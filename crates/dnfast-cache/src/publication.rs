@@ -8,7 +8,8 @@ use dnfast_metadata::{
 
 use crate::{
     fs_safety::{create_private_tree, sync_directory, write_synced, write_verified},
-    model::{io_error, metadata_error, sha256, CacheError, CompleteSnapshot, Manifest, SelectedOrigin, Snapshot, SnapshotIntegrity},
+    model::{io_error, metadata_error, sha256, CacheError, CompleteSnapshot, Manifest,
+        RepomdAuthentication, SelectedOrigin, Snapshot, SnapshotIntegrity},
     Cache,
 };
 
@@ -21,6 +22,7 @@ impl Cache {
             repository, repomd, primary, packages: &packages,
             solver_inputs: None, filelists_bytes: None, filelists: None,
             source_origin: None,
+            repomd_authentication: &RepomdAuthentication::TransportOnly,
             integrity: SnapshotIntegrity::SearchOnly,
         })?;
         Ok(Snapshot { digest, packages })
@@ -39,6 +41,17 @@ impl Cache {
     pub fn publish_complete_with_origin(
         &self, repository: &str, repomd: &[u8], primary: &[u8], filelists: &[u8], source_origin: Option<&str>,
     ) -> Result<CompleteSnapshot, CacheError> {
+        self.publish_complete_with_origin_and_authentication(
+            repository, repomd, primary, filelists, source_origin,
+            RepomdAuthentication::TransportOnly,
+        )
+    }
+
+    pub fn publish_complete_with_origin_and_authentication(
+        &self, repository: &str, repomd: &[u8], primary: &[u8], filelists: &[u8],
+        source_origin: Option<&str>, repomd_authentication: RepomdAuthentication,
+    ) -> Result<CompleteSnapshot, CacheError> {
+        repomd_authentication.validate()?;
         let source_origin = source_origin
             .map(SelectedOrigin::parse)
             .transpose()
@@ -54,6 +67,7 @@ impl Cache {
             solver_inputs: Some(&solver_inputs), filelists_bytes: Some(filelists),
             filelists: Some(&filelist_inputs), integrity: SnapshotIntegrity::CompleteMetadata,
             source_origin: source_origin.as_ref().map(SelectedOrigin::repomd_url),
+            repomd_authentication: &repomd_authentication,
         })?;
         self.open_by_digest(&digest)
     }
@@ -70,7 +84,7 @@ impl Cache {
         if loaded.repository != input.repository || loaded.integrity != input.integrity {
             return Err(CacheError::Corrupt("existing object identity mismatch".into()));
         }
-        self.publish_repository_pointer(input.repository, &digest)?;
+        self.publish_repository_pointer(input.repository, &digest, input.repomd_authentication)?;
         Ok(digest)
     }
 
@@ -103,7 +117,8 @@ impl Cache {
         }
     }
 
-    fn publish_repository_pointer(&self, repository: &str, digest: &str) -> Result<(), CacheError> {
+    fn publish_repository_pointer(&self, repository: &str, digest: &str,
+        repomd_authentication: &RepomdAuthentication) -> Result<(), CacheError> {
         let directory = self.repository_dir(repository);
         create_private_tree(&self.root, &directory)?;
         let id_path = directory.join("repo-id");
@@ -115,8 +130,13 @@ impl Cache {
             write_synced(&id_path, repository.as_bytes())?;
             sync_directory(&directory)?;
         }
+        let pointer = crate::model::CurrentPointer {
+            version: 1,
+            digest: digest.into(),
+            repomd_authentication: repomd_authentication.clone(),
+        };
         let mut current = tempfile::NamedTempFile::new_in(&directory).map_err(io_error)?;
-        writeln!(current, "{digest}").map_err(io_error)?;
+        current.write_all(&json(&pointer)?).map_err(io_error)?;
         current.as_file().sync_all().map_err(io_error)?;
         fault(&self.root, ".fail-before-current-rename")?;
         current.persist(directory.join("current")).map_err(|error| io_error(error.error))?;
@@ -134,6 +154,7 @@ struct Publication<'a> {
     filelists: Option<&'a [FileListPackage]>,
     integrity: SnapshotIntegrity,
     source_origin: Option<&'a str>,
+    repomd_authentication: &'a RepomdAuthentication,
 }
 
 fn search_package(record: &CompletePackage) -> Package {

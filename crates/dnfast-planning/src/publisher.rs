@@ -242,7 +242,7 @@ fn policy_for(host: Architecture, profile: &MutationProfile, preferences: Vec<Re
 }
 
 fn repository_payload(repository: &RepoConfig, cache: &Cache, valid_at_unix: u64) -> Result<PlanningRepository, PlanningError> {
-    if !repository.sslverify || !repository.gpgcheck || !repository.pkg_gpgcheck || repository.repo_gpgcheck
+    if !repository.sslverify || !repository.gpgcheck || !repository.pkg_gpgcheck
         || repository.allowed_fingerprints.is_empty() || repository.gpgkey.is_empty()
     {
         return Err(PlanningError::Input("repository trust policy is incomplete".into()));
@@ -281,6 +281,7 @@ fn generation_payload(
         primary: crate::model::PlanningBytes::from_verified(generation.primary()),
         filelists: crate::model::PlanningBytes::from_verified(generation.filelists()),
         solver_inputs: generation.solver_inputs().to_vec(), filelist_inputs: generation.filelist_inputs().to_vec(), trust, keys,
+        repomd_authentication: generation.repomd_authentication().clone(),
     })
 }
 
@@ -290,6 +291,7 @@ fn normalized_configuration(profile: &MutationProfile) -> Result<Vec<PlanningCon
         mirrorlist: repository.mirrorlist.clone(), priority: u32::from(repository.priority), cost: repository.cost,
         excludes: repository.excludepkgs.clone(), includes: repository.includepkgs.clone(), gpgkey: repository.gpgkey.clone(),
         allowed_fingerprints: repository.allowed_fingerprints.clone(),
+        repo_gpgcheck: repository.repo_gpgcheck,
     }).collect::<Vec<_>>();
     result.sort_by(|left, right| left.id.cmp(&right.id));
     if result.windows(2).any(|pair| pair[0].id == pair[1].id) {

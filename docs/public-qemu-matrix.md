@@ -82,7 +82,7 @@ export MATRIX_BUILD_GPG_KEY=/path/to/fedora-build-key.asc
 export MATRIX_HOST_TOOLS_SHA256=/path/to/trusted-host-tools.sha256
 export MATRIX_GUEST_ASSETS_SHA256=/path/to/trusted-guest-assets.sha256
 export MATRIX_RPM_REPOSITORY_SHA256=/path/to/trusted-rpm-repository.sha256
-export MATRIX_BUILD_PACKAGES='gcc-... libsolv-devel-... rpm-devel-... pkgconf-pkg-config-... rust-... cargo-...'
+export MATRIX_BUILD_PACKAGES='gcc-... libsolv-devel-... rpm-devel-... nettle-devel-... clang-devel-... pkgconf-pkg-config-... rust-... cargo-...'
 ```
 
 Obtain the three manifests through an independent trusted channel outside the

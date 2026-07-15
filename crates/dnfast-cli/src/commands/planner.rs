@@ -189,6 +189,7 @@ mod tests {
             repomd: planning_bytes(&repomd), primary: planning_bytes(&primary), filelists: planning_bytes(&filelists),
             solver_inputs, filelist_inputs, trust,
             keys: vec![PlanningKey { bundle_path: bundle_path.into(), certificate_base64: STANDARD.encode(certificate) }],
+            repomd_authentication: dnfast_cache::RepomdAuthentication::TransportOnly,
         }
     }
 

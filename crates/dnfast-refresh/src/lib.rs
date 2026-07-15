@@ -4,12 +4,14 @@ use std::{error::Error, fmt};
 
 mod metalink;
 mod mirrorlist;
+mod openpgp;
 mod repo_lock;
 mod orchestrator;
 mod transport;
 mod url_policy;
 
 pub use orchestrator::Refresher;
+pub use openpgp::MetadataTrust;
 pub use transport::{HttpTransport, Transport};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +33,7 @@ pub enum RefreshError {
     Transport(String),
     Metalink(String),
     Metadata(String),
+    Signature(String),
     Cache(String),
 }
 

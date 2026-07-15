@@ -161,6 +161,7 @@ pub(super) fn zstd_repository() -> PlanningRepository {
         origin: PlanningOrigin { repomd_url: "https://mirror.example/fedora/repodata/repomd.xml".into(), sha256: format!("{:x}", Sha256::digest(b"https://mirror.example/fedora/repodata/repomd.xml")) },
         repomd: planning_bytes(&repomd), primary: planning_bytes(&primary), filelists: planning_bytes(&filelists), solver_inputs, filelist_inputs, trust,
         keys: vec![PlanningKey { bundle_path: bundle_path.into(), certificate_base64: base64::engine::general_purpose::STANDARD.encode(certificate) }],
+        repomd_authentication: dnfast_cache::RepomdAuthentication::TransportOnly,
     }
 }
 

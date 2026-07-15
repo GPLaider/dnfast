@@ -17,10 +17,10 @@ namespace binding aborts the operation.
 
 Metadata refresh disables redirects, requires HTTPS sources, and, for Metalink, validates repomd
 size and SHA-256 before accepting a mirror. Primary and filelists compressed/open SHA-256 and size
-values from repomd are mandatory and checked before publication. These transport and digest checks
-do not by themselves prove publisher authenticity: dnfast does not currently verify an OpenPGP
-signature over repomd. Repositories with `repo_gpgcheck=true` are rejected instead of silently
-weakening that request.
+values from repomd are mandatory and checked before publication. When `repo_gpgcheck=true`, dnfast
+also downloads `repomd.xml.asc` and verifies the detached OpenPGP signature with the repository's
+root-owned key bundle at the refresh timestamp. The verified primary and signing fingerprints,
+key-bundle digest, and signature digest are bound into the cache generation and planning snapshot.
 
 Snapshots and artifacts are immutable and content addressed. Complete objects are staged on the
 cache filesystem, synced, and renamed before an atomic pointer update. Readers revalidate sizes,

@@ -5,7 +5,7 @@ use dnfast_metadata::{parse_repomd, parse_repomd_records, validate_filelists_gen
 use crate::{
     fs_safety::{read_anchored, read_regular, reject_symlink, validate_name, verify_file, AnchoredDirectory, MAX_MANIFEST_BYTES},
     model::{
-        io_error, metadata_error, sha256, valid_digest, CacheError, CompleteSnapshot, Manifest,
+        io_error, metadata_error, sha256, valid_digest, CacheError, CompleteSnapshot, CurrentPointer, Manifest,
         SelectedOrigin, Snapshot, SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration,
     },
     Cache,
@@ -16,16 +16,17 @@ impl Cache {
         &self,
         repository: &str,
     ) -> Result<VerifiedCompleteGeneration, CacheError> {
-        let digest = self.current_digest(repository)?;
-        let generation = self.open_verified_complete_generation(&digest)?;
+        let pointer = self.current_pointer(repository)?;
+        let mut generation = self.open_verified_complete_generation(&pointer.digest)?;
         if generation.repository() != repository {
             return Err(CacheError::Corrupt("repository identity mismatch".into()));
         }
+        generation.repomd_authentication = pointer.repomd_authentication;
         Ok(generation)
     }
 
     pub fn load(&self, repository: &str) -> Result<Snapshot, CacheError> {
-        let digest = self.current_digest(repository)?;
+        let digest = self.current_pointer(repository)?.digest;
         let complete = self.open_by_digest(&digest)?;
         if complete.repository != repository {
             return Err(CacheError::Corrupt("repository identity mismatch".into()));
@@ -115,6 +116,7 @@ impl Cache {
             filelists,
             solver_inputs: snapshot.solver_inputs,
             filelist_inputs: snapshot.filelists,
+            repomd_authentication: crate::model::RepomdAuthentication::TransportOnly,
         })
     }
 
@@ -155,21 +157,34 @@ impl Cache {
         }
     }
 
-    fn current_digest(&self, repository: &str) -> Result<String, CacheError> {
+    fn current_pointer(&self, repository: &str) -> Result<CurrentPointer, CacheError> {
         let directory = self.repository_dir(repository);
         if fs::symlink_metadata(directory.join("current")).is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file()) {
             return Err(CacheError::Corrupt("current is not a regular file".into()));
         }
-        let bytes = read_anchored(&directory, std::ffi::OsStr::new("current"), 65).map_err(|error| match error {
+        let bytes = read_anchored(&directory, std::ffi::OsStr::new("current"), 2048).map_err(|error| match error {
             CacheError::Io(_) if !directory.join("current").exists() => CacheError::MissingSnapshot(repository.into()),
             other => other,
         })?;
-        let current = String::from_utf8(bytes).map_err(|error| CacheError::Corrupt(error.to_string()))?;
-        let digest = current.trim();
-        if current.lines().count() != 1 || !valid_digest(digest) {
+        if let Ok(current) = std::str::from_utf8(&bytes) {
+            let digest = current.trim();
+            if current.lines().count() == 1 && valid_digest(digest) {
+                return Ok(CurrentPointer {
+                    version: 1,
+                    digest: digest.into(),
+                    repomd_authentication: crate::model::RepomdAuthentication::TransportOnly,
+                });
+            }
+        }
+        let pointer: CurrentPointer = serde_json::from_slice(&bytes)
+            .map_err(|_| CacheError::Corrupt("invalid current digest".into()))?;
+        if pointer.version != 1 || !valid_digest(&pointer.digest)
+            || serde_json::to_vec(&pointer).map_err(|error| CacheError::Corrupt(error.to_string()))? != bytes
+        {
             return Err(CacheError::Corrupt("invalid current digest".into()));
         }
-        Ok(digest.into())
+        pointer.repomd_authentication.validate()?;
+        Ok(pointer)
     }
 
     pub fn repositories(&self) -> Result<Vec<String>, CacheError> {

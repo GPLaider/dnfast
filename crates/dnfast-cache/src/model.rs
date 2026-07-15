@@ -46,6 +46,52 @@ pub struct CompleteSnapshot {
     pub source_origin: Option<SelectedOrigin>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RepomdAuthentication {
+    TransportOnly,
+    OpenPgp {
+        primary_fingerprint: String,
+        signing_fingerprint: String,
+        key_bundle_sha256: String,
+        signature_sha256: String,
+    },
+}
+
+impl RepomdAuthentication {
+    pub fn openpgp(
+        primary_fingerprint: impl Into<String>,
+        signing_fingerprint: impl Into<String>,
+        key_bundle_sha256: impl Into<String>,
+        signature_sha256: impl Into<String>,
+    ) -> Result<Self, CacheError> {
+        let value = Self::OpenPgp {
+            primary_fingerprint: primary_fingerprint.into().to_ascii_uppercase(),
+            signing_fingerprint: signing_fingerprint.into().to_ascii_uppercase(),
+            key_bundle_sha256: key_bundle_sha256.into().to_ascii_lowercase(),
+            signature_sha256: signature_sha256.into().to_ascii_lowercase(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), CacheError> {
+        match self {
+            Self::TransportOnly => Ok(()),
+            Self::OpenPgp { primary_fingerprint, signing_fingerprint, key_bundle_sha256, signature_sha256 } => {
+                if !valid_fingerprint(primary_fingerprint)
+                    || !valid_fingerprint(signing_fingerprint)
+                    || !valid_digest(key_bundle_sha256)
+                    || !valid_digest(signature_sha256)
+                {
+                    return Err(CacheError::Corrupt("invalid repomd authentication evidence".into()));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectedOrigin(String);
 
@@ -131,6 +177,7 @@ pub struct VerifiedCompleteGeneration {
     pub(crate) filelists: VerifiedBytes,
     pub(crate) solver_inputs: Vec<CompletePackage>,
     pub(crate) filelist_inputs: Vec<FileListPackage>,
+    pub(crate) repomd_authentication: RepomdAuthentication,
 }
 
 impl VerifiedCompleteGeneration {
@@ -142,6 +189,7 @@ impl VerifiedCompleteGeneration {
     pub fn filelists(&self) -> &VerifiedBytes { &self.filelists }
     pub fn solver_inputs(&self) -> &[CompletePackage] { &self.solver_inputs }
     pub fn filelist_inputs(&self) -> &[FileListPackage] { &self.filelist_inputs }
+    pub fn repomd_authentication(&self) -> &RepomdAuthentication { &self.repomd_authentication }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -158,6 +206,14 @@ pub(crate) struct Manifest {
     pub(crate) solver_inputs: Option<FileRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) source_origin: Option<FileRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CurrentPointer {
+    pub(crate) version: u32,
+    pub(crate) digest: String,
+    pub(crate) repomd_authentication: RepomdAuthentication,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -177,6 +233,10 @@ pub(crate) fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_fingerprint(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase())
 }
 
 pub(crate) fn io_error(error: std::io::Error) -> CacheError {

@@ -1,4 +1,4 @@
-use dnfast_cache::{Cache, SelectedOrigin};
+use dnfast_cache::{Cache, RepomdAuthentication, SelectedOrigin};
 use dnfast_metadata::parse_repomd_records;
 use sha2::{Digest, Sha256};
 
@@ -6,6 +6,7 @@ use crate::{
     RefreshError, RefreshOutcome, Source, Transport,
     metalink::{MAX_METALINK_BYTES, MAX_REPOMD_BYTES, parse_metalink},
     mirrorlist,
+    openpgp::{MetadataTrust, verify_repomd},
     repo_lock::RepositoryLock,
     url_policy::validate_https,
 };
@@ -25,6 +26,15 @@ impl<'a, T: Transport> Refresher<'a, T> {
         repository: &str,
         source: Source,
     ) -> Result<RefreshOutcome, RefreshError> {
+        self.refresh_with_metadata_trust(repository, source, None)
+    }
+
+    pub fn refresh_with_metadata_trust(
+        &self,
+        repository: &str,
+        source: Source,
+        metadata_trust: Option<&MetadataTrust>,
+    ) -> Result<RefreshOutcome, RefreshError> {
         let _lock = RepositoryLock::acquire(self.cache.root(), repository)?;
         match source {
             Source::BaseUrl(base) => {
@@ -32,7 +42,7 @@ impl<'a, T: Transport> Refresher<'a, T> {
                 let base = base.trim_end_matches('/');
                 let url = format!("{base}/repodata/repomd.xml");
                 let bytes = self.transport.get(&url, MAX_REPOMD_BYTES)?;
-                self.finish_generation(repository, &url, bytes)
+                self.finish_generation(repository, &url, bytes, metadata_trust)
             }
             Source::Metalink(url) => {
                 validate_https(&url)?;
@@ -50,7 +60,7 @@ impl<'a, T: Transport> Refresher<'a, T> {
                     if bytes.len() as u64 == metalink.size
                         && hex::encode(Sha256::digest(&bytes)) == metalink.sha256
                     {
-                        match self.finish_generation(repository, &resource.url, bytes) {
+                        match self.finish_generation(repository, &resource.url, bytes, metadata_trust) {
                             Ok(outcome) => return Ok(outcome),
                             Err(error) => last_error = Some(error),
                         }
@@ -67,7 +77,7 @@ impl<'a, T: Transport> Refresher<'a, T> {
                 for base in mirrorlist::parse(&list)? {
                     let repomd_url = format!("{base}/repodata/repomd.xml");
                     match self.transport.get(&repomd_url, MAX_REPOMD_BYTES)
-                        .and_then(|bytes| self.finish_generation(repository, &repomd_url, bytes))
+                        .and_then(|bytes| self.finish_generation(repository, &repomd_url, bytes, metadata_trust))
                     {
                         Ok(outcome) => return Ok(outcome),
                         Err(error) => last_error = Some(error),
@@ -83,7 +93,16 @@ impl<'a, T: Transport> Refresher<'a, T> {
         repository: &str,
         repomd_url: &str,
         repomd: Vec<u8>,
+        metadata_trust: Option<&MetadataTrust>,
     ) -> Result<RefreshOutcome, RefreshError> {
+        let authentication = match metadata_trust {
+            Some(trust) => {
+                let signature_url = format!("{repomd_url}.asc");
+                let signature = self.transport.get(&signature_url, 1024 * 1024)?;
+                verify_repomd(trust, &signature, &repomd)?
+            }
+            None => RepomdAuthentication::TransportOnly,
+        };
         let records = parse_repomd_records(&repomd)
             .map_err(|error| RefreshError::Metadata(error.to_string()))?;
         let origin = SelectedOrigin::parse(repomd_url)
@@ -96,7 +115,9 @@ impl<'a, T: Transport> Refresher<'a, T> {
         let filelists = self.transport.get(&filelists_url, records.filelists.size)?;
         let snapshot = self
             .cache
-            .publish_complete_with_origin(repository, &repomd, &primary, &filelists, Some(origin.repomd_url()))
+            .publish_complete_with_origin_and_authentication(
+                repository, &repomd, &primary, &filelists, Some(origin.repomd_url()), authentication,
+            )
             .map_err(|error| RefreshError::Cache(error.to_string()))?;
         Ok(RefreshOutcome {
             digest: snapshot.digest,

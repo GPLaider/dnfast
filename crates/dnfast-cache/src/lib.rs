@@ -10,7 +10,10 @@ mod publication;
 
 use std::path::{Path, PathBuf};
 
-pub use model::{CacheError, CompleteSnapshot, OriginError, SelectedOrigin, Snapshot, SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration};
+pub use model::{
+    CacheError, CompleteSnapshot, OriginError, RepomdAuthentication, SelectedOrigin, Snapshot,
+    SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration,
+};
 pub use artifact::{
     ArtifactError, ArtifactResponse, ArtifactSpec, ArtifactTransport, Capacity, Digest,
     HttpArtifactTransport, TransactionRequest, MAX_ARTIFACT_BYTES, MAX_CACHE_BYTES,

@@ -1,12 +1,13 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dnfast_core::{CanonicalDocument, InstalledInventory, PlanIntegrity, RepoTrustPolicy, RepositoryBinding, SolverPolicy};
 use dnfast_metadata::{CompletePackage, FileListPackage};
+use dnfast_cache::RepomdAuthentication;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::PlanningError;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -49,6 +50,7 @@ pub struct PlanningRepository {
     pub filelist_inputs: Vec<FileListPackage>,
     pub trust: RepoTrustPolicy,
     pub keys: Vec<PlanningKey>,
+    pub repomd_authentication: RepomdAuthentication,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,6 +89,7 @@ pub struct PlanningConfiguration {
     pub includes: Vec<String>,
     pub gpgkey: Vec<String>,
     pub allowed_fingerprints: Vec<String>,
+    pub repo_gpgcheck: bool,
 }
 
 impl PlanningSnapshot {
@@ -164,6 +167,14 @@ impl PlanningSnapshot {
             if fingerprints != repository.trust.allowed_primary_fingerprints() {
                 return Err(PlanningError::Input("repository trust differs from configuration".into()));
             }
+            if configuration.repo_gpgcheck {
+                match &repository.repomd_authentication {
+                    RepomdAuthentication::OpenPgp { primary_fingerprint, key_bundle_sha256, .. }
+                        if fingerprints.contains(primary_fingerprint)
+                            && key_bundle_sha256 == repository.trust.key_bundle_sha256().as_str() => {}
+                    _ => return Err(PlanningError::Input("repository requires authenticated repomd metadata".into())),
+                }
+            }
         }
         Ok(())
     }
@@ -220,6 +231,8 @@ fn validate_repository(repository: &PlanningRepository) -> Result<(), PlanningEr
     dnfast_cache::SelectedOrigin::parse(&repository.origin.repomd_url)
         .map_err(|error| PlanningError::Input(error.to_string()))?;
     repository.trust.canonical_sha256().map_err(domain)?;
+    repository.repomd_authentication.validate()
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
     let mut bundle = Sha256::new();
     bundle.update(b"dnfast-key-bundle-v1");
     for key in &repository.keys {

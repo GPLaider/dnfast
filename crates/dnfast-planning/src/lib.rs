@@ -102,13 +102,26 @@ mod tests {
                 repomd: bytes(&repomd), primary: bytes(&primary), filelists: bytes(&filelists), solver_inputs,
                 filelist_inputs, trust,
                 keys: vec![PlanningKey { bundle_path: bundle_path.into(), certificate_base64: base64::engine::general_purpose::STANDARD.encode(certificate) }],
+                repomd_authentication: dnfast_cache::RepomdAuthentication::TransportOnly,
             }],
             configuration: vec![PlanningConfiguration {
                 id: "main".into(), enabled: true, baseurl: vec!["https://mirror.example/fedora".into()], metalink: None, mirrorlist: None,
                 priority: 99, cost: 1000, excludes: Vec::new(), includes: Vec::new(), gpgkey: vec![bundle_path.into()], allowed_fingerprints: vec!["A".repeat(40)],
+                repo_gpgcheck: false,
             }],
         };
         let snapshot = PlanningSnapshot::new(7, payload).expect("snapshot");
+        let mut unsigned_required_payload = snapshot.payload().clone();
+        unsigned_required_payload.configuration[0].repo_gpgcheck = true;
+        assert!(PlanningSnapshot::new(7, unsigned_required_payload.clone()).is_err());
+        unsigned_required_payload.allowed_repositories[0].repomd_authentication =
+            dnfast_cache::RepomdAuthentication::openpgp(
+                "A".repeat(40),
+                "A".repeat(40),
+                unsigned_required_payload.allowed_repositories[0].trust.key_bundle_sha256().as_str(),
+                "f".repeat(64),
+            ).expect("OpenPGP evidence");
+        assert!(PlanningSnapshot::new(7, unsigned_required_payload).is_ok());
         let default_selection = snapshot.integrity_for_repositories(&[]).expect("default selected integrity");
         let explicit_selection = snapshot.integrity_for_repositories(&["main".into()]).expect("explicit selected integrity");
         assert_eq!(default_selection, explicit_selection);

@@ -4,7 +4,7 @@ use dnfast_cache::Cache;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    RefreshError, Refresher, Source, Transport,
+    MetadataTrust, RefreshError, Refresher, Source, Transport,
     metalink::parse_metalink,
 };
 
@@ -255,6 +255,43 @@ fn missing_filelists_preserves_pointer_and_publishes_nothing() {
     let result = Refresher::new(transport, &cache).refresh("fedora", Source::BaseUrl(base.into()));
     assert!(result.is_err());
     assert!(!directory.path().join("objects/sha256").exists());
+}
+
+#[test]
+fn openpgp_authenticated_refresh_binds_signer_evidence_and_rejects_missing_signature() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path());
+    let (repomd, primary, filelists) = metadata_fixture();
+    let (certificate, fingerprint, signature, now) = super::openpgp::signed_fixture(&repomd);
+    let trust = MetadataTrust::new(
+        [certificate], [fingerprint.clone()], "a".repeat(64), now,
+    ).unwrap();
+    let base = "https://signed.example/fedora";
+    cache.publish_complete_with_origin(
+        "fedora", &repomd, &primary, &filelists,
+        Some(&format!("{base}/repodata/repomd.xml")),
+    ).unwrap();
+    let transport = FakeTransport::new([
+        (format!("{base}/repodata/repomd.xml"), repomd.clone()),
+        (format!("{base}/repodata/repomd.xml.asc"), signature),
+        (format!("{base}/repodata/primary.xml.zst"), primary),
+        (format!("{base}/repodata/filelists.xml.zst"), filelists),
+    ]);
+
+    let outcome = Refresher::new(transport, &cache)
+        .refresh_with_metadata_trust("fedora", Source::BaseUrl(base.into()), Some(&trust))
+        .unwrap();
+    let generation = cache.open_current_verified_complete_generation("fedora").unwrap();
+
+    assert_eq!(generation.digest(), outcome.digest);
+    assert!(matches!(generation.repomd_authentication(), dnfast_cache::RepomdAuthentication::OpenPgp {
+        primary_fingerprint, ..
+    } if primary_fingerprint == &fingerprint));
+    let missing = Refresher::new(FakeTransport::new([
+        (format!("{base}/repodata/repomd.xml"), repomd),
+    ]), &Cache::new(tempfile::tempdir().unwrap().keep()))
+        .refresh_with_metadata_trust("fedora", Source::BaseUrl(base.into()), Some(&trust));
+    assert!(missing.is_err());
 }
 
 

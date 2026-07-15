@@ -41,6 +41,7 @@ fn public_error_variants_retain_display_and_source_contracts() {
         RefreshError::Transport("transport".into()),
         RefreshError::Metalink("metalink".into()),
         RefreshError::Metadata("metadata".into()),
+        RefreshError::Signature("signature".into()),
         RefreshError::Cache("cache".into()),
     ];
 
@@ -48,7 +49,8 @@ fn public_error_variants_retain_display_and_source_contracts() {
     assert_eq!(errors[1].to_string(), "refresh error: Transport(\"transport\")");
     assert_eq!(errors[2].to_string(), "refresh error: Metalink(\"metalink\")");
     assert_eq!(errors[3].to_string(), "refresh error: Metadata(\"metadata\")");
-    assert_eq!(errors[4].to_string(), "refresh error: Cache(\"cache\")");
+    assert_eq!(errors[4].to_string(), "refresh error: Signature(\"signature\")");
+    assert_eq!(errors[5].to_string(), "refresh error: Cache(\"cache\")");
     assert!(errors.iter().all(|error| error.source().is_none()));
 }
 

@@ -2,8 +2,8 @@ use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
 use dnfast_cache::Cache;
 use dnfast_planning::{RootPlanningPublisher, SYSTEM_CACHE_PATH};
-use dnfast_refresh::{HttpTransport, RefreshOutcome, Refresher, Source};
-use dnfast_repo::{MutationProfile, RepoConfig, load_repository_dirs, load_system_mutation_profile};
+use dnfast_refresh::{HttpTransport, MetadataTrust, RefreshOutcome, Refresher, Source};
+use dnfast_repo::{MutationProfile, RepoConfig, key_bundle_digest, load_repository_dirs, load_system_mutation_profile};
 
 use crate::{
     commands::AppFailure,
@@ -25,7 +25,12 @@ pub(super) fn refresh(
     let report = refresh_profile(
         &profile,
         requested,
-        |repository, source| refresher.refresh(repository, source).map_err(|error| error.to_string()),
+        |repository, source| {
+            let metadata_trust = metadata_trust(repository, now)?;
+            refresher.refresh_with_metadata_trust(
+                &repository.id, source, metadata_trust.as_ref(),
+            ).map_err(|error| error.to_string())
+        },
         |published_at_unix| publisher.publish_after_verified_refresh(published_at_unix).map_err(|error| error.to_string()),
         now,
     )?;
@@ -50,7 +55,7 @@ fn refresh_profile<Refresh, Publish>(
     published_at_unix: u64,
 ) -> Result<RefreshReport, AppFailure>
 where
-    Refresh: FnMut(&str, Source) -> Result<RefreshOutcome, String>,
+    Refresh: FnMut(&RepoConfig, Source) -> Result<RefreshOutcome, String>,
     Publish: FnOnce(u64) -> Result<String, String>,
 {
     requested.sort();
@@ -73,7 +78,7 @@ where
         let mut outcome = None;
         let mut last_error = None;
         for source in sources(repository) {
-            match refresh_source(&repository.id, source) {
+            match refresh_source(repository, source) {
                 Ok(value) => {
                     outcome = Some(value);
                     break;
@@ -89,6 +94,21 @@ where
     }
     let planning_snapshot = publish_snapshot(published_at_unix).map_err(|error| AppFailure::new(1, error))?;
     Ok(RefreshReport { refreshed, planning_snapshot })
+}
+
+fn metadata_trust(repository: &RepoConfig, valid_at_unix: u64) -> Result<Option<MetadataTrust>, String> {
+    if !repository.repo_gpgcheck { return Ok(None); }
+    let paths = repository.gpgkey.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let bundle = key_bundle_digest(&repository.id, &paths).map_err(|error| error.to_string())?;
+    if repository.key_bundle_digest != Some(bundle.digest) {
+        return Err("repository key bundle changed after profile validation".into());
+    }
+    MetadataTrust::new(
+        bundle.certificates,
+        repository.allowed_fingerprints.clone(),
+        hex::encode(bundle.digest),
+        valid_at_unix,
+    ).map(Some).map_err(|error| error.to_string())
 }
 
 fn sources(repository: &RepoConfig) -> Vec<Source> {

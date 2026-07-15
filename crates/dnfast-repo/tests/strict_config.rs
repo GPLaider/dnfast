@@ -243,7 +243,7 @@ fn forbidden_and_unknown_settings_fail_closed_without_leaking_values() {
         assert!(!error.contains("/secret/token"));
     }
     let main = MainConfig::default();
-    for line in ["sslverify=false", "repo_gpgcheck=true", "proxy_username=alice"] {
+    for line in ["sslverify=false", "proxy_username=alice"] {
         let input = format!("[fedora]\nbaseurl=https://example.test\n{line}\n");
         let error = parse_repo_profile(Path::new("fedora.repo"), &input, &main).unwrap_err().to_string();
         assert!(error.contains("rejected mutation setting") || error.contains("unsupported mutation key"));
@@ -308,12 +308,22 @@ fn repo_trust_defaults_are_explicit_and_credentials_fail_before_network() {
     let source_empty = &source_empty.repositories[0];
     assert!(source_empty.baseurl.is_empty() && source_empty.metalink.is_none() && source_empty.mirrorlist.is_none());
     // Given credential-bearing and disabled-check settings, when parsed before networking, then no call occurs.
-    for setting in ["proxy=alice:secret@host", "proxy=https://alice:secret@host", "gpgcheck=false", "pkg_gpgcheck=false", "sslverify=false", "repo_gpgcheck=true", "module_hotfixes=true"] {
+    for setting in ["proxy=alice:secret@host", "proxy=https://alice:secret@host", "gpgcheck=false", "pkg_gpgcheck=false", "sslverify=false", "module_hotfixes=true"] {
         let input = format!("[a]\nbaseurl=x\n{setting}\n");
         let mut calls = 0;
         assert!(parse_before_network(Path::new("x"), &input, &MainConfig::default(), |_| calls += 1).is_err());
         assert_eq!(calls, 0);
     }
+}
+
+#[test]
+fn repomd_openpgp_check_is_explicitly_supported() {
+    let profile = parse_repo_profile(
+        Path::new("x"),
+        "[a]\nbaseurl=x\nrepo_gpgcheck=true\n",
+        &MainConfig::default(),
+    ).unwrap();
+    assert!(profile.repositories[0].repo_gpgcheck);
 }
 
 #[test]
