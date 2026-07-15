@@ -14,7 +14,7 @@ use dnfast_core::{Action, PackageSpec, TransactionIntent};
 use dnfast_metadata::search;
 
 use crate::{
-    args::{Commands, MutationArgs, PlanAction, RepoCommand},
+    args::{Commands, DaemonCommand, MutationArgs, PlanAction, RepoCommand},
     environment::{cache_directory, library_present},
     rendering::escaped_field,
     response::{Action as ResponseAction, Response},
@@ -69,6 +69,7 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
         Commands::Install(arguments) => run_convenience(PlanAction::Install, arguments),
         Commands::Remove(arguments) => run_convenience(PlanAction::Remove, arguments),
         Commands::Upgrade(arguments) => run_convenience(PlanAction::Upgrade, arguments),
+        Commands::Daemon { command } => run_daemon(command),
         Commands::Repo { command } => match command {
             RepoCommand::List {
                 repo_dirs,
@@ -96,6 +97,7 @@ pub(crate) fn name(command: &Commands) -> &'static str {
         Commands::Install(_) => "install",
         Commands::Remove(_) => "remove",
         Commands::Upgrade(_) => "upgrade",
+        Commands::Daemon { .. } => "daemon",
         Commands::Repo { .. } => "repo",
         Commands::Doctor => "doctor",
         Commands::Search { .. } => "search",
@@ -127,8 +129,19 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
         return Err(AppFailure::new(1, "mutation requires root"));
     }
     let approval = approval(arguments.assumeyes, arguments.assumeno)?;
-    let intent = intent(action, arguments.packages)?;
+    let daemon_approval = daemon_approval(arguments.assumeyes, arguments.assumeno)?;
     let repositories = canonical_repository_ids(arguments.repositories)?;
+    match dnfast_executor::transact_via_daemon(
+        Action::from(action),
+        &arguments.packages,
+        &repositories,
+        daemon_approval,
+    ) {
+        Ok(outcome) => return Ok(Response::from_daemon(outcome)),
+        Err(error) if error.is_unavailable() => {}
+        Err(error) => return Err(AppFailure::new(1, error.to_string())),
+    }
+    let intent = intent(action, arguments.packages)?;
     let plan = planner::solve(intent, &repositories)?;
     let bytes = plan
         .canonical_json()
@@ -158,6 +171,49 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
     match dnfast_native_sys::exec_fixed_executor(plan_fd, approval) {
         Ok(()) => Err(AppFailure::new(1, "fixed executor unexpectedly returned")),
         Err(error) => Err(AppFailure::new(1, error.to_string())),
+    }
+}
+
+fn daemon_approval(
+    assumeyes: bool,
+    assumeno: bool,
+) -> Result<dnfast_executor::DaemonApproval, AppFailure> {
+    match (assumeyes, assumeno) {
+        (false, false) => Ok(dnfast_executor::DaemonApproval::Prompt),
+        (true, false) => Ok(dnfast_executor::DaemonApproval::Yes),
+        (false, true) => Ok(dnfast_executor::DaemonApproval::No),
+        (true, true) => Err(AppFailure::new(2, "--assumeyes and --assumeno conflict")),
+    }
+}
+
+fn run_daemon(command: DaemonCommand) -> Result<Response, AppFailure> {
+    match command {
+        DaemonCommand::Status => dnfast_executor::daemon_status()
+            .map(|available| {
+                Response::completed(
+                    "daemon",
+                    format!(
+                        "resident_daemon={}",
+                        if available {
+                            "available"
+                        } else {
+                            "unavailable"
+                        }
+                    ),
+                )
+            })
+            .map_err(|error| AppFailure::new(1, error.to_string())),
+        DaemonCommand::Warm { repositories } => {
+            let repositories = canonical_repository_ids(repositories)?;
+            dnfast_executor::warm_daemon(&repositories)
+                .map(|cookie| {
+                    Response::completed(
+                        "daemon",
+                        format!("resident_pool=warmed; rpmdb_cookie_sha256={cookie}"),
+                    )
+                })
+                .map_err(|error| AppFailure::new(1, error.to_string()))
+        }
     }
 }
 
@@ -277,9 +333,18 @@ fn run_plan(
     packages: Vec<String>,
 ) -> Result<Response, AppFailure> {
     output::validate_new_path(&output)?;
-    let intent = intent(action, packages)?;
     let repositories = canonical_repository_ids(repositories)?;
-    let plan = planner::solve(intent, &repositories)?;
+    let plan = if rustix::process::geteuid().as_raw() == 0 {
+        match dnfast_executor::plan_via_daemon(Action::from(action), &packages, &repositories) {
+            Ok(resident) => resident.plan,
+            Err(error) if error.is_unavailable() => {
+                planner::solve(intent(action, packages)?, &repositories)?
+            }
+            Err(error) => return Err(AppFailure::new(1, error.to_string())),
+        }
+    } else {
+        planner::solve(intent(action, packages)?, &repositories)?
+    };
     let bytes = plan
         .canonical_json()
         .map_err(|error| AppFailure::new(1, error.to_string()))?;

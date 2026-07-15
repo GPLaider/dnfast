@@ -230,7 +230,11 @@ fn loader_ignores_symlinked_files_roots_and_ancestors() {
 
     let linked = parent.0.join("linked");
     symlink(&real, &linked).unwrap();
-    assert!(load_repository_dirs(&[linked.clone()]).unwrap().is_empty());
+    assert!(
+        load_repository_dirs(std::slice::from_ref(&linked))
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         load_repository_dirs(&[linked.join("nested")])
             .unwrap()

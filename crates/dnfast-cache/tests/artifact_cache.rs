@@ -152,7 +152,7 @@ fn accepts_exact_numeric_boundaries_and_rejects_plus_one() {
         TransactionRequest::from_totals(MAX_TRANSACTION_BYTES, MAX_TRANSACTION_ARTIFACTS).unwrap();
     let capacity = Capacity {
         cached_bytes: MAX_CACHE_BYTES - MAX_TRANSACTION_BYTES,
-        available_bytes: MAX_TRANSACTION_BYTES + (MAX_TRANSACTION_BYTES + 19) / 20,
+        available_bytes: MAX_TRANSACTION_BYTES + MAX_TRANSACTION_BYTES.div_ceil(20),
     };
     // When
     let result = exact.validate(capacity);

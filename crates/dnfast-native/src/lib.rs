@@ -5,7 +5,8 @@ use std::rc::Rc;
 
 mod inventory;
 pub use inventory::{
-    ExecutionState, ExecutorInventory, InventoryError, InventoryReader, KeyringInstalled,
+    ExecutionState, ExecutorInventory, InventoryError, InventoryReader, InventorySnapshot,
+    KeyringInstalled,
 };
 mod checked_transaction;
 mod transaction;
@@ -156,6 +157,18 @@ impl NativeContext {
         &mut self,
     ) -> Result<dnfast_core::InstalledInventory, InventoryError> {
         inventory::read_from_context(&mut self.inner)
+    }
+
+    pub fn read_installed_inventory_snapshot(
+        &mut self,
+    ) -> Result<InventorySnapshot, InventoryError> {
+        inventory::read_snapshot_from_context(&mut self.inner)
+    }
+
+    pub fn verify_installed_rpmdb(&mut self) -> Result<(), NativeError> {
+        self.inner
+            .verify_inventory_db("/")
+            .map_err(NativeError::from)
     }
 
     pub fn add_installed_repository(&mut self, repository: Repository) -> Result<(), NativeError> {

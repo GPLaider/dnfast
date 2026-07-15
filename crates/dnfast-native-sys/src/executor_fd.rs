@@ -44,18 +44,6 @@ pub fn exec_fixed_executor(plan: OwnedFd, approval: ExecutorApproval) -> Result<
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ExecutorApproval;
-
-    #[test]
-    fn approval_modes_have_fixed_native_values() {
-        assert_eq!(ExecutorApproval::Prompt.raw(), 0);
-        assert_eq!(ExecutorApproval::Yes.raw(), 1);
-        assert_eq!(ExecutorApproval::No.raw(), 2);
-    }
-}
-
 pub fn take_inherited_plan_fd() -> Result<OwnedFd, NativeError> {
     // SAFETY: [Category 8 — FFI boundary UB] the C function receives no Rust
     // pointers and returns either -1 or a fresh CLOEXEC descriptor it owns.
@@ -71,4 +59,16 @@ pub fn take_inherited_plan_fd() -> Result<OwnedFd, NativeError> {
     // SAFETY: [Category 12 — invalid free] the C wrapper returned a fresh
     // descriptor via F_DUPFD_CLOEXEC, transferring its single close duty here.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecutorApproval;
+
+    #[test]
+    fn approval_modes_have_fixed_native_values() {
+        assert_eq!(ExecutorApproval::Prompt.raw(), 0);
+        assert_eq!(ExecutorApproval::Yes.raw(), 1);
+        assert_eq!(ExecutorApproval::No.raw(), 2);
+    }
 }

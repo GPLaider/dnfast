@@ -138,9 +138,8 @@ fn concurrent_transactions_cannot_oversubscribe_cache_cap() {
             ArtifactCache::new(root)
                 .begin_transaction(&request)
                 .map(|_| ())
-                .map_err(|error| {
-                    let _ = calls;
-                    error
+                .inspect_err(|_| {
+                    let _ = &calls;
                 })
         })
     });

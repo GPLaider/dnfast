@@ -126,10 +126,13 @@ dnfast_status dnfast_inventory_read(dnfast_context *context,
                                     const char *root,
                                     dnfast_error *out_error);
 dnfast_status dnfast_inventory_read_cached(dnfast_context *context,
-                                           const char *root,
-                                           const char *expected_cookie,
-                                           uint8_t *cache_hit,
-                                           dnfast_error *out_error);
+                                            const char *root,
+                                            const char *expected_cookie,
+                                            uint8_t *cache_hit,
+                                            dnfast_error *out_error);
+dnfast_status dnfast_inventory_verify_db(dnfast_context *context,
+                                         const char *root,
+                                         dnfast_error *out_error);
 dnfast_status dnfast_inventory_write_begin(dnfast_context *context,
                                            dnfast_keyring *keyring,
                                            const char *root,
@@ -141,6 +144,10 @@ dnfast_status dnfast_inventory_read_locked_cached(dnfast_context *context,
                                                   const char *expected_cookie,
                                                   uint8_t *cache_hit,
                                                   dnfast_error *out_error);
+dnfast_status dnfast_inventory_read_locked_selected(dnfast_context *context,
+                                                    const char *const *names,
+                                                    size_t name_count,
+                                                    dnfast_error *out_error);
 void dnfast_inventory_write_end(dnfast_context *context);
 uint64_t dnfast_inventory_rpm_run_count(const dnfast_context *context);
 uint64_t dnfast_inventory_test_count(const dnfast_context *context);

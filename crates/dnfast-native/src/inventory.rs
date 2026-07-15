@@ -1,9 +1,9 @@
-use std::rc::Rc;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+use std::{collections::BTreeSet, rc::Rc};
 
 use dnfast_core::{
     Architecture, CanonicalDocument, EraseLookupError, Evra, InstalledInventory, InstalledPackage,
@@ -32,6 +32,10 @@ pub enum InventoryError {
     Interrupted,
     #[error("installed RPM inventory changed after solve")]
     StaleInventory,
+    #[error("RPMDB cookie did not change after a successful mutating transaction")]
+    UnchangedCookie,
+    #[error("post-transaction RPM identities differ: expected={expected}; actual={actual}")]
+    PostTransactionIdentity { expected: String, actual: String },
     #[error("invalid executor state transition")]
     InvalidState,
     #[error("cancellation is too late after transaction start")]
@@ -61,6 +65,12 @@ pub struct InventoryReader {
     context: crate::NativeContext,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InventorySnapshot {
+    pub inventory: InstalledInventory,
+    pub rpmdb_cookie: String,
+}
+
 #[derive(Clone)]
 struct CachedInventory {
     cookie: String,
@@ -78,6 +88,10 @@ impl InventoryReader {
 
     pub fn read(&mut self) -> Result<InstalledInventory, InventoryError> {
         self.context.read_installed_inventory()
+    }
+
+    pub fn read_snapshot(&mut self) -> Result<InventorySnapshot, InventoryError> {
+        self.context.read_installed_inventory_snapshot()
     }
 }
 
@@ -103,6 +117,7 @@ pub struct ExecutorInventory {
     pub(crate) inventory: InstalledInventory,
     pub(crate) state: ExecutionState,
     pub(crate) journal: Option<Rc<dnfast_state::TransactionJournal>>,
+    rpmdb_cookie: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +149,28 @@ impl ExecutorInventory {
             architecture,
             keyring,
             expected,
+            None,
+            root,
+            LOCK_TIMEOUT,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub fn begin_at_root_with_cookie(
+        architecture: Architecture,
+        keyring: KeyringInstalled,
+        expected: &InstalledInventory,
+        expected_cookie: &str,
+        root: &str,
+    ) -> Result<Self, InventoryError> {
+        if expected_cookie.is_empty() {
+            return Err(InventoryError::StaleInventory);
+        }
+        Self::begin_controlled(
+            architecture,
+            keyring,
+            expected,
+            Some(expected_cookie),
             root,
             LOCK_TIMEOUT,
             Arc::new(AtomicBool::new(false)),
@@ -150,6 +187,7 @@ impl ExecutorInventory {
             architecture,
             keyring,
             expected,
+            None,
             "/",
             LOCK_TIMEOUT,
             interrupted,
@@ -223,22 +261,78 @@ impl ExecutorInventory {
     }
 
     pub fn reconcile(&mut self) -> Result<&InstalledInventory, InventoryError> {
-        self.reconcile_with_success(true)
+        self.reconcile_with_success(true, None, None)
+    }
+
+    pub fn reconcile_selected(
+        &mut self,
+        changed_names: &[String],
+    ) -> Result<&InstalledInventory, InventoryError> {
+        self.reconcile_with_success(true, Some(changed_names), None)
+    }
+
+    pub fn reconcile_selected_expected(
+        &mut self,
+        changed_names: &[String],
+        expected_identities: &[(String, Evra, String)],
+    ) -> Result<&InstalledInventory, InventoryError> {
+        self.reconcile_with_success(true, Some(changed_names), Some(expected_identities))
     }
 
     pub fn reconcile_after_failure(&mut self) -> Result<&InstalledInventory, InventoryError> {
-        self.reconcile_with_success(false)
+        self.reconcile_with_success(false, None, None)
     }
 
     fn reconcile_with_success(
         &mut self,
         success: bool,
+        changed_names: Option<&[String]>,
+        expected_identities: Option<&[(String, Evra, String)]>,
     ) -> Result<&InstalledInventory, InventoryError> {
         if self.state != ExecutionState::Started {
             return Err(InventoryError::InvalidState);
         }
         let before = self.inventory.to_canonical_json()?;
-        let inventory = read_locked(&mut self.context)?;
+        let (inventory, post_cookie) = match changed_names {
+            Some(names) => {
+                let snapshot = read_locked_selected(&mut self.context, &self.inventory, names)?;
+                if self.rpmdb_cookie.as_deref() == Some(snapshot.rpmdb_cookie.as_str()) {
+                    return Err(InventoryError::UnchangedCookie);
+                }
+                (snapshot.inventory, Some(snapshot.rpmdb_cookie))
+            }
+            None if success => (read_locked(&mut self.context)?, None),
+            None => (read_locked_uncached(&mut self.context)?, None),
+        };
+        if let (Some(names), Some(expected)) = (changed_names, expected_identities) {
+            let changed = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            let mut actual = inventory
+                .packages()
+                .iter()
+                .filter(|package| changed.contains(package.name()))
+                .map(|package| {
+                    (
+                        package.name().to_owned(),
+                        package.evra().clone(),
+                        package.vendor().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut expected = expected.to_vec();
+            for (_, _, vendor) in &mut actual {
+                if vendor == "unknown" {
+                    vendor.clear();
+                }
+            }
+            actual.sort();
+            expected.sort();
+            if actual != expected {
+                return Err(InventoryError::PostTransactionIdentity {
+                    expected: format_identities(&expected),
+                    actual: format_identities(&actual),
+                });
+            }
+        }
         let after = inventory.to_canonical_json()?;
         if let Some(journal) = &self.journal {
             use sha2::{Digest as _, Sha256};
@@ -251,6 +345,9 @@ impl ExecutorInventory {
                 .map_err(|error| InventoryError::Journal(error.to_string()))?;
         }
         self.inventory = inventory;
+        if post_cookie.is_some() {
+            self.rpmdb_cookie = post_cookie;
+        }
         self.state = ExecutionState::Reconciled;
         Ok(&self.inventory)
     }
@@ -264,6 +361,7 @@ impl ExecutorInventory {
         architecture: Architecture,
         _keyring: KeyringInstalled,
         expected: &InstalledInventory,
+        expected_cookie: Option<&str>,
         root: &str,
         timeout: Duration,
         interrupted: Arc<AtomicBool>,
@@ -290,8 +388,13 @@ impl ExecutorInventory {
             Err(NativeError::Interrupted) => return Err(InventoryError::Interrupted),
             Err(error) => return Err(InventoryError::Native(error)),
         }
-        let inventory = read_locked(&mut context)?;
-        if inventory.to_canonical_json()? != expected.to_canonical_json()? {
+        let inventory = match expected_cookie {
+            Some(cookie) => read_locked_cookie_bound(&mut context, cookie, expected)?,
+            None => read_locked(&mut context)?,
+        };
+        if expected_cookie.is_none()
+            && inventory.to_canonical_json()? != expected.to_canonical_json()?
+        {
             context.end_inventory_write();
             return Err(InventoryError::StaleInventory);
         }
@@ -302,6 +405,7 @@ impl ExecutorInventory {
             inventory,
             state: ExecutionState::Prepared,
             journal: None,
+            rpmdb_cookie: expected_cookie.map(str::to_owned),
         })
     }
 }
@@ -329,12 +433,23 @@ impl Drop for ExecutorInventory {
 pub(crate) fn read_from_context(
     context: &mut dnfast_native_sys::Context,
 ) -> Result<InstalledInventory, InventoryError> {
+    read_snapshot_from_context(context).map(|snapshot| snapshot.inventory)
+}
+
+pub(crate) fn read_snapshot_from_context(
+    context: &mut dnfast_native_sys::Context,
+) -> Result<InventorySnapshot, InventoryError> {
     let mut cache = inventory_cache();
     let expected = cache.as_ref().map(|cached| cached.cookie.as_str());
     let read = context
         .read_inventory_cached("/", expected)
         .map_err(NativeError::from)?;
-    finish_cached_read(&mut cache, read)
+    let cookie = read.cookie.clone();
+    let inventory = finish_cached_read(&mut cache, read)?;
+    Ok(InventorySnapshot {
+        inventory,
+        rpmdb_cookie: cookie,
+    })
 }
 
 fn read_locked(
@@ -346,6 +461,102 @@ fn read_locked(
         .read_locked_inventory_cached(expected)
         .map_err(NativeError::from)?;
     finish_cached_read(&mut cache, read)
+}
+
+fn read_locked_uncached(
+    context: &mut dnfast_native_sys::Context,
+) -> Result<InstalledInventory, InventoryError> {
+    let read = context
+        .read_locked_inventory_cached(None)
+        .map_err(NativeError::from)?;
+    let mut cache = inventory_cache();
+    finish_cached_read(&mut cache, read)
+}
+
+fn format_identities(identities: &[(String, Evra, String)]) -> String {
+    identities
+        .iter()
+        .map(|(name, evra, vendor)| {
+            format!(
+                "{name}-{}:{}-{}.{} vendor={vendor:?}",
+                evra.epoch(),
+                evra.version(),
+                evra.release(),
+                evra.arch().as_rpm_arch()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn read_locked_cookie_bound(
+    context: &mut dnfast_native_sys::Context,
+    expected_cookie: &str,
+    expected: &InstalledInventory,
+) -> Result<InstalledInventory, InventoryError> {
+    let read = context
+        .read_locked_inventory_cached(Some(expected_cookie))
+        .map_err(NativeError::from)?;
+    if read.cookie != expected_cookie || read.inventory.is_some() {
+        context.end_inventory_write();
+        return Err(InventoryError::StaleInventory);
+    }
+    let mut cache = inventory_cache();
+    *cache = Some(CachedInventory {
+        cookie: expected_cookie.into(),
+        inventory: expected.clone(),
+    });
+    Ok(expected.clone())
+}
+
+fn read_locked_selected(
+    context: &mut dnfast_native_sys::Context,
+    before: &InstalledInventory,
+    changed_names: &[String],
+) -> Result<InventorySnapshot, InventoryError> {
+    if changed_names.is_empty() || changed_names.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(InventoryError::InvalidState);
+    }
+    let names = changed_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let read = context
+        .read_locked_inventory_selected(&names)
+        .map_err(NativeError::from)?;
+    let cookie = read.cookie;
+    let selected = convert(read.inventory.ok_or(InventoryError::InvalidState)?)?;
+    if selected.rpmdb_backend() != before.rpmdb_backend()
+        || selected.rpm_version() != before.rpm_version()
+    {
+        return Err(InventoryError::InvalidState);
+    }
+    let changed = changed_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if selected
+        .packages()
+        .iter()
+        .any(|package| !changed.contains(package.name()))
+    {
+        return Err(InventoryError::InvalidState);
+    }
+    let mut packages = before
+        .packages()
+        .iter()
+        .filter(|package| !changed.contains(package.name()))
+        .cloned()
+        .collect::<Vec<_>>();
+    packages.extend_from_slice(selected.packages());
+    let inventory =
+        InstalledInventory::new(before.rpmdb_backend(), before.rpm_version(), packages)?;
+    inventory.canonical_sha256()?;
+    *inventory_cache() = Some(CachedInventory {
+        cookie: cookie.clone(),
+        inventory: inventory.clone(),
+    });
+    Ok(InventorySnapshot {
+        inventory,
+        rpmdb_cookie: cookie,
+    })
 }
 
 fn inventory_cache() -> std::sync::MutexGuard<'static, Option<CachedInventory>> {

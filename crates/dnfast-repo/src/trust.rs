@@ -65,7 +65,7 @@ mod system_key_tests {
             .expect("file URI must normalize");
         let bundle = key_bundle_digest_owned(
             "fedora",
-            &[normalized.clone()],
+            std::slice::from_ref(&normalized),
             Path::new("/etc/dnfast/keys"),
             owner,
             Some(&directory),
@@ -101,7 +101,7 @@ mod system_key_tests {
         let url = normalize_gpgkey_location("https://untrusted.example.invalid/key");
         let direct_outside = key_bundle_digest_owned(
             "fedora",
-            &[outside.clone()],
+            std::slice::from_ref(&outside),
             Path::new("/etc/dnfast/keys"),
             owner,
             Some(&directory),

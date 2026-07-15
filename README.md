@@ -16,12 +16,24 @@ sudo dnfast apply /var/lib/dnfast/bash-plan.json --assumeyes
 sudo dnfast install bash --assumeyes
 sudo dnfast remove bash --assumeyes
 sudo dnfast upgrade --assumeyes
+sudo dnfast daemon status
+sudo dnfast daemon warm --repo fedora
 ```
 
 `repo refresh` and package-changing commands require root. `plan` writes a solved, reviewable,
 canonical plan to the mandatory absolute `--output` path. Plans are bound to the exact RPMDB,
 metadata, repository policy, package digests, and trust material and expire after five minutes.
-The convenience mutation commands solve, prepare, and invoke the same fixed executor in one run.
+The convenience mutation commands normally use the root-only `dnfastd` service. The daemon keeps
+one libsolv pool resident, returns the exact solved action set for approval, and accepts an
+approval token only on the same connection and unchanged RPMDB/repository generation. If the
+socket is genuinely absent or refusing connections, the CLI retains the fixed-executor path as a
+safe compatibility fallback; protocol and integrity failures never fall back. Root `plan` also
+uses the resident solve when the service is available.
+
+Install `dnfastd` at `/usr/libexec/dnfastd`, install
+[`packaging/dnfastd.service`](packaging/dnfastd.service) as a system service, and enable it before
+benchmarking the resident path. `dnfast daemon status` reports protocol readiness, while
+`dnfast daemon warm` loads the exact selected repository generation outside a timed mutation.
 
 Group, environment, module, plugin, COPR, system-upgrade, offline, autoremove, downgrade,
 reinstall, distro-sync, advisory, and history commands are not implemented and fail closed.
@@ -51,7 +63,7 @@ DNFAST_NATIVE_REAL=1 cargo test --offline --locked --workspace --all-targets -- 
 - `dnfast-native`: safe native solver, inventory, trust, and transaction state
 - `dnfast-solver`: explained canonical plan construction and validation
 - `dnfast-state`: durable transaction journal and reconciliation state
-- `dnfast-executor`: fixed root-only plan preparation and librpm executor
+- `dnfast-executor`: resident root service, fixed fallback, plan preparation, and librpm executor
 - `dnfast-cli`: supported user command surface and JSON response contract
 
 Read [architecture](docs/architecture.md) and [safety](docs/safety.md) before changing solver,

@@ -30,6 +30,11 @@ unsafe extern "C" {
         cache_hit: *mut u8,
         error: *mut RawError,
     ) -> i32;
+    fn dnfast_inventory_verify_db(
+        context: *mut RawContext,
+        root: *const c_char,
+        error: *mut RawError,
+    ) -> i32;
     fn dnfast_inventory_backend(context: *const RawContext) -> *const c_char;
     fn dnfast_inventory_cookie(context: *const RawContext) -> *const c_char;
     fn dnfast_inventory_rpm_version(context: *const RawContext) -> *const c_char;
@@ -46,6 +51,12 @@ unsafe extern "C" {
         context: *mut RawContext,
         expected_cookie: *const c_char,
         cache_hit: *mut u8,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_inventory_read_locked_selected(
+        context: *mut RawContext,
+        names: *const *const c_char,
+        name_count: usize,
         error: *mut RawError,
     ) -> i32;
     fn dnfast_inventory_write_end(context: *mut RawContext);
@@ -97,6 +108,20 @@ pub struct InventoryPackage {
 }
 
 impl Context {
+    pub fn verify_inventory_db(&mut self, root: &str) -> Result<(), NativeError> {
+        let root = c_string(root)?;
+        let mut error = empty_error();
+        // SAFETY: root and error are live for the synchronous call, and unique
+        // context access enforces the native thread-affinity contract.
+        let status =
+            unsafe { dnfast_inventory_verify_db(self.raw.as_ptr(), root.as_ptr(), &mut error) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status_error(status, &mut error))
+        }
+    }
+
     pub fn read_inventory(&mut self, root: &str) -> Result<Inventory, NativeError> {
         self.read_inventory_cached(root, None)?
             .inventory
@@ -203,6 +228,45 @@ impl Context {
             None
         };
         Ok(InventoryRead { cookie, inventory })
+    }
+
+    pub fn read_locked_inventory_selected(
+        &mut self,
+        names: &[&str],
+    ) -> Result<InventoryRead, NativeError> {
+        if names.is_empty() || names.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(NativeError {
+                status: 1,
+                component: "rpmdb".into(),
+                symbol: String::new(),
+                message: "selected inventory names are not canonical".into(),
+            });
+        }
+        let encoded = names
+            .iter()
+            .map(|name| c_string(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pointers = encoded.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+        let mut error = empty_error();
+        // SAFETY: every pointer references a live CString for the synchronous
+        // call, and unique context access serializes the native inventory buffer.
+        let status = unsafe {
+            dnfast_inventory_read_locked_selected(
+                self.raw.as_ptr(),
+                pointers.as_ptr(),
+                pointers.len(),
+                &mut error,
+            )
+        };
+        if status != 0 {
+            return Err(status_error(status, &mut error));
+        }
+        // SAFETY: the context owns the cookie until its next mutation.
+        let cookie = unsafe { copy_string(dnfast_inventory_cookie(self.raw.as_ptr()))? };
+        Ok(InventoryRead {
+            cookie,
+            inventory: Some(self.copy_inventory()?),
+        })
     }
 
     pub fn end_inventory_write(&mut self) {

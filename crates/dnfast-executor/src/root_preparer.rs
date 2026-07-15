@@ -91,6 +91,24 @@ impl RootInputPreparer {
         Self::prepare_with_transport_mode(proposal, &transport, false)
     }
 
+    /// Publishes inputs for a solve-token held by the resident root daemon.
+    ///
+    /// The token's RPMDB cookie is checked under the final librpm write lock,
+    /// so this path revalidates the root-owned snapshot but deliberately does
+    /// not perform another unlocked RPMDB walk or solve.
+    pub fn prepare_token_bound_system(
+        proposal: &CanonicalSolverPlan,
+    ) -> Result<PreparedInputs, PreparationError> {
+        require_root()?;
+        let transport = HttpArtifactTransport::new();
+        let digest = proposal.digest().map_err(solver)?;
+        let snapshot = current_snapshot(proposal)?;
+        let mut draft = InputDraft::create()?;
+        prepare_into_draft(proposal, &snapshot, &mut draft, &transport, false)?;
+        current_snapshot(proposal)?;
+        draft.publish(digest.as_str(), proposal)
+    }
+
     pub fn prepare_inherited(
         inherited: &InheritedPlan,
         now_unix: u64,

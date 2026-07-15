@@ -263,6 +263,7 @@ impl PackageAction {
             }),
         })
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn upgrade_with_identity(
         name: impl Into<String>,
         installed_evra: Evra,

@@ -15,6 +15,12 @@ use crate::{
     },
 };
 
+type LoadedInputs = (
+    Vec<dnfast_metadata::CompletePackage>,
+    Vec<dnfast_metadata::FileListPackage>,
+    Vec<dnfast_metadata::Package>,
+);
+
 impl Cache {
     pub fn open_current_verified_complete_generation(
         &self,
@@ -170,14 +176,7 @@ impl Cache {
         repomd: &[u8],
         primary: &[u8],
         manifest: &Manifest,
-    ) -> Result<
-        (
-            Vec<dnfast_metadata::CompletePackage>,
-            Vec<dnfast_metadata::FileListPackage>,
-            Vec<dnfast_metadata::Package>,
-        ),
-        CacheError,
-    > {
+    ) -> Result<LoadedInputs, CacheError> {
         match manifest.integrity {
             SnapshotIntegrity::SearchOnly => {
                 if manifest.filelists.is_some()

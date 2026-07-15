@@ -133,6 +133,36 @@ dnfast_status dnfast_inventory_read_locked_cached(dnfast_context *context,
 #endif
 }
 
+dnfast_status dnfast_inventory_read_locked_selected(dnfast_context *context,
+                                                     const char *const *names,
+                                                     size_t name_count,
+                                                     dnfast_error *error) {
+#ifdef DNFAST_NATIVE_REAL
+    if (context == NULL || context->inventory_write_ts == NULL ||
+        context->inventory_write_txn == NULL || names == NULL || name_count == 0)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "rpmdb", NULL, "selected read context is invalid");
+    char *cookie = dnfast_inventory_take_cookie(context->inventory_write_ts);
+    if (cookie == NULL || cookie[0] == '\0') {
+        free(cookie);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "rpm", "rpmdbCookie", "rpmdb cookie unavailable");
+    }
+    dnfast_status status = dnfast_inventory_collect_selected(
+        context, context->inventory_write_ts, names, name_count, error);
+    if (status == DNFAST_STATUS_OK) {
+        context->inventory_cookie = cookie;
+        cookie = NULL;
+    }
+    free(cookie);
+    return status;
+#else
+    (void)context; (void)names; (void)name_count;
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "rpm", "rpmtxnBegin", "real native build disabled");
+#endif
+}
+
 void dnfast_inventory_write_end(dnfast_context *context) {
     if (context == NULL) return;
 #ifdef DNFAST_NATIVE_REAL

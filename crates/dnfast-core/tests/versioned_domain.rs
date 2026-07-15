@@ -54,7 +54,7 @@ fn canonical_boundary_rejects_duplicate_keys_and_unsorted_arrays() {
 
 #[test]
 fn repo_preference_orders_priority_then_cost_then_id() {
-    let mut repos = vec![
+    let mut repos = [
         RepoPreference::new("z", 10, 10).unwrap(),
         RepoPreference::new("a", 10, 10).unwrap(),
         RepoPreference::new("cheap", 10, 1).unwrap(),

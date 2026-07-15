@@ -69,7 +69,7 @@ export MATRIX_BUILD_GPG_KEY='/absolute/path/to/fedora-build-key.asc'
 export MATRIX_HOST_TOOLS_SHA256='/absolute/path/to/trusted-host-tools.sha256'
 export MATRIX_GUEST_ASSETS_SHA256='/absolute/path/to/trusted-guest-assets.sha256'
 export MATRIX_RPM_REPOSITORY_SHA256='/absolute/path/to/trusted-rpm-repository.sha256'
-export MATRIX_BUILD_PACKAGES='gcc-16.1.1-2.fc44.x86_64 libsolv-devel-0.7.39-1.fc44.x86_64 rpm-devel-6.0.1-2.fc44.x86_64 nettle-devel-3.10.1-3.fc44.x86_64 clang-devel-22.1.8-1.fc44.x86_64 pkgconf-pkg-config-2.5.1-1.fc44.x86_64 rust-1.96.1-1.fc44.x86_64 cargo-1.96.1-1.fc44.x86_64'
+export MATRIX_BUILD_PACKAGES='gcc-16.1.1-2.fc44.x86_64 libsolv-devel-0.7.39-1.fc44.x86_64 rpm-devel-6.0.1-2.fc44.x86_64 nettle-devel-3.10.1-3.fc44.x86_64 clang-22.1.8-1.fc44.x86_64 pkgconf-pkg-config-2.5.1-1.fc44.x86_64 rust-1.96.1-1.fc44.x86_64 cargo-1.96.1-1.fc44.x86_64'
 ```
 
 필요한 것은 Fedora 44 x86_64 cloud image, 서로 맞는 OVMF code/variables,

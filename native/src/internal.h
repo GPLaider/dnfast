@@ -130,6 +130,10 @@ void dnfast_inventory_configure_trusted_rpmdb_read(rpmts ts);
 char *dnfast_inventory_take_cookie(rpmts ts);
 dnfast_status dnfast_inventory_collect(dnfast_context *context, rpmts ts,
                                        dnfast_error *error);
+dnfast_status dnfast_inventory_collect_selected(dnfast_context *context, rpmts ts,
+                                                const char *const *names,
+                                                size_t name_count,
+                                                dnfast_error *error);
 void dnfast_transaction_clear(dnfast_context *context);
 int dnfast_transaction_reverify(dnfast_context *context,
                                 dnfast_transaction_item *item);

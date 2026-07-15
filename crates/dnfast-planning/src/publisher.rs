@@ -21,7 +21,7 @@ use crate::{
     PlanningConfiguration, PlanningError, PlanningKey, PlanningOrigin, PlanningPayload,
     PlanningPolicy, PlanningRepository, PlanningSnapshot,
     fs::{TrustedDirectory, validate_root_executable, validate_tree},
-    snapshot_store::{garbage_collect, open_snapshot, publish_snapshot},
+    snapshot_store::{current_digest, garbage_collect, open_snapshot, publish_snapshot},
 };
 
 pub const SYSTEM_CACHE_PATH: &str = "/var/cache/dnfast";
@@ -111,11 +111,22 @@ impl RootPlanningPublisher {
         &self,
         inventory: InstalledInventory,
     ) -> Result<String, PlanningError> {
+        self.publish_inventory_onto_current_with_source(inventory)
+            .map(|(_, published)| published)
+    }
+
+    pub fn publish_inventory_onto_current_with_source(
+        &self,
+        inventory: InstalledInventory,
+    ) -> Result<(String, String), PlanningError> {
         self.require_publisher()?;
         let current = open_snapshot(&self.roots, self.owner)?;
+        let source = current.digest()?;
         let mut payload = current.payload().clone();
         payload.inventory = inventory;
-        self.store_snapshot(PlanningSnapshot::new(current.published_at_unix(), payload)?)
+        let published =
+            self.store_snapshot(PlanningSnapshot::new(current.published_at_unix(), payload)?)?;
+        Ok((source, published))
     }
 
     pub fn prepare_system_cache_for_verified_refresh(&self) -> Result<(), PlanningError> {
@@ -233,6 +244,10 @@ impl RootPlanningPublisher {
 impl PlanningSnapshot {
     pub fn open_system() -> Result<Self, PlanningError> {
         open_snapshot(&PlanningRoots::system(), 0)
+    }
+
+    pub fn current_system_digest() -> Result<String, PlanningError> {
+        current_digest(&PlanningRoots::system(), 0)
     }
 
     pub fn revalidate_system_state(&self) -> Result<(), PlanningError> {

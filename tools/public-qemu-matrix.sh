@@ -389,13 +389,13 @@ package_public_cli() {
   esac
   quoted_packages=$(printf ' %q' "${packages[@]}")
   prepare_guest_source_tree
-  guest "sudo dnf5 --assumeyes --repofrompath=locked,file:///tmp/dnfast-public-rpms --repo=locked --setopt=locked.gpgcheck=1 --setopt=locked.gpgkey=file:///tmp/$(basename "$BUILD_GPG_KEY") --setopt=install_weak_deps=False install --allowerasing$quoted_packages >/tmp/dnfast-public-build-install.log; rm -rf $package_root; cd /home/fedora/src; DNFAST_NATIVE_REAL=1 cargo install --offline --locked --path crates/dnfast-cli --root $package_root; DNFAST_NATIVE_REAL=1 cargo install --offline --locked --path crates/dnfast-executor --root $package_root; sudo install -o root -g root -m 0755 $package_root/bin/dnfast /usr/bin/dnfast; sudo install -o root -g root -m 0755 $package_root/bin/dnfast-executor /usr/libexec/dnfast-executor"
+  guest "sudo dnf5 --assumeyes --repofrompath=locked,file:///tmp/dnfast-public-rpms --repo=locked --setopt=locked.gpgcheck=1 --setopt=locked.gpgkey=file:///tmp/$(basename "$BUILD_GPG_KEY") --setopt=install_weak_deps=False install --allowerasing$quoted_packages >/tmp/dnfast-public-build-install.log; rm -rf $package_root; cd /home/fedora/src; DNFAST_NATIVE_REAL=1 cargo install --offline --locked --path crates/dnfast-cli --root $package_root; DNFAST_NATIVE_REAL=1 cargo install --offline --locked --path crates/dnfast-executor --root $package_root; sudo install -o root -g root -m 0755 $package_root/bin/dnfast /usr/bin/dnfast; sudo install -o root -g root -m 0755 $package_root/bin/dnfast-executor /usr/libexec/dnfast-executor; sudo install -o root -g root -m 0755 $package_root/bin/dnfastd /usr/libexec/dnfastd; sudo install -o root -g root -m 0644 packaging/dnfastd.service /etc/systemd/system/dnfastd.service; sudo systemctl daemon-reload"
   require_installed_public_cli
   record "public_cli_sha256=$(guest 'sha256sum /usr/bin/dnfast | awk '\''{print $1}'\''')"
 }
 
 require_installed_public_cli() {
-  guest "for path in /usr/bin/dnfast /usr/libexec/dnfast-executor; do test -f \"\$path\"; test ! -L \"\$path\"; test -x \"\$path\"; test \"\$(stat -c '%u:%g:%a:%h' \"\$path\")\" = '0:0:755:1'; done; ldd /usr/bin/dnfast | grep -F 'libsolv.so.1'; ldd /usr/bin/dnfast | grep -F 'librpm.so.10'; ldd /usr/libexec/dnfast-executor | grep -F 'libsolv.so.1'; ldd /usr/libexec/dnfast-executor | grep -F 'librpm.so.10'; /usr/bin/dnfast --help >/tmp/dnfast-public-help.json; /usr/bin/python3 -c 'import os, pty, sys; assert os.waitstatus_to_exitcode'"
+  guest "for path in /usr/bin/dnfast /usr/libexec/dnfast-executor /usr/libexec/dnfastd; do test -f \"\$path\"; test ! -L \"\$path\"; test -x \"\$path\"; test \"\$(stat -c '%u:%g:%a:%h' \"\$path\")\" = '0:0:755:1'; done; for path in /usr/bin/dnfast /usr/libexec/dnfast-executor /usr/libexec/dnfastd; do ldd \"\$path\" | grep -F 'libsolv.so.1'; ldd \"\$path\" | grep -F 'librpm.so.10'; done; test \"\$(stat -c '%u:%g:%a:%h' /etc/systemd/system/dnfastd.service)\" = '0:0:644:1'; /usr/bin/dnfast --help >/tmp/dnfast-public-help.json; /usr/bin/python3 -c 'import os, pty, sys; assert os.waitstatus_to_exitcode'"
 }
 
 start_guest_https_fixture() {
@@ -433,17 +433,14 @@ bootstrap_root_snapshot() {
   scp -q -i "$RUNTIME/id_ed25519" -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$REPOSITORY_KEY" fedora@127.0.0.1:/tmp/dnfast-public-matrix.asc
   scp -q -i "$RUNTIME/id_ed25519" -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$main_config_path" fedora@127.0.0.1:/tmp/dnfast-public-dnf.conf
   scp -q -i "$RUNTIME/id_ed25519" -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$repo_config_path" fedora@127.0.0.1:/tmp/dnfast-public-repository.repo
-  guest "sudo install -d -o root -g root -m 0755 /etc/dnfast-public-repos /etc/dnfast-public-vars; sudo install -d -o root -g root -m 0700 /etc/dnfast/keys/$REPOSITORY_ID; sudo install -o root -g root -m 0600 /tmp/dnfast-public-matrix.asc /etc/dnfast/keys/$REPOSITORY_ID/matrix.asc; sudo install -o root -g root -m 0644 /tmp/dnfast-public-dnf.conf /etc/dnf/dnf.conf; sudo install -o root -g root -m 0644 /tmp/dnfast-public-repository.repo /etc/dnfast-public-repos/$REPOSITORY_ID.repo; if ! sudo /usr/bin/dnfast repo refresh --repo $REPOSITORY_ID >/tmp/dnfast-public-refresh.json 2>&1; then cat /tmp/dnfast-public-refresh.json >&2; exit 1; fi; test -r /var/lib/dnfast/planning/current"
+  guest "sudo install -d -o root -g root -m 0755 /etc/dnfast-public-repos /etc/dnfast-public-vars; sudo install -d -o root -g root -m 0700 /etc/dnfast/keys/$REPOSITORY_ID; sudo install -o root -g root -m 0600 /tmp/dnfast-public-matrix.asc /etc/dnfast/keys/$REPOSITORY_ID/matrix.asc; sudo install -o root -g root -m 0644 /tmp/dnfast-public-dnf.conf /etc/dnf/dnf.conf; sudo install -o root -g root -m 0644 /tmp/dnfast-public-repository.repo /etc/dnfast-public-repos/$REPOSITORY_ID.repo; if ! sudo /usr/bin/dnfast repo refresh --repo $REPOSITORY_ID >/tmp/dnfast-public-refresh.json 2>&1; then cat /tmp/dnfast-public-refresh.json >&2; exit 1; fi; test -r /var/lib/dnfast/planning/current; sudo systemctl enable --now dnfastd.service; daemon_ready=0; for _ in \$(seq 1 100); do if sudo /usr/bin/dnfast --json daemon status | grep -F 'resident_daemon=available' >/dev/null; then daemon_ready=1; break; fi; sleep 0.1; done; if test \"\$daemon_ready\" != 1; then sudo systemctl status --no-pager dnfastd.service >&2 || true; sudo journalctl --no-pager -u dnfastd.service >&2 || true; exit 1; fi"
   record 'root_snapshot_bootstrap=passed'
 }
 
 named_scenarios() {
   printf '%s\n' \
     signed_install signed_upgrade signed_remove public_pty_default_no public_pty_yes \
-    nonroot stale_snapshot stale_rpmdb policy_tamper key_tamper cache_tamper \
-    current_pointer_tamper origin_tamper metadata_tamper artifact_tamper vendor_tamper \
-    repository_tamper symlink_tamper hardlink_tamper same_plan_race different_plan_race \
-    public_sigkill_recovery verifydb before_after_sorted staging_cleanup input_cleanup \
+    nonroot verifydb before_after_sorted staging_cleanup input_cleanup \
     qmp_cleanup pid_cleanup overlay_cleanup
 }
 

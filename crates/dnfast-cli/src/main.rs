@@ -137,6 +137,7 @@ fn command_from_arguments(arguments: impl IntoIterator<Item = String>) -> Option
         "install" => Some("install"),
         "remove" => Some("remove"),
         "upgrade" => Some("upgrade"),
+        "daemon" => Some("daemon"),
         "repo" => Some("repo"),
         "search" => Some("search"),
         "doctor" => Some("doctor"),

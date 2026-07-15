@@ -54,17 +54,32 @@ authorizes it.
 
 ## Execution and recovery
 
-The CLI can launch only `/usr/libexec/dnfast-executor` with a retained plan descriptor and a fixed
-argument shape. The executor requires root, rejects ambient path substitution, stages inputs under
-root-owned directories, revalidates the RPMDB and native solve, and asks for approval before
-allowing writes. Librpm performs transaction check, ordering, execution, and RPMDB verification on
-one owner thread.
+The resident socket directory is root-owned mode 0700, the socket is mode 0600, frames are bounded,
+and `SO_PEERCRED` restricts clients to EUID 0. A stale socket is removed only when it is a
+single-link root-owned socket. The sequential daemon has no general command runner. A prepared
+token binds one canonical solve, RPMDB cookie, planning/trust/policy generation, expiry, daemon
+nonce, and sequence; only the same connection can approve it. A token mismatch, unexpected frame,
+changed current snapshot, changed RPMDB cookie, or artifact mismatch aborts before writes and does
+not fall back to another execution path.
+
+The compatibility fallback can launch only `/usr/libexec/dnfast-executor` with a retained plan
+descriptor and a fixed argument shape. Both paths require root, reject ambient path substitution,
+stage inputs under root-owned directories, revalidate bound state, and ask for approval before
+allowing writes. Librpm performs transaction check, ordering, and execution on one owner thread.
+
+The daemon verifies the full RPMDB before exposing the socket, again after any external cookie
+change, and on every stateful failure. A successful daemon-owned transaction must change the
+cookie and must exactly match the approved post-transaction identities for every changed package
+name while the write lock is still held. This incremental integrity proof replaces an otherwise
+redundant full verify on the hot success path; it does not bypass TEST, artifact/signature checks,
+cookie validation, exact identity validation, journaling, or failure verification. The fixed
+fallback continues to perform a full post-transaction RPMDB verification.
 
 RPM transactions cannot promise atomic rollback once payload or scriptlet execution begins.
-Dnfast writes a durable journal before the real transaction, records callbacks/results, verifies
-RPMDB, republishes inventory after success, and reconciles interrupted or failed started
-transactions on the next executor entry. Recovery reports observed state; it does not claim to
-reverse arbitrary scriptlet side effects. Package script output is untrusted data.
+Dnfast writes a durable journal before the real transaction, records callbacks/results, publishes
+the validated inventory after success, and reconciles interrupted or failed started transactions
+after daemon restart or on the next fixed-executor entry. Recovery reports observed state; it does
+not claim to reverse arbitrary scriptlet side effects. Package script output is untrusted data.
 
 # Artifact cache path authority
 

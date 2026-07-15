@@ -60,6 +60,11 @@ pub(crate) enum Commands {
     Remove(MutationArgs),
     #[command(about = "Plan and apply an upgrade through the fixed root executor")]
     Upgrade(MutationArgs),
+    #[command(about = "Inspect or pre-warm the resident transaction daemon")]
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     #[command(about = "Inspect configured repositories without network access")]
     Repo {
         #[command(subcommand)]
@@ -74,6 +79,17 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "DIR")]
         cache_dir: Option<PathBuf>,
         query: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum DaemonCommand {
+    #[command(about = "Check whether the root-only resident daemon is available")]
+    Status,
+    #[command(about = "Preload the libsolv pool for an exact repository selection")]
+    Warm {
+        #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+        repositories: Vec<String>,
     },
 }
 

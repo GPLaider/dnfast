@@ -417,25 +417,6 @@ pub struct DecisionOutput {
     pub provider_installed: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn x86_64_context_selects_the_x86_64_native_pool() {
-        let context = Context::open(PoolArchitecture::X86_64, || false).unwrap();
-        assert_eq!(
-            context.pool_architecture().unwrap(),
-            PoolArchitecture::X86_64
-        );
-    }
-
-    #[test]
-    fn requested_spec_when_native_getter_returns_null_maps_to_none() {
-        assert_eq!(copy_requested_spec(std::ptr::null()).unwrap(), None);
-    }
-}
-
 pub(crate) fn empty_error() -> RawError {
     RawError {
         status: 0,
@@ -648,5 +629,24 @@ impl Drop for Context {
         // SAFETY: [Categories 3 and 12 — dangling/double free] `raw` is uniquely
         // owned by this Context and Drop runs exactly once.
         unsafe { dnfast_context_free(self.raw.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x86_64_context_selects_the_x86_64_native_pool() {
+        let context = Context::open(PoolArchitecture::X86_64, || false).unwrap();
+        assert_eq!(
+            context.pool_architecture().unwrap(),
+            PoolArchitecture::X86_64
+        );
+    }
+
+    #[test]
+    fn requested_spec_when_native_getter_returns_null_maps_to_none() {
+        assert_eq!(copy_requested_spec(std::ptr::null()).unwrap(), None);
     }
 }

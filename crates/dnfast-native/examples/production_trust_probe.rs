@@ -106,7 +106,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let symlink_path = key_root.join("symlink.asc");
     std::os::unix::fs::symlink(&key_path, &symlink_path)?;
-    if KeyringInstalled::from_repository(&policy, &repo_id, &[symlink_path.clone()]).is_ok() {
+    if KeyringInstalled::from_repository(&policy, &repo_id, std::slice::from_ref(&symlink_path))
+        .is_ok()
+    {
         return Err("key symlink accepted".into());
     }
     fs::remove_file(&symlink_path)?;

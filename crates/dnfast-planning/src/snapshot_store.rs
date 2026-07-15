@@ -34,6 +34,11 @@ pub(crate) fn open_snapshot(
     Ok(result)
 }
 
+pub(crate) fn current_digest(roots: &PlanningRoots, owner: u32) -> Result<String, PlanningError> {
+    let planning = TrustedDirectory::open(roots.planning_root(), owner, false, 0)?;
+    pointer_digest(&planning.read(CURRENT_POINTER, 65)?)
+}
+
 pub(crate) fn publish_snapshot(
     planning: &TrustedDirectory,
     snapshots: &TrustedDirectory,

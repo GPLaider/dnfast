@@ -134,6 +134,80 @@ pub(crate) fn stage(
     })
 }
 
+pub(crate) fn stage_token_bound(
+    directory: &std::os::fd::OwnedFd,
+    manifest: &InputManifest,
+) -> Result<StagedInputs, ExecutorError> {
+    let policy = parse_policy(directory, &manifest.policy)?;
+    let repositories = manifest
+        .repositories
+        .iter()
+        .map(|repository| {
+            let trust = parse_trust(directory, &repository.trust.policy)?;
+            let keys = repository
+                .trust
+                .keys
+                .iter()
+                .map(|key| {
+                    let mut file = open_retained(directory, &key.file)?;
+                    let mut certificate = Vec::new();
+                    file.read_to_end(&mut certificate).map_err(io)?;
+                    Ok(VerifiedStagedKey {
+                        bundle_path: key.bundle_path.clone(),
+                        certificate,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutorError>>()?;
+            Ok(StagedRepository {
+                repository: Repository {
+                    id: repository.id.clone(),
+                    repomd_path: String::new(),
+                    primary_path: String::new(),
+                    filelists_path: String::new(),
+                    priority: repository.priority,
+                    cost: repository.cost,
+                },
+                trust,
+                keys,
+                generation_sha256: repository.generation_sha256.clone(),
+                origin_sha256: repository.origin.sha256.clone(),
+                trust_sha256: repository.trust.sha256.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ExecutorError>>()?;
+    let artifacts = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            let file = open_retained(directory, &artifact.file)?;
+            Ok(StagedArtifact {
+                file,
+                expected: ExpectedPackage {
+                    name: artifact.name.clone(),
+                    epoch: artifact.epoch.into(),
+                    version: artifact.version.clone(),
+                    release: artifact.release.clone(),
+                    arch: artifact.arch.clone(),
+                    vendor: artifact.vendor.clone(),
+                },
+                sha256: artifact.file.sha256.clone(),
+                size: artifact.file.size,
+                repo_id: artifact.repo_id.clone(),
+                generation_sha256: artifact.generation_sha256.clone(),
+                origin_sha256: artifact.origin_sha256.clone(),
+                trust_sha256: artifact.trust_sha256.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ExecutorError>>()?;
+    Ok(StagedInputs {
+        policy,
+        repositories,
+        candidates: Vec::new(),
+        metadata: Vec::new(),
+        artifacts,
+    })
+}
+
 fn copy(
     directory: &std::os::fd::OwnedFd,
     staging: &mut Staging,

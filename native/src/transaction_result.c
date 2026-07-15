@@ -5,10 +5,14 @@ dnfast_status dnfast_transaction_verify_db(dnfast_context *context, dnfast_error
     if (context == NULL || context->transaction_phase != DNFAST_TRANSACTION_STARTED)
         return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
                                 "rpm", "rpmtsVerifyDB", "real run has not started");
-    rpmts ts = rpmtsCreate();
-    int failed = context->transaction_fail_callback == 6 || ts == NULL || rpmtsSetRootDir(ts, "/") != 0 ||
-        rpmtsSetKeyring(ts, context->transaction_keyring) != 0 || rpmtsVerifyDB(ts) != 0;
-    rpmtsFree(ts);
+    /* Keep verification on the root-only transaction set that already owns
+     * the RPMDB write lock.  Creating a second rpmts here reopens the database
+     * after every mutation and weakens the lock-scoped state relationship we
+     * want to verify.  Reuse preserves the full rpmtsVerifyDB check while
+     * avoiding that redundant setup and I/O. */
+    rpmts ts = context->inventory_write_ts;
+    int failed = context->transaction_fail_callback == 6 || ts == NULL ||
+        context->inventory_write_txn == NULL || rpmtsVerifyDB(ts) != 0;
     return failed ? dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
         "rpm", "rpmtsVerifyDB", "rpmdb verification failed") : DNFAST_STATUS_OK;
 #else

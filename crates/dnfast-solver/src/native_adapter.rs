@@ -7,6 +7,14 @@ use crate::{
 };
 use dnfast_core::PackageSpec;
 
+type ResolvedIdentity = (
+    ResolvedOperation,
+    String,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+);
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeAction {
@@ -378,16 +386,7 @@ fn action_identity(
     action: &NativeAction,
     candidate: Option<&CandidatePackage>,
     inventory: &dnfast_core::InstalledInventory,
-) -> Result<
-    (
-        ResolvedOperation,
-        String,
-        Option<u64>,
-        Option<String>,
-        Option<String>,
-    ),
-    PlanError,
-> {
+) -> Result<ResolvedIdentity, PlanError> {
     match action.kind.as_str() {
         "install" | "obsoletes" => {
             let value =

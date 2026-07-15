@@ -80,6 +80,10 @@ impl RootInputs {
         crate::staged_inputs::stage(&self._directory, &self.manifest, staging)
     }
 
+    pub fn stage_token_bound(&self) -> Result<StagedInputs, ExecutorError> {
+        crate::staged_inputs::stage_token_bound(&self._directory, &self.manifest)
+    }
+
     pub fn base_arch(&self) -> Result<dnfast_core::Architecture, ExecutorError> {
         Ok(read_policy(&self._directory, &self.manifest.policy, self.owner)?.base_arch())
     }

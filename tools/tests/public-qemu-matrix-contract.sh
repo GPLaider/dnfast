@@ -272,7 +272,7 @@ executor_references_are_packaging_or_preflight_only() {
       *dnfast-executor*)
         [[ $line == *'DNFAST_NATIVE_REAL=1 cargo install --offline --locked --path crates/dnfast-executor --root $package_root'* ||
           $line == *'$package_root/bin/dnfast-executor /usr/libexec/dnfast-executor'* ||
-          $line == *'for path in /usr/bin/dnfast /usr/libexec/dnfast-executor;'* ]] || return 1
+          $line == *'for path in /usr/bin/dnfast /usr/libexec/dnfast-executor /usr/libexec/dnfastd;'* ]] || return 1
         ;;
     esac
   done <"$HARNESS"
@@ -325,12 +325,13 @@ ok "packages public CLI with the real native backend" contains "$HARNESS" 'DNFAS
 ok "installs package output at public path" contains "$HARNESS" '$package_root/bin/dnfast /usr/bin/dnfast'
 ok "packages the fixed executor with the real native backend" contains "$HARNESS" 'DNFAST_NATIVE_REAL=1 cargo install --offline --locked --path crates/dnfast-executor'
 ok "installs the fixed executor at its root-only path" contains "$HARNESS" '$package_root/bin/dnfast-executor /usr/libexec/dnfast-executor'
-ok "preflights both installed program paths" contains "$HARNESS" 'for path in /usr/bin/dnfast /usr/libexec/dnfast-executor;'
+ok "installs the resident daemon at its root-only path" contains "$HARNESS" '$package_root/bin/dnfastd /usr/libexec/dnfastd'
+ok "installs the resident daemon service" contains "$HARNESS" 'packaging/dnfastd.service /etc/systemd/system/dnfastd.service'
+ok "preflights all installed program paths" contains "$HARNESS" 'for path in /usr/bin/dnfast /usr/libexec/dnfast-executor /usr/libexec/dnfastd;'
 ok "requires regular non-symlink root-owned program files" contains "$HARNESS" 'test -f \"\$path\"; test ! -L \"\$path\"; test -x \"\$path\"; test \"\$(stat -c '\''%u:%g:%a:%h'\'' \"\$path\")\" = '\''0:0:755:1'\'''
-ok "probes installed public CLI for libsolv linkage" contains "$HARNESS" "ldd /usr/bin/dnfast | grep -F 'libsolv.so.1'"
-ok "probes installed public CLI for librpm linkage" contains "$HARNESS" "ldd /usr/bin/dnfast | grep -F 'librpm.so.10'"
-ok "probes installed fixed executor for libsolv linkage" contains "$HARNESS" "ldd /usr/libexec/dnfast-executor | grep -F 'libsolv.so.1'"
-ok "probes installed fixed executor for librpm linkage" contains "$HARNESS" "ldd /usr/libexec/dnfast-executor | grep -F 'librpm.so.10'"
+ok "probes every installed program for native linkage" contains "$HARNESS" 'do ldd \"\$path\" | grep -F '\''libsolv.so.1'\''; ldd \"\$path\" | grep -F '\''librpm.so.10'\''; done'
+ok "starts the resident daemon after snapshot bootstrap" contains "$HARNESS" 'systemctl enable --now dnfastd.service'
+ok "checks the resident daemon protocol after startup" contains "$HARNESS" 'resident_daemon=available'
 ok "checks public CLI help after packaging" contains "$HARNESS" '/usr/bin/dnfast --help >/tmp/dnfast-public-help.json'
 ok "preflights the guest Python PTY standard library" contains "$HARNESS" "/usr/bin/python3 -c 'import os, pty, sys; assert os.waitstatus_to_exitcode'"
 ok "passes each locked build package as a distinct DNF argument" contains "$HARNESS" "printf ' %q' \"\${packages[@]}\""
@@ -385,6 +386,13 @@ for marker in \
   nonroot verifydb before_after_sorted staging_cleanup input_cleanup \
   qmp_cleanup pid_cleanup overlay_cleanup; do
   ok "named matrix scenario $marker" contains "$HARNESS" "$marker"
+done
+for stale_marker in \
+  stale_snapshot stale_rpmdb policy_tamper key_tamper cache_tamper \
+  current_pointer_tamper origin_tamper metadata_tamper artifact_tamper vendor_tamper \
+  repository_tamper symlink_tamper hardlink_tamper same_plan_race different_plan_race \
+  public_sigkill_recovery; do
+  ok "does not advertise unexecuted scenario $stale_marker" absent "$HARNESS" "^[[:space:]]+$stale_marker([[:space:]]|$)"
 done
 ok "plans as the unprivileged public user" contains "$HARNESS" 'setpriv --reuid=fedora --regid=fedora --clear-groups /usr/bin/dnfast'
 ok "applies only through installed public CLI" contains "$HARNESS" 'sudo /usr/bin/dnfast apply'

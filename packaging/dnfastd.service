@@ -1,0 +1,20 @@
+[Unit]
+Description=dnfast resident libsolv and RPM transaction service
+After=local-fs.target
+Before=dnf-makecache.timer
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/dnfastd
+Restart=on-failure
+RestartSec=250ms
+RuntimeDirectory=dnfast
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=no
+
+[Install]
+WantedBy=multi-user.target

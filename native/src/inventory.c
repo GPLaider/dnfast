@@ -120,6 +120,48 @@ static int fill_record(Header header, dnfast_inventory_record *record) {
     return 0;
 }
 
+static int collect_iterator(dnfast_context *context,
+                            rpmdbMatchIterator iterator,
+                            size_t *capacity) {
+    Header header;
+    while ((header = rpmdbNextIterator(iterator)) != NULL) {
+        if (context->inventory_count == context->limits.max_packages) return 1;
+        if (context->inventory_count == *capacity) {
+            size_t next = *capacity == 0 ? 16 : *capacity * 2;
+            if (next > context->limits.max_packages) next = context->limits.max_packages;
+            void *grown = realloc(context->inventory, next * sizeof(*context->inventory));
+            if (grown == NULL) return 2;
+            context->inventory = grown;
+            *capacity = next;
+        }
+        if (fill_record(header, &context->inventory[context->inventory_count])) return 2;
+        context->inventory_count++;
+    }
+    return 0;
+}
+
+static dnfast_status finish_collection(dnfast_context *context,
+                                       int collected,
+                                       dnfast_error *error) {
+    if (collected == 1) {
+        dnfast_inventory_clear(context);
+        return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
+                                "rpm", "rpmdbNextIterator", "package limit exceeded");
+    }
+    if (collected != 0) {
+        dnfast_inventory_clear(context);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "rpm", "headerGet", "invalid installed header");
+    }
+    context->inventory_backend = rpmExpand("%{?_db_backend}", NULL);
+    if (context->inventory_backend == NULL || context->inventory_backend[0] == '\0') {
+        dnfast_inventory_clear(context);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "rpm", "rpmExpand", "rpmdb backend unavailable");
+    }
+    return DNFAST_STATUS_OK;
+}
+
 dnfast_status dnfast_inventory_collect(dnfast_context *context, rpmts ts,
                                        dnfast_error *error) {
     rpmdbMatchIterator iterator = rpmtsInitIterator(ts, RPMDBI_PACKAGES, NULL, 0);
@@ -128,36 +170,64 @@ dnfast_status dnfast_inventory_collect(dnfast_context *context, rpmts ts,
                                 "rpm", "rpmtsInitIterator", "rpmdb unreadable");
     dnfast_inventory_clear(context);
     size_t capacity = 0;
-    Header header;
-    while ((header = rpmdbNextIterator(iterator)) != NULL) {
-        if (context->inventory_count == context->limits.max_packages) goto limit;
-        if (context->inventory_count == capacity) {
-            size_t next = capacity == 0 ? 256 : capacity * 2;
-            if (next > context->limits.max_packages) next = context->limits.max_packages;
-            void *grown = realloc(context->inventory, next * sizeof(*context->inventory));
-            if (grown == NULL) goto failure;
-            context->inventory = grown;
-            capacity = next;
-        }
-        if (fill_record(header, &context->inventory[context->inventory_count])) goto failure;
-        context->inventory_count++;
-    }
+    int collected = collect_iterator(context, iterator, &capacity);
     rpmdbFreeIterator(iterator);
-    context->inventory_backend = rpmExpand("%{?_db_backend}", NULL);
-    if (context->inventory_backend == NULL || context->inventory_backend[0] == '\0') {
-        dnfast_inventory_clear(context);
+    return finish_collection(context, collected, error);
+}
+
+dnfast_status dnfast_inventory_collect_selected(dnfast_context *context, rpmts ts,
+                                                const char *const *names,
+                                                size_t name_count,
+                                                dnfast_error *error) {
+    if (name_count > context->limits.max_packages)
+        return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
+                                "rpm", "rpmtsInitIterator", "name limit exceeded");
+    dnfast_inventory_clear(context);
+    size_t capacity = 0;
+    int collected = 0;
+    rpmdb db = rpmtsGetRdb(ts);
+    if (db == NULL)
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
-                                "rpm", "rpmExpand", "rpmdb backend unavailable");
+                                "rpm", "rpmtsGetRdb", "rpmdb is not open");
+    for (size_t index = 0; index < name_count; ++index) {
+        if (names[index] == NULL || names[index][0] == '\0' ||
+            (index != 0 && strcmp(names[index - 1], names[index]) >= 0)) {
+            dnfast_inventory_clear(context);
+            return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                    "rpmdb", NULL, "selected names are not canonical");
+        }
+        /* rpmtsInitIterator() returns NULL for both no match and failure.
+         * rpmdbCountPackages() preserves that distinction: zero is a valid
+         * absent name and -1 is an index/open/read failure.  Both calls use
+         * the same RPMDB and transaction-scoped write lock. */
+        int match_count = rpmdbCountPackages(db, names[index]);
+        if (match_count < 0) {
+            dnfast_inventory_clear(context);
+            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                    "rpm", "rpmdbCountPackages",
+                                    "selected package count failed");
+        }
+        if (match_count == 0) continue;
+        rpmdbMatchIterator iterator = rpmtsInitIterator(
+            ts, RPMDBI_NAME, names[index], 0);
+        if (iterator == NULL) {
+            dnfast_inventory_clear(context);
+            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                    "rpm", "rpmtsInitIterator",
+                                    "selected package iterator failed");
+        }
+        size_t before_count = context->inventory_count;
+        collected = collect_iterator(context, iterator, &capacity);
+        rpmdbFreeIterator(iterator);
+        if (collected != 0) break;
+        if (context->inventory_count - before_count != (size_t)match_count) {
+            dnfast_inventory_clear(context);
+            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                    "rpm", "rpmdbNextIterator",
+                                    "selected package count changed");
+        }
     }
-    return DNFAST_STATUS_OK;
-limit:
-    rpmdbFreeIterator(iterator); dnfast_inventory_clear(context);
-    return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
-                            "rpm", "rpmdbNextIterator", "package limit exceeded");
-failure:
-    rpmdbFreeIterator(iterator); dnfast_inventory_clear(context);
-    return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
-                            "rpm", "headerGet", "invalid installed header");
+    return finish_collection(context, collected, error);
 }
 #endif
 
@@ -165,6 +235,37 @@ dnfast_status dnfast_inventory_read(dnfast_context *context, const char *root,
                                     dnfast_error *error) {
     uint8_t cache_hit = 0;
     return dnfast_inventory_read_cached(context, root, NULL, &cache_hit, error);
+}
+
+dnfast_status dnfast_inventory_verify_db(dnfast_context *context,
+                                         const char *root,
+                                         dnfast_error *error) {
+    if (context == NULL || root == NULL || strcmp(root, "/") != 0)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "rpmdb", NULL, "inventory root must be /");
+    if (!pthread_equal(context->owner, pthread_self()))
+        return dnfast_set_error(error, DNFAST_STATUS_WRONG_THREAD,
+                                "rpmdb", NULL, "wrong owner thread");
+    dnfast_status status = dnfast_callback_check(&context->callbacks, error);
+    if (status != DNFAST_STATUS_OK) return status;
+#ifdef DNFAST_NATIVE_REAL
+    status = dnfast_inventory_prepare_rpm(error);
+    if (status != DNFAST_STATUS_OK) return status;
+    rpmts ts = rpmtsCreate();
+    if (ts == NULL || rpmtsSetRootDir(ts, root) != 0) {
+        rpmtsFree(ts);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "rpm", "rpmtsCreate", "verification context failed");
+    }
+    dnfast_inventory_configure_trusted_rpmdb_read(ts);
+    int failed = rpmtsVerifyDB(ts) != 0;
+    rpmtsFree(ts);
+    return failed ? dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+        "rpm", "rpmtsVerifyDB", "rpmdb verification failed") : DNFAST_STATUS_OK;
+#else
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "rpm", "rpmtsVerifyDB", "real native build disabled");
+#endif
 }
 
 dnfast_status dnfast_inventory_read_cached(dnfast_context *context,

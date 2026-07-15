@@ -100,13 +100,15 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
     );
     root.restore_namespace_root()?;
     staging.cleanup()?;
-    execution?;
-    republish_planning_inventory_after_transaction()?;
+    let inventory_after = execution?;
+    republish_planning_inventory_after_transaction(&inventory_after)?;
     root.cleanup()?;
     Ok(Outcome::Executed(proposal, id.as_str().into()))
 }
 
-fn republish_planning_inventory_after_transaction() -> Result<(), ExecutorError> {
+fn republish_planning_inventory_after_transaction(
+    inventory: &dnfast_core::InstalledInventory,
+) -> Result<(), ExecutorError> {
     if !std::path::Path::new("/proc/self/fd").is_dir() {
         return Err(ExecutorError::Plan("post-transaction inventory republish requires /proc/self/fd after leaving the transaction chroot".into()));
     }
@@ -116,7 +118,7 @@ fn republish_planning_inventory_after_transaction() -> Result<(), ExecutorError>
         ))
     })?;
     publisher
-        .publish_inventory_after_transaction()
+        .publish_inventory_onto_current(inventory.clone())
         .map_err(|error| {
             ExecutorError::Plan(format!(
                 "post-transaction inventory republish failed: {error}"

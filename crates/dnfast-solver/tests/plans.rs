@@ -328,7 +328,7 @@ fn protected_and_reverse_dependency_removals_fail_before_plan() {
         introduced_by_requested: false,
         solver_rule: "requested removal".into(),
     };
-    assert!(builder.build(&[action.clone()]).is_err());
+    assert!(builder.build(std::slice::from_ref(&action)).is_err());
     let mut reverse = action;
     reverse.name = "other".into();
     reverse.installed_instance = Some(8);

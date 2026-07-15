@@ -181,6 +181,7 @@ fn planning_failure(error: dnfast_planning::PlanningError) -> AppFailure {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::cell::Cell;
 

@@ -19,6 +19,13 @@ use dnfast_repo::{
     RepoError, Repository, SourceKind, Variables, load_repository_dirs, parse_repository_file,
 };
 
+type CacheContract<'a> = (
+    &'a Path,
+    Result<Snapshot, CacheError>,
+    Result<Vec<String>, CacheError>,
+    Result<Snapshot, CacheError>,
+);
+
 struct OfflineTransport;
 
 impl Transport for OfflineTransport {
@@ -132,12 +139,7 @@ pub fn compile_m1_contract(cache_root: &Path) {
     );
 
     let cache = Cache::new(cache_root);
-    let _cache_contract: (
-        &Path,
-        Result<Snapshot, CacheError>,
-        Result<Vec<String>, CacheError>,
-        Result<Snapshot, CacheError>,
-    ) = (
+    let _cache_contract: CacheContract<'_> = (
         cache.root(),
         cache.load("missing"),
         cache.repositories(),
