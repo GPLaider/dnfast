@@ -30,7 +30,7 @@ reinstall, distro-sync, advisory, and history commands are not implemented and f
 ## Native build and test
 
 The real native path requires the Fedora libsolv, librpm, Nettle, and Clang development packages
-(`libsolv-devel rpm-devel nettle-devel clang-devel`). Clang is used by the locked Nettle bindings
+(`libsolv-devel rpm-devel nettle-devel clang`). Clang is used by the locked Nettle bindings
 build; runtime metadata-signature verification uses Sequoia OpenPGP. Build and test explicitly so
 a missing native or cryptographic toolchain cannot be mistaken for a successful product build:
 
