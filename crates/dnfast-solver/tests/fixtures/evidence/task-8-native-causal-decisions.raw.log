@@ -1,0 +1,24 @@
+command: tools/fedora44-native-build.sh --sanitize --probe --keep-cache
+platform: Fedora Linux 44 aarch64 under QEMU/KVM
+observed_exit: 0
+action	install	transitive	dnfast-dep-0:1.0-1.noarch
+action	install	transitive	dnfast-app-0:1.0-1.noarch
+decision	strong	action	dnfast-app-0:1.0-1.noarch	dnfast-dep-0:1.0-1.noarch	dnfast-dep >= 1.0
+action	install	main	dnfast-obsoletes-0:2.0-1.noarch
+action	install	main	dnfast-weak-app-0:1.0-1.noarch
+decision	weak	action	dnfast-weak-app-0:1.0-1.noarch	dnfast-obsoletes-0:2.0-1.noarch	dnfast-dep
+action	install	main	dnfast-app-0:1.0-1.noarch
+decision	strong	installed	dnfast-app-0:1.0-1.noarch	dnfast-dep-0:1.0-1.noarch	dnfast-dep >= 1.0
+action	upgrade	main	dnfast-upgrade-0:2.0-1.noarch
+pair	dnfast-upgrade-0:2.0-1.noarch	dnfast-upgrade-0:1.0-1.noarch
+action	upgraded	@System	dnfast-upgrade-0:1.0-1.noarch
+action	obsoletes	main	dnfast-obsoletes-0:2.0-1.noarch
+pair	dnfast-obsoletes-0:2.0-1.noarch	dnfast-dep-0:1.0-1.noarch
+action	obsoleted	@System	dnfast-dep-0:1.0-1.noarch
+assert repeated-causal-matrix=20/20
+assert runtime-symbol-coverage=true count=58
+assert weak-disabled-decision-count=0
+assert installed-provider-no-redundant-action=true
+assert ambiguous-installed-provider-rejected=true
+assert native-obsolete-counterparts=true
+assert sanitizer-errors=0

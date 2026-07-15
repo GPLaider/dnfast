@@ -1,0 +1,46 @@
+[package]
+name = "dnfast-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dnfast-executor"
+path = "src/main.rs"
+
+[[example]]
+name = "mount_swap_probe"
+required-features = ["test-fixtures"]
+
+[[example]]
+name = "recovery_seed"
+required-features = ["test-fixtures"]
+
+[features]
+test-fixtures = []
+
+[dependencies]
+dnfast-core = { path = "../dnfast-core" }
+dnfast-cache = { path = "../dnfast-cache" }
+dnfast-metadata = { path = "../dnfast-metadata" }
+dnfast-native = { path = "../dnfast-native" }
+dnfast-native-sys = { path = "../dnfast-native-sys" }
+dnfast-planning = { path = "../dnfast-planning" }
+dnfast-repo = { path = "../dnfast-repo" }
+dnfast-state = { path = "../dnfast-state" }
+dnfast-solver = { path = "../dnfast-solver" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+rustix = { version = "1.1", features = ["fs", "mount", "process", "thread"] }
+thiserror = "2"
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

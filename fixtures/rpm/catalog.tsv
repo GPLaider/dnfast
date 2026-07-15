@@ -1,0 +1,34 @@
+semantic	package	version	release	arch	boundary	artifact
+app	dnfast-app	1.0	1	noarch	solver-transitive
+dependency	dnfast-dep	1.0	1	noarch	solver-transitive
+rich	dnfast-rich	1.0	1	noarch	solver-rich
+unsatisfied	dnfast-unsatisfied	1.0	1	noarch	solver-problem
+weak	dnfast-weak-app	1.0	1	noarch	solver-weak
+file-provide	dnfast-file-provider	1.0	1	noarch	solver-file-provide
+file-collision	dnfast-file-collision	1.0	1	noarch	rpmts-check
+conflict	dnfast-conflict	1.0	1	noarch	solver-conflict
+obsoletes	dnfast-obsoletes	2.0	1	noarch	solver-obsoletes
+upgrade-v1	dnfast-upgrade	1.0	1	noarch	solver-upgrade
+upgrade-v2	dnfast-upgrade	2.0	1	noarch	solver-upgrade
+aarch64	dnfast-arch	1.0	1	aarch64	solver-arch
+noarch	dnfast-noarch	1.0	1	noarch	solver-arch
+wrong-arch	dnfast-arch	1.0	1	x86_64	solver-arch	dnfast-arch-1.0-1.x86_64.rpm
+priority-tie	dnfast-priority	1.0	1	noarch	solver-priority
+cost-tie	dnfast-cost	1.0	1	noarch	solver-cost
+vendor-switch-v1	dnfast-vendor-switch	1.0	1	noarch	solver-vendor-policy
+vendor-switch-v2	dnfast-vendor-switch	2.0	1	noarch	solver-vendor-policy
+arch-switch-v1	dnfast-arch-switch	1.0	1	aarch64	solver-arch-policy
+arch-switch-v2	dnfast-arch-switch	2.0	1	noarch	solver-arch-policy
+config	dnfast-config	1.0	1	noarch	rpm-config
+protected	dnfast-protected	1.0	1	noarch	policy-protected
+installonly	dnfast-installonly	1.0	1	noarch	policy-installonly
+pre-failure	dnfast-pre-failure	1.0	1	noarch	rpm-pre-script
+post-failure	dnfast-post-failure	1.0	1	noarch	rpm-post-script
+trigger-failure	dnfast-trigger-failure	1.0	1	noarch	rpm-trigger-script
+unsigned	dnfast-app	1.0	1	noarch	signature-missing
+corrupt	dnfast-app	1.0	1	noarch	payload-integrity
+alternate-key	dnfast-app	1.0	1	noarch	signer-authorization
+expired-primary	dnfast-app	1.0	1	noarch	certificate-expired
+revoked-primary	dnfast-app	1.0	1	noarch	certificate-revoked
+expired-subkey	dnfast-app	1.0	1	noarch	subkey-expired
+revoked-subkey	dnfast-app	1.0	1	noarch	subkey-revoked

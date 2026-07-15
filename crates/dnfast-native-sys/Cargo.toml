@@ -1,0 +1,17 @@
+[package]
+name = "dnfast-native-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+links = "dnfast_native"
+
+[dependencies]
+sha2 = "0.10"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[lints.rust]
+unsafe_code = "allow"

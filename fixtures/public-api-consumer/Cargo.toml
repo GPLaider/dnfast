@@ -1,0 +1,18 @@
+[package]
+name = "dnfast-public-api-consumer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dnfast-cache = { path = "../../crates/dnfast-cache" }
+dnfast-core = { path = "../../crates/dnfast-core" }
+dnfast-metadata = { path = "../../crates/dnfast-metadata" }
+dnfast-refresh = { path = "../../crates/dnfast-refresh" }
+dnfast-repo = { path = "../../crates/dnfast-repo" }
+dnfast-state = { path = "../../crates/dnfast-state" }
+
+[lints]
+workspace = true

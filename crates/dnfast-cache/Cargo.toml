@@ -1,0 +1,22 @@
+[package]
+name = "dnfast-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dnfast-native-sys = { path = "../dnfast-native-sys" }
+dnfast-metadata = { path = "../dnfast-metadata" }
+hex = "0.4"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+tempfile = "3.27"
+rustix = { version = "1.1", features = ["fs", "process"] }
+thiserror = "2"
+url = "2"
+ureq = { version = "3.3", default-features = false, features = ["platform-verifier", "rustls"] }
+
+[lints]
+workspace = true

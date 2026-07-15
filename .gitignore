@@ -1,0 +1,35 @@
+# Rust build products.
+/target/
+
+# Local dnfast runtime state and VM/tool caches.
+/.dnfast/
+/.cache/
+/staging/
+/overlays/
+/qemu/
+*.qcow2
+*.qcow2.*
+*.img
+*.iso
+*.overlay
+*.pflash
+
+# Work-controller state and ephemeral test evidence.  The executable plan is
+# intentionally tracked below; the evidence tree can contain raw logs, guest
+# transcripts, generated binaries, and VM-adjacent material.
+/.omo/*
+!/.omo/plans/
+!/.omo/plans/**
+
+# Never add locally generated private signing/keyring material.  Public fixture
+# certificates use the .asc extension and remain trackable.
+/.gnupg/
+/.gnupg-*/
+/private-keys/
+/keyrings/
+*.key
+*.pem
+*.p12
+*.pfx
+*.priv
+*.secret

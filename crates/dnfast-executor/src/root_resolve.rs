@@ -1,0 +1,39 @@
+use dnfast_core::{Action, CanonicalDocument};
+use dnfast_solver::{CanonicalSolverPlan, NativeSolveOutput, PlanBuilder, ReSolveContract};
+
+use crate::{ExecutorError, StagedInputs};
+
+pub fn require_equal(proposed: &CanonicalSolverPlan, staged: &StagedInputs, root: &str) -> Result<dnfast_core::InstalledInventory, ExecutorError> {
+    let proposal = proposed.proposal();
+    let selected = proposal.selected_repositories().iter().map(|repository| repository.id().to_owned()).collect::<Vec<_>>();
+    let snapshot = dnfast_planning::PlanningSnapshot::open_system().map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    let current = snapshot.integrity_for_repositories(&selected).map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    if proposal.integrity() != current { return Err(ExecutorError::Plan("root planning snapshot or repository binding mismatch".into())); }
+    let mut context = dnfast_native::NativeContext::open(staged.policy.base_arch(), || false).map_err(native)?;
+    context.add_installed_rpmdb(root).map_err(native)?;
+    let inventory = context.read_installed_inventory().map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    if inventory.canonical_sha256().map_err(|error| ExecutorError::Plan(error.to_string()))?.as_str() != proposal.inventory_sha256().as_str() {
+        return Err(ExecutorError::Plan("root inventory digest mismatch".into()));
+    }
+    for repository in &staged.repositories { context.add_repository(repository.repository.clone()).map_err(native)?; }
+    let intent = proposal.intent();
+    let names = intent.packages().iter().map(|package| package.as_str()).collect::<Vec<_>>();
+    let result = match intent.action() {
+        Action::Install => context.solve_install_many(&names, staged.policy.install_weak_deps(), staged.policy.best()),
+        Action::Upgrade => context.solve_upgrade_many(&names, staged.policy.best()),
+        Action::Remove => context.solve_erase_many(&names),
+    }.map_err(native)?;
+    let metadata = staged.metadata.iter().map(|(repository, package)| (repository.as_str(), package)).collect::<Vec<_>>();
+    let transcript = NativeSolveOutput::from_native(result, proposal.metadata_sha256().as_str().into(), &metadata, &inventory)
+        .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    let resolved = transcript.into_resolved(&names, &staged.candidates, &metadata, &inventory)
+        .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    let snapshots = proposal.integrity();
+    let root_plan = PlanBuilder { intent, snapshots: &snapshots, inventory: &inventory, policy: &staged.policy,
+        candidates: &staged.candidates, expires_at_unix: proposal.expires_at_unix() }.build(&resolved)
+        .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    ReSolveContract::require_equal(proposed, &root_plan).map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    Ok(inventory)
+}
+
+fn native(error: dnfast_native::NativeError) -> ExecutorError { ExecutorError::Plan(error.to_string()) }

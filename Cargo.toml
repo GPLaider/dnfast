@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/dnfast-cache",
+    "crates/dnfast-cli",
+    "crates/dnfast-core",
+    "crates/dnfast-executor",
+    "crates/dnfast-metadata",
+    "crates/dnfast-native",
+    "crates/dnfast-native-sys",
+    "crates/dnfast-planning",
+    "crates/dnfast-repo",
+    "crates/dnfast-refresh",
+    "crates/dnfast-solver",
+    "crates/dnfast-state",
+    "fixtures/public-api-consumer",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

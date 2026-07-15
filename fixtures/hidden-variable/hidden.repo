@@ -1,0 +1,3 @@
+[hidden]
+enabled=1
+baseurl=https://example.test/ok https://example.test/$unknown

@@ -1,0 +1,8 @@
+[fedora]
+enabled=yes
+baseurl=https://example.test/fedora/$releasever/$basearch
+
+[disabled]
+enabled=off
+mirrorlist=https://example.test/mirrors/${releasever}
+

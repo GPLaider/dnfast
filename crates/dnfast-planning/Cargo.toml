@@ -1,0 +1,26 @@
+[package]
+name = "dnfast-planning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = "0.22"
+dnfast-cache = { path = "../dnfast-cache" }
+dnfast-core = { path = "../dnfast-core" }
+dnfast-metadata = { path = "../dnfast-metadata" }
+dnfast-native = { path = "../dnfast-native" }
+dnfast-repo = { path = "../dnfast-repo" }
+hex = "0.4"
+rustix = { version = "1.1", features = ["fs", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

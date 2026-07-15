@@ -1,0 +1,13 @@
+void pool_create(void) {}
+void pool_free(void) {}
+void solver_create(void) {}
+void solver_solve(void) {}
+void solver_free(void) {}
+void solver_set_flag(void) {}
+void solver_problem_count(void) {}
+void solver_problem2str(void) {}
+void solver_create_transaction(void) {}
+void transaction_free(void) {}
+void transaction_order(void) {}
+void transaction_type(void) {}
+void selection_make(void) {}
