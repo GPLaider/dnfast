@@ -59,7 +59,6 @@ impl RootPlanningPublisher {
         let host_architecture = host_rpm_architecture()?;
         let mut context = dnfast_native::NativeContext::open(host_architecture, || false)
             .map_err(|error| PlanningError::Input(error.to_string()))?;
-        context.add_installed_rpmdb("/").map_err(|error| PlanningError::Input(error.to_string()))?;
         let inventory = context.read_installed_inventory().map_err(|error| PlanningError::Input(error.to_string()))?;
         self.publish(&profile, inventory, published_at_unix, host_architecture)
     }
@@ -74,7 +73,6 @@ impl RootPlanningPublisher {
         let host_architecture = host_rpm_architecture()?;
         let mut context = dnfast_native::NativeContext::open(host_architecture, || false)
             .map_err(|error| PlanningError::Input(error.to_string()))?;
-        context.add_installed_rpmdb("/").map_err(|error| PlanningError::Input(error.to_string()))?;
         let inventory = context.read_installed_inventory().map_err(|error| PlanningError::Input(error.to_string()))?;
         self.publish_inventory_onto_current(inventory)
     }

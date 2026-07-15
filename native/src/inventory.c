@@ -1,5 +1,6 @@
 #include "internal.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,6 +40,24 @@ dnfast_status dnfast_inventory_prepare_rpm(dnfast_error *error) {
                                 "rpm", "rpmReadConfigFiles", "RPM configuration failed");
     return DNFAST_STATUS_OK;
 }
+
+void dnfast_inventory_configure_trusted_rpmdb_read(rpmts ts) {
+    /*
+     * Installed headers live in the root-owned RPMDB and were authenticated at
+     * install time.  Re-running their package signatures on every inventory
+     * walk is both redundant and very expensive on RPM 6.  The inventory still
+     * exports and SHA-256 binds every immutable header, while package artifacts
+     * are verified separately against the isolated repository keyring before
+     * either TEST or real transaction execution.
+     */
+    rpmtsSetVSFlags(ts, rpmtsVSFlags(ts) | RPMVSF_NOHDRCHK);
+    rpmtsSetVfyFlags(ts, rpmtsVfyFlags(ts) | RPMVSF_NOHDRCHK);
+}
+
+char *dnfast_inventory_take_cookie(rpmts ts) {
+    if (rpmtsGetRdb(ts) == NULL && rpmtsOpenDB(ts, O_RDONLY) != 0) return NULL;
+    return rpmdbCookie(rpmtsGetRdb(ts));
+}
 #endif
 
 void dnfast_inventory_clear(dnfast_context *context) {
@@ -47,9 +66,11 @@ void dnfast_inventory_clear(dnfast_context *context) {
         free_record(&context->inventory[index]);
     free(context->inventory);
     free(context->inventory_backend);
+    free(context->inventory_cookie);
     context->inventory = NULL;
     context->inventory_count = 0;
     context->inventory_backend = NULL;
+    context->inventory_cookie = NULL;
 }
 
 #ifdef DNFAST_NATIVE_REAL
@@ -142,9 +163,22 @@ failure:
 
 dnfast_status dnfast_inventory_read(dnfast_context *context, const char *root,
                                     dnfast_error *error) {
+    uint8_t cache_hit = 0;
+    return dnfast_inventory_read_cached(context, root, NULL, &cache_hit, error);
+}
+
+dnfast_status dnfast_inventory_read_cached(dnfast_context *context,
+                                           const char *root,
+                                           const char *expected_cookie,
+                                           uint8_t *cache_hit,
+                                           dnfast_error *error) {
     if (context == NULL || root == NULL || strcmp(root, "/") != 0)
         return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
                                 "rpmdb", NULL, "inventory root must be /");
+    if (cache_hit == NULL)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "rpmdb", NULL, "cache result is null");
+    *cache_hit = 0;
     if (!pthread_equal(context->owner, pthread_self()))
         return dnfast_set_error(error, DNFAST_STATUS_WRONG_THREAD,
                                 "rpmdb", NULL, "wrong owner thread");
@@ -159,13 +193,32 @@ dnfast_status dnfast_inventory_read(dnfast_context *context, const char *root,
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                 "rpm", "rpmtsCreate", "inventory context failed");
     }
+    dnfast_inventory_configure_trusted_rpmdb_read(ts);
     rpmtxn txn = rpmtxnBegin(ts, RPMTXN_READ);
     if (txn == NULL) {
         rpmtsFree(ts);
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                 "rpm", "rpmtxnBegin", "rpmdb read lock failed");
     }
-    status = dnfast_inventory_collect(context, ts, error);
+    char *cookie = dnfast_inventory_take_cookie(ts);
+    if (cookie == NULL || cookie[0] == '\0') {
+        free(cookie);
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "rpm", "rpmdbCookie", "rpmdb cookie unavailable");
+    } else if (expected_cookie != NULL && strcmp(expected_cookie, cookie) == 0) {
+        dnfast_inventory_clear(context);
+        context->inventory_cookie = cookie;
+        cookie = NULL;
+        *cache_hit = 1;
+        status = DNFAST_STATUS_OK;
+    } else {
+        status = dnfast_inventory_collect(context, ts, error);
+        if (status == DNFAST_STATUS_OK) {
+            context->inventory_cookie = cookie;
+            cookie = NULL;
+        }
+    }
+    free(cookie);
     rpmtxnEnd(txn);
     rpmtsFree(ts);
     return status;
@@ -177,6 +230,10 @@ dnfast_status dnfast_inventory_read(dnfast_context *context, const char *root,
 
 const char *dnfast_inventory_backend(const dnfast_context *context) {
     return context == NULL ? NULL : context->inventory_backend;
+}
+
+const char *dnfast_inventory_cookie(const dnfast_context *context) {
+    return context == NULL ? NULL : context->inventory_cookie;
 }
 
 const char *dnfast_inventory_rpm_version(const dnfast_context *context) {

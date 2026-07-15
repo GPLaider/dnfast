@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +51,7 @@ impl InstalledPackage {
     pub fn immutable_header_sha256(&self) -> &Sha256Digest { &self.immutable_header_sha256 }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledInventory {
     schema_version: u32,
@@ -59,7 +59,21 @@ pub struct InstalledInventory {
     rpmdb_backend: String,
     rpm_version: String,
     packages: Vec<InstalledPackage>,
+    #[serde(skip)]
+    canonical_sha256: OnceLock<Sha256Digest>,
 }
+
+impl PartialEq for InstalledInventory {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.install_root == other.install_root
+            && self.rpmdb_backend == other.rpmdb_backend
+            && self.rpm_version == other.rpm_version
+            && self.packages == other.packages
+    }
+}
+
+impl Eq for InstalledInventory {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,7 +86,8 @@ impl<'de> Deserialize<'de> for InstalledInventory {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = RawInstalledInventory::deserialize(deserializer)?;
         let value = Self { schema_version: raw.schema_version, install_root: raw.install_root,
-            rpmdb_backend: raw.rpmdb_backend, rpm_version: raw.rpm_version, packages: raw.packages };
+            rpmdb_backend: raw.rpmdb_backend, rpm_version: raw.rpm_version, packages: raw.packages,
+            canonical_sha256: OnceLock::new() };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
     }
@@ -85,7 +100,8 @@ impl InstalledInventory {
         for package in &packages {
             if !identities.insert(package.db_instance) { return Err(DomainError::Duplicate(format!("rpmdb instance {}", package.db_instance))); }
         }
-        let value = Self { schema_version: 1, install_root: "/".into(), rpmdb_backend: backend.into(), rpm_version: rpm_version.into(), packages };
+        let value = Self { schema_version: 1, install_root: "/".into(), rpmdb_backend: backend.into(), rpm_version: rpm_version.into(), packages,
+            canonical_sha256: OnceLock::new() };
         value.validate()?;
         Ok(value)
     }
@@ -121,4 +137,14 @@ impl InstalledInventory {
 impl CanonicalDocument for InstalledInventory {
     fn from_canonical_json(bytes: &[u8]) -> Result<Self, DomainError> { let value: Self = canonical::parse(bytes)?; value.validate()?; Ok(value) }
     fn to_canonical_json(&self) -> Result<Vec<u8>, DomainError> { self.validate()?; canonical::serialize(self) }
+    fn canonical_sha256(&self) -> Result<Sha256Digest, DomainError> {
+        if let Some(digest) = self.canonical_sha256.get() { return Ok(digest.clone()); }
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256Digest::parse(
+            format!("{:x}", Sha256::digest(self.to_canonical_json()?)),
+            "canonical_sha256",
+        )?;
+        let _ = self.canonical_sha256.set(digest.clone());
+        Ok(digest)
+    }
 }

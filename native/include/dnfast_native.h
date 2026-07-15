@@ -125,6 +125,11 @@ dnfast_status dnfast_solver_add_rpmdb(dnfast_context *context,
 dnfast_status dnfast_inventory_read(dnfast_context *context,
                                     const char *root,
                                     dnfast_error *out_error);
+dnfast_status dnfast_inventory_read_cached(dnfast_context *context,
+                                           const char *root,
+                                           const char *expected_cookie,
+                                           uint8_t *cache_hit,
+                                           dnfast_error *out_error);
 dnfast_status dnfast_inventory_write_begin(dnfast_context *context,
                                            dnfast_keyring *keyring,
                                            const char *root,
@@ -132,6 +137,10 @@ dnfast_status dnfast_inventory_write_begin(dnfast_context *context,
                                            dnfast_error *out_error);
 dnfast_status dnfast_inventory_read_locked(dnfast_context *context,
                                            dnfast_error *out_error);
+dnfast_status dnfast_inventory_read_locked_cached(dnfast_context *context,
+                                                  const char *expected_cookie,
+                                                  uint8_t *cache_hit,
+                                                  dnfast_error *out_error);
 void dnfast_inventory_write_end(dnfast_context *context);
 uint64_t dnfast_inventory_rpm_run_count(const dnfast_context *context);
 uint64_t dnfast_inventory_test_count(const dnfast_context *context);
@@ -224,6 +233,7 @@ void dnfast_inventory_fixture_reset_global_counts(void);
 uint64_t dnfast_inventory_fixture_global_test_count(void);
 uint64_t dnfast_inventory_fixture_global_real_count(void);
 const char *dnfast_inventory_backend(const dnfast_context *context);
+const char *dnfast_inventory_cookie(const dnfast_context *context);
 const char *dnfast_inventory_rpm_version(const dnfast_context *context);
 size_t dnfast_inventory_count(const dnfast_context *context);
 const dnfast_inventory_record *dnfast_inventory_get(

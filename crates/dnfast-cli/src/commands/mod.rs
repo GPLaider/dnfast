@@ -101,7 +101,7 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
     temporary.as_file().sync_all().map_err(|error| AppFailure::new(1, error.to_string()))?;
     temporary.as_file_mut().seek(SeekFrom::Start(0)).map_err(|error| AppFailure::new(1, error.to_string()))?;
     let plan_fd = temporary.as_file().as_fd().try_clone_to_owned().map_err(|error| AppFailure::new(1, error.to_string()))?;
-    prepare_before_fixed_executor(&plan_fd)?;
+    prepare_locally_solved_before_fixed_executor(&plan_fd)?;
     match dnfast_native_sys::exec_fixed_executor(plan_fd, approval) {
         Ok(()) => Err(AppFailure::new(1, "fixed executor unexpectedly returned")),
         Err(error) => Err(AppFailure::new(1, error.to_string())),
@@ -122,6 +122,15 @@ fn prepare_before_fixed_executor(fd: &std::os::fd::OwnedFd) -> Result<(), AppFai
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| AppFailure::new(1, error.to_string()))?.as_secs();
     let proposal = dnfast_solver::CanonicalSolverPlan::from_canonical_json(&bytes, now).map_err(|error| AppFailure::new(1, error.to_string()))?;
     let prepared = dnfast_executor::RootInputPreparer::prepare_system(&proposal).map_err(|error| AppFailure::new(1, error.to_string()))?;
+    prepared.revalidate_before_fd3(&proposal).map_err(|error| AppFailure::new(1, error.to_string()))
+}
+
+fn prepare_locally_solved_before_fixed_executor(fd: &std::os::fd::OwnedFd) -> Result<(), AppFailure> {
+    let bytes = read_retained_plan_bytes(fd)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| AppFailure::new(1, error.to_string()))?.as_secs();
+    let proposal = dnfast_solver::CanonicalSolverPlan::from_canonical_json(&bytes, now).map_err(|error| AppFailure::new(1, error.to_string()))?;
+    let prepared = dnfast_executor::RootInputPreparer::prepare_locally_solved_system(&proposal)
+        .map_err(|error| AppFailure::new(1, error.to_string()))?;
     prepared.revalidate_before_fd3(&proposal).map_err(|error| AppFailure::new(1, error.to_string()))
 }
 

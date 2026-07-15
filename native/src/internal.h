@@ -63,6 +63,7 @@ struct dnfast_context {
     dnfast_inventory_record *inventory;
     size_t inventory_count;
     char *inventory_backend;
+    char *inventory_cookie;
     uint64_t inventory_rpm_run_count;
     uint64_t inventory_test_count;
     uint64_t inventory_real_count;
@@ -125,6 +126,8 @@ char *dnfast_solvable_identity(struct s_Pool *pool, struct s_Solvable *item);
 void dnfast_inventory_clear(dnfast_context *context);
 #ifdef DNFAST_NATIVE_REAL
 dnfast_status dnfast_inventory_prepare_rpm(dnfast_error *error);
+void dnfast_inventory_configure_trusted_rpmdb_read(rpmts ts);
+char *dnfast_inventory_take_cookie(rpmts ts);
 dnfast_status dnfast_inventory_collect(dnfast_context *context, rpmts ts,
                                        dnfast_error *error);
 void dnfast_transaction_clear(dnfast_context *context);

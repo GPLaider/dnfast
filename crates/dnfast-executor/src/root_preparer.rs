@@ -61,6 +61,16 @@ impl RootInputPreparer {
         Self::prepare_with_transport(proposal, &transport)
     }
 
+    /// Stages a plan produced in this process by the root-published planner.
+    ///
+    /// The fixed executor still independently re-solves and performs its final
+    /// lock-held RPMDB equality check before any write.  This path only avoids
+    /// repeating the same unlocked solve once more while staging trusted inputs.
+    pub fn prepare_locally_solved_system(proposal: &CanonicalSolverPlan) -> Result<PreparedInputs, PreparationError> {
+        let transport = HttpArtifactTransport::new();
+        Self::prepare_with_transport_mode(proposal, &transport, false)
+    }
+
     pub fn prepare_inherited(
         inherited: &InheritedPlan,
         now_unix: u64,
@@ -76,12 +86,20 @@ impl RootInputPreparer {
         proposal: &CanonicalSolverPlan,
         transport: &dyn ArtifactTransport,
     ) -> Result<PreparedInputs, PreparationError> {
+        Self::prepare_with_transport_mode(proposal, transport, true)
+    }
+
+    fn prepare_with_transport_mode(
+        proposal: &CanonicalSolverPlan,
+        transport: &dyn ArtifactTransport,
+        re_solve: bool,
+    ) -> Result<PreparedInputs, PreparationError> {
         require_root()?;
         let digest = proposal.digest().map_err(solver)?;
         let snapshot = current_snapshot(proposal)?;
         let mut draft = InputDraft::create()?;
 
-        match prepare_into_draft(proposal, &snapshot, &mut draft, transport) {
+        match prepare_into_draft(proposal, &snapshot, &mut draft, transport, re_solve) {
             Ok(()) => {
                 revalidate_snapshot_and_inventory(proposal)?;
                 draft.publish(digest.as_str(), proposal)
@@ -96,18 +114,24 @@ fn prepare_into_draft(
     snapshot: &PlanningSnapshot,
     draft: &mut InputDraft,
     transport: &dyn ArtifactTransport,
+    re_solve: bool,
 ) -> Result<(), PreparationError> {
     let selected_ids = selected_ids(proposal);
     let integrity = snapshot.integrity_for_repositories(&selected_ids).map_err(snapshot_error)?;
     if integrity != proposal.proposal().integrity() { return Err(PreparationError::SnapshotMismatch); }
 
     let policy = &snapshot.payload().policy.solver;
-    let mut context = NativeContext::open(policy.base_arch(), || false).map_err(native)?;
-    context.add_installed_rpmdb("/").map_err(native)?;
-    let inventory = context.read_installed_inventory().map_err(|error| PreparationError::Native(error.to_string()))?;
-    if inventory.canonical_sha256().map_err(domain)?.as_str() != proposal.proposal().inventory_sha256().as_str() {
-        return Err(PreparationError::RpmdbChanged);
-    }
+    let mut context = if re_solve {
+        let mut context = NativeContext::open(policy.base_arch(), || false).map_err(native)?;
+        context.add_installed_rpmdb("/").map_err(native)?;
+        let inventory = context.read_installed_inventory().map_err(|error| PreparationError::Native(error.to_string()))?;
+        if inventory.canonical_sha256().map_err(domain)?.as_str() != proposal.proposal().inventory_sha256().as_str() {
+            return Err(PreparationError::RpmdbChanged);
+        }
+        Some((context, inventory))
+    } else {
+        None
+    };
 
     let repositories = selected_repositories(snapshot, proposal)?;
     let mut materialized_repositories = Vec::with_capacity(repositories.len());
@@ -120,42 +144,46 @@ fn prepare_into_draft(
         let parsed = parse_candidates(&materialized.input, &mut repomd, &mut primary).map_err(inputs)?;
         candidates.extend(parsed.0);
         metadata.extend(parsed.1);
-        context.add_repository(Repository {
-            id: materialized.input.id.clone(),
-            repomd_path: draft.absolute_path(&materialized.input.repomd.name),
-            primary_path: draft.absolute_path(&materialized.native_primary.name),
-            filelists_path: draft.absolute_path(&materialized.native_filelists.name),
-            priority: materialized.input.priority,
-            cost: materialized.input.cost,
-        }).map_err(native)?;
+        if let Some((context, _)) = &mut context {
+            context.add_repository(Repository {
+                id: materialized.input.id.clone(),
+                repomd_path: draft.absolute_path(&materialized.input.repomd.name),
+                primary_path: draft.absolute_path(&materialized.native_primary.name),
+                filelists_path: draft.absolute_path(&materialized.native_filelists.name),
+                priority: materialized.input.priority,
+                cost: materialized.input.cost,
+            }).map_err(native)?;
+        }
         materialized_repositories.push(materialized);
     }
 
-    let names = proposal.proposal().intent().packages().iter().map(|package| package.as_str()).collect::<Vec<_>>();
-    let solved = match proposal.proposal().intent().action() {
-        Action::Install => context.solve_install_many(&names, policy.install_weak_deps(), policy.best()),
-        Action::Upgrade => context.solve_upgrade_many(&names, policy.best()),
-        Action::Remove => context.solve_erase_many(&names),
-    }.map_err(native)?;
     draft.discard_native_metadata(&materialized_repositories)?;
     let repository_inputs = materialized_repositories.into_iter().map(|materialized| materialized.input).collect::<Vec<_>>();
-    let metadata_refs = metadata.iter().map(|(id, package)| (id.as_str(), package)).collect::<Vec<_>>();
-    let transcript = NativeSolveOutput::from_native(
-        solved,
-        proposal.proposal().metadata_sha256().as_str().into(),
-        &metadata_refs,
-        &inventory,
-    ).map_err(solver)?;
-    let resolved = transcript.into_resolved(&names, &candidates, &metadata_refs, &inventory).map_err(solver)?;
-    let root_plan = PlanBuilder {
-        intent: proposal.proposal().intent(),
-        snapshots: &integrity,
-        inventory: &inventory,
-        policy,
-        candidates: &candidates,
-        expires_at_unix: proposal.proposal().expires_at_unix(),
-    }.build(&resolved).map_err(solver)?;
-    ReSolveContract::require_equal(proposal, &root_plan).map_err(|_| PreparationError::ReSolveMismatch)?;
+    if let Some((mut context, inventory)) = context {
+        let names = proposal.proposal().intent().packages().iter().map(|package| package.as_str()).collect::<Vec<_>>();
+        let solved = match proposal.proposal().intent().action() {
+            Action::Install => context.solve_install_many(&names, policy.install_weak_deps(), policy.best()),
+            Action::Upgrade => context.solve_upgrade_many(&names, policy.best()),
+            Action::Remove => context.solve_erase_many(&names),
+        }.map_err(native)?;
+        let metadata_refs = metadata.iter().map(|(id, package)| (id.as_str(), package)).collect::<Vec<_>>();
+        let transcript = NativeSolveOutput::from_native(
+            solved,
+            proposal.proposal().metadata_sha256().as_str().into(),
+            &metadata_refs,
+            &inventory,
+        ).map_err(solver)?;
+        let resolved = transcript.into_resolved(&names, &candidates, &metadata_refs, &inventory).map_err(solver)?;
+        let root_plan = PlanBuilder {
+            intent: proposal.proposal().intent(),
+            snapshots: &integrity,
+            inventory: &inventory,
+            policy,
+            candidates: &candidates,
+            expires_at_unix: proposal.proposal().expires_at_unix(),
+        }.build(&resolved).map_err(solver)?;
+        ReSolveContract::require_equal(proposal, &root_plan).map_err(|_| PreparationError::ReSolveMismatch)?;
+    }
 
     let artifacts = draft.fetch_artifacts(proposal, &repository_inputs, transport)?;
     let policy_file = draft.write_bytes("policy.json", &policy.to_canonical_json().map_err(domain)?)?;

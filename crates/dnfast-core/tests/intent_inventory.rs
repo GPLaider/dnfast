@@ -63,6 +63,29 @@ fn inventory_and_actions_have_canonical_domain_order() {
 }
 
 #[test]
+fn inventory_digest_memoization_is_not_serialized_or_semantic_state() {
+    let package = InstalledPackage::new(
+        "bash",
+        Evra::new(0, "5.2", "1", Architecture::X86_64),
+        "Fedora",
+        1,
+        8,
+        digest('a'),
+    ).unwrap();
+    let inventory = InstalledInventory::new("rpm.sqlite", "6.0.1", vec![package]).unwrap();
+
+    let first = inventory.canonical_sha256().unwrap();
+    let second = inventory.canonical_sha256().unwrap();
+    let bytes = inventory.to_canonical_json().unwrap();
+    let reparsed = InstalledInventory::from_canonical_json(&bytes).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(reparsed, inventory);
+    assert_eq!(reparsed.canonical_sha256().unwrap(), first);
+    assert!(!std::str::from_utf8(&bytes).unwrap().contains("canonical_sha256"));
+}
+
+#[test]
 fn unknown_or_external_reason_is_never_autoremovable() {
     assert!(!PackageReason::Unknown.is_autoremove_candidate());
     assert!(!PackageReason::External.is_autoremove_candidate());

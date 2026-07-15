@@ -49,7 +49,10 @@ pub fn run(plan: &CanonicalSolverPlan, staged: &mut StagedInputs, inventory: &dn
             _ => return Err(ExecutorError::Plan("unknown planned operation".into())),
         }
     }
-    executor.prepare_checked_transaction().map_err(|error| phase("prepare", error))?;
+    // The checked TEST run below creates a fresh rpm transaction set and
+    // performs the same add/check/order preflight before rpmtsRun(TEST).
+    // Running transaction_prepare first repeated that entire native pass but
+    // carried no state into TEST or the real transaction.
     executor.test_checked_transaction().map_err(|error| phase("test", error))?;
     mount_root.verify_unchanged()?;
     if let Err(error) = executor.run_checked_transaction() { return stateful_or_preflight(&mut executor, mount_root, "run", error); }

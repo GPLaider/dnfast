@@ -1,10 +1,15 @@
 #define _POSIX_C_SOURCE 200809L
 #include "internal.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdatomic.h>
+
+#ifdef DNFAST_NATIVE_REAL
+#include <rpm/rpmdb.h>
+#endif
 
 static _Atomic uint64_t global_test_count;
 static _Atomic uint64_t global_real_count;
@@ -40,6 +45,7 @@ dnfast_status dnfast_inventory_write_begin(dnfast_context *context,
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                 "rpm", "rpmtsSetKeyring", "isolated keyring rejected");
     }
+    dnfast_inventory_configure_trusted_rpmdb_read(ts);
     context->inventory_keyring_sequence = 1;
     struct timespec started;
     (void)clock_gettime(CLOCK_MONOTONIC, &started);
@@ -86,14 +92,42 @@ dnfast_status dnfast_inventory_write_begin(dnfast_context *context,
 
 dnfast_status dnfast_inventory_read_locked(dnfast_context *context,
                                            dnfast_error *error) {
+    uint8_t cache_hit = 0;
+    return dnfast_inventory_read_locked_cached(context, NULL, &cache_hit, error);
+}
+
+dnfast_status dnfast_inventory_read_locked_cached(dnfast_context *context,
+                                                  const char *expected_cookie,
+                                                  uint8_t *cache_hit,
+                                                  dnfast_error *error) {
 #ifdef DNFAST_NATIVE_REAL
     if (context == NULL || context->inventory_write_ts == NULL ||
-        context->inventory_write_txn == NULL)
+        context->inventory_write_txn == NULL || cache_hit == NULL)
         return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
                                 "rpmdb", NULL, "write context is not active");
-    return dnfast_inventory_collect(context, context->inventory_write_ts, error);
+    *cache_hit = 0;
+    char *cookie = dnfast_inventory_take_cookie(context->inventory_write_ts);
+    if (cookie == NULL || cookie[0] == '\0') {
+        free(cookie);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "rpm", "rpmdbCookie", "rpmdb cookie unavailable");
+    }
+    if (expected_cookie != NULL && strcmp(expected_cookie, cookie) == 0) {
+        dnfast_inventory_clear(context);
+        context->inventory_cookie = cookie;
+        *cache_hit = 1;
+        return DNFAST_STATUS_OK;
+    }
+    dnfast_status status = dnfast_inventory_collect(
+        context, context->inventory_write_ts, error);
+    if (status == DNFAST_STATUS_OK) {
+        context->inventory_cookie = cookie;
+        cookie = NULL;
+    }
+    free(cookie);
+    return status;
 #else
-    (void)context;
+    (void)context; (void)expected_cookie; (void)cache_hit;
     return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
                             "rpm", "rpmtxnBegin", "real native build disabled");
 #endif

@@ -8,7 +8,7 @@ pub use authority::{fork_probe as authority_fork_probe, Authority};
 mod executor_fd;
 pub use executor_fd::{ExecutorApproval, exec_fixed_executor, take_inherited_plan_fd};
 mod inventory;
-pub use inventory::{fixture_inventory_counts, fixture_reset_inventory_counts, Inventory, InventoryPackage};
+pub use inventory::{fixture_inventory_counts, fixture_reset_inventory_counts, Inventory, InventoryPackage, InventoryRead};
 mod keyring;
 pub use keyring::{Keyring, VerifiedPackage};
 mod transaction;

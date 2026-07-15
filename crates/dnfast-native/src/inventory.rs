@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
 use std::rc::Rc;
 
 use dnfast_core::{Architecture, CanonicalDocument, EraseLookupError, Evra, InstalledInventory, InstalledPackage};
@@ -40,6 +40,11 @@ pub enum InventoryError {
 }
 
 pub struct InventoryReader { context: crate::NativeContext }
+
+#[derive(Clone)]
+struct CachedInventory { cookie: String, inventory: InstalledInventory }
+
+static INVENTORY_CACHE: OnceLock<Mutex<Option<CachedInventory>>> = OnceLock::new();
 
 impl InventoryReader {
     pub fn open(architecture: Architecture) -> Result<Self, InventoryError> {
@@ -200,13 +205,36 @@ impl Drop for ExecutorInventory {
 }
 
 pub(crate) fn read_from_context(context: &mut dnfast_native_sys::Context) -> Result<InstalledInventory, InventoryError> {
-    let raw = context.read_inventory("/").map_err(NativeError::from)?;
-    convert(raw)
+    let mut cache = inventory_cache();
+    let expected = cache.as_ref().map(|cached| cached.cookie.as_str());
+    let read = context.read_inventory_cached("/", expected).map_err(NativeError::from)?;
+    finish_cached_read(&mut cache, read)
 }
 
 fn read_locked(context: &mut dnfast_native_sys::Context) -> Result<InstalledInventory, InventoryError> {
-    let raw = context.read_locked_inventory().map_err(NativeError::from)?;
-    convert(raw)
+    let mut cache = inventory_cache();
+    let expected = cache.as_ref().map(|cached| cached.cookie.as_str());
+    let read = context.read_locked_inventory_cached(expected).map_err(NativeError::from)?;
+    finish_cached_read(&mut cache, read)
+}
+
+fn inventory_cache() -> std::sync::MutexGuard<'static, Option<CachedInventory>> {
+    INVENTORY_CACHE.get_or_init(|| Mutex::new(None)).lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn finish_cached_read(cache: &mut Option<CachedInventory>,
+    read: dnfast_native_sys::InventoryRead) -> Result<InstalledInventory, InventoryError> {
+    if let Some(raw) = read.inventory {
+        let inventory = convert(raw)?;
+        inventory.canonical_sha256()?;
+        *cache = Some(CachedInventory { cookie: read.cookie, inventory: inventory.clone() });
+        return Ok(inventory);
+    }
+    match cache {
+        Some(cached) if cached.cookie == read.cookie => Ok(cached.inventory.clone()),
+        _ => Err(InventoryError::InvalidState),
+    }
 }
 
 fn convert(raw: dnfast_native_sys::Inventory) -> Result<InstalledInventory, InventoryError> {

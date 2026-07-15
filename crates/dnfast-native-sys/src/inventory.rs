@@ -21,13 +21,16 @@ struct RawInventoryRecord {
 }
 
 unsafe extern "C" {
-    fn dnfast_inventory_read(context: *mut RawContext, root: *const c_char, error: *mut RawError) -> i32;
+    fn dnfast_inventory_read_cached(context: *mut RawContext, root: *const c_char,
+        expected_cookie: *const c_char, cache_hit: *mut u8, error: *mut RawError) -> i32;
     fn dnfast_inventory_backend(context: *const RawContext) -> *const c_char;
+    fn dnfast_inventory_cookie(context: *const RawContext) -> *const c_char;
     fn dnfast_inventory_rpm_version(context: *const RawContext) -> *const c_char;
     fn dnfast_inventory_count(context: *const RawContext) -> usize;
     fn dnfast_inventory_get(context: *const RawContext, index: usize) -> *const RawInventoryRecord;
     fn dnfast_inventory_write_begin(context: *mut RawContext, keyring: *mut RawKeyring, root: *const c_char, timeout_milliseconds: u64, error: *mut RawError) -> i32;
-    fn dnfast_inventory_read_locked(context: *mut RawContext, error: *mut RawError) -> i32;
+    fn dnfast_inventory_read_locked_cached(context: *mut RawContext,
+        expected_cookie: *const c_char, cache_hit: *mut u8, error: *mut RawError) -> i32;
     fn dnfast_inventory_write_end(context: *mut RawContext);
     fn dnfast_inventory_rpm_run_count(context: *const RawContext) -> u64;
     fn dnfast_inventory_test_count(context: *const RawContext) -> u64;
@@ -46,6 +49,9 @@ unsafe extern "C" {
 pub struct Inventory { pub backend: String, pub rpm_version: String, pub packages: Vec<InventoryPackage> }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InventoryRead { pub cookie: String, pub inventory: Option<Inventory> }
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InventoryPackage {
     pub name: String, pub version: String, pub release: String, pub arch: String,
     pub vendor: String,
@@ -55,13 +61,26 @@ pub struct InventoryPackage {
 
 impl Context {
     pub fn read_inventory(&mut self, root: &str) -> Result<Inventory, NativeError> {
+        self.read_inventory_cached(root, None)?.inventory.ok_or_else(null_result)
+    }
+
+    pub fn read_inventory_cached(&mut self, root: &str,
+        expected_cookie: Option<&str>) -> Result<InventoryRead, NativeError> {
         let root = c_string(root)?;
+        let expected_cookie = expected_cookie.map(c_string).transpose()?;
         let mut error = empty_error();
+        let mut cache_hit = 0_u8;
         // SAFETY: [Category 8 — FFI boundary UB] root and error are live for
-        // the synchronous call and unique access serializes context mutation.
-        let status = unsafe { dnfast_inventory_read(self.raw.as_ptr(), root.as_ptr(), &mut error) };
+        // the synchronous call; the optional cookie pointer is either null or
+        // references a live CString, and unique access serializes mutation.
+        let status = unsafe { dnfast_inventory_read_cached(self.raw.as_ptr(), root.as_ptr(),
+            expected_cookie.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+            &mut cache_hit, &mut error) };
         if status != 0 { return Err(status_error(status, &mut error)); }
-        self.copy_inventory()
+        // SAFETY: the context owns the cookie until its next mutation.
+        let cookie = unsafe { copy_string(dnfast_inventory_cookie(self.raw.as_ptr()))? };
+        let inventory = if cache_hit == 0 { Some(self.copy_inventory()?) } else { None };
+        Ok(InventoryRead { cookie, inventory })
     }
 
     pub fn begin_inventory_write(&mut self, keyring: &Keyring, root: &str, timeout: std::time::Duration) -> Result<(), NativeError> {
@@ -75,12 +94,25 @@ impl Context {
     }
 
     pub fn read_locked_inventory(&mut self) -> Result<Inventory, NativeError> {
+        self.read_locked_inventory_cached(None)?.inventory.ok_or_else(null_result)
+    }
+
+    pub fn read_locked_inventory_cached(&mut self,
+        expected_cookie: Option<&str>) -> Result<InventoryRead, NativeError> {
+        let expected_cookie = expected_cookie.map(c_string).transpose()?;
         let mut error = empty_error();
+        let mut cache_hit = 0_u8;
         // SAFETY: [Category 8 — FFI boundary UB] unique access and the native
-        // write-context state satisfy the synchronous call contract.
-        let status = unsafe { dnfast_inventory_read_locked(self.raw.as_ptr(), &mut error) };
+        // write-context state satisfy the synchronous call contract; the
+        // optional cookie is null or a live CString.
+        let status = unsafe { dnfast_inventory_read_locked_cached(self.raw.as_ptr(),
+            expected_cookie.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+            &mut cache_hit, &mut error) };
         if status != 0 { return Err(status_error(status, &mut error)); }
-        self.copy_inventory()
+        // SAFETY: the context owns the cookie until its next mutation.
+        let cookie = unsafe { copy_string(dnfast_inventory_cookie(self.raw.as_ptr()))? };
+        let inventory = if cache_hit == 0 { Some(self.copy_inventory()?) } else { None };
+        Ok(InventoryRead { cookie, inventory })
     }
 
     pub fn end_inventory_write(&mut self) {
