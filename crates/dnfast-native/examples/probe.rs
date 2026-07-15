@@ -5,7 +5,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut context = match mode.as_str() {
         "happy" => NativeContext::open(dnfast_core::Architecture::Aarch64, || false)?,
         "interrupt" => NativeContext::open(dnfast_core::Architecture::Aarch64, || true)?,
-        "panic" => NativeContext::open(dnfast_core::Architecture::Aarch64, || panic!("probe callback panic"))?,
+        "panic" => NativeContext::open(dnfast_core::Architecture::Aarch64, || {
+            panic!("probe callback panic")
+        })?,
         _ => return Err("unknown probe mode".into()),
     };
     match (mode.as_str(), context.check_interruption()) {

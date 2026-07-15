@@ -6,15 +6,15 @@ use std::{
 };
 
 use dnfast_cache::Cache;
-use dnfast_refresh::{
-    HttpTransport, RefreshError, RefreshOutcome, Refresher, Source, Transport,
-};
+use dnfast_refresh::{HttpTransport, RefreshError, RefreshOutcome, Refresher, Source, Transport};
 
 struct NoNetwork;
 
 impl Transport for NoNetwork {
     fn get(&self, url: &str, _maximum_bytes: u64) -> Result<Vec<u8>, RefreshError> {
-        Err(RefreshError::Transport(format!("unexpected request: {url}")))
+        Err(RefreshError::Transport(format!(
+            "unexpected request: {url}"
+        )))
     }
 }
 
@@ -46,10 +46,22 @@ fn public_error_variants_retain_display_and_source_contracts() {
     ];
 
     assert_eq!(errors[0].to_string(), "refresh error: Policy(\"policy\")");
-    assert_eq!(errors[1].to_string(), "refresh error: Transport(\"transport\")");
-    assert_eq!(errors[2].to_string(), "refresh error: Metalink(\"metalink\")");
-    assert_eq!(errors[3].to_string(), "refresh error: Metadata(\"metadata\")");
-    assert_eq!(errors[4].to_string(), "refresh error: Signature(\"signature\")");
+    assert_eq!(
+        errors[1].to_string(),
+        "refresh error: Transport(\"transport\")"
+    );
+    assert_eq!(
+        errors[2].to_string(),
+        "refresh error: Metalink(\"metalink\")"
+    );
+    assert_eq!(
+        errors[3].to_string(),
+        "refresh error: Metadata(\"metadata\")"
+    );
+    assert_eq!(
+        errors[4].to_string(),
+        "refresh error: Signature(\"signature\")"
+    );
     assert_eq!(errors[5].to_string(), "refresh error: Cache(\"cache\")");
     assert!(errors.iter().all(|error| error.source().is_none()));
 }

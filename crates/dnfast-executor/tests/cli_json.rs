@@ -1,8 +1,4 @@
-use std::{
-    ffi::OsString,
-    os::unix::ffi::OsStringExt,
-    process::Command,
-};
+use std::{ffi::OsString, os::unix::ffi::OsStringExt, process::Command};
 
 #[test]
 fn executor_argument_failure_is_one_v1_json_object() {

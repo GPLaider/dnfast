@@ -18,19 +18,31 @@ pub struct CandidatePackage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum ResolvedOperation { Install, Upgrade, Remove }
+pub enum ResolvedOperation {
+    Install,
+    Upgrade,
+    Remove,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DependencyKind { Strong, Weak }
+pub enum DependencyKind {
+    Strong,
+    Weak,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct DependencyEdge { pub parent: String, pub kind: DependencyKind }
+pub struct DependencyEdge {
+    pub parent: String,
+    pub kind: DependencyKind,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ActionProvenance { ObsoletedBy { parent_action_identity: String } }
+pub enum ActionProvenance {
+    ObsoletedBy { parent_action_identity: String },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedAction {
@@ -63,7 +75,11 @@ pub struct ArtifactRecord {
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RequestedRelation { Requested, Dependency, WeakDependency }
+pub enum RequestedRelation {
+    Requested,
+    Dependency,
+    WeakDependency,
+}
 
 impl RequestedRelation {
     pub(crate) const fn reason(&self) -> PackageReason {
@@ -109,6 +125,10 @@ pub struct ExplainedAction {
 }
 
 impl ExplainedAction {
-    pub fn name(&self) -> &str { &self.name }
-    pub const fn relation(&self) -> &RequestedRelation { &self.relation }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub const fn relation(&self) -> &RequestedRelation {
+        &self.relation
+    }
 }

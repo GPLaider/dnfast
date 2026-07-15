@@ -78,13 +78,20 @@ impl RepomdAuthentication {
     pub fn validate(&self) -> Result<(), CacheError> {
         match self {
             Self::TransportOnly => Ok(()),
-            Self::OpenPgp { primary_fingerprint, signing_fingerprint, key_bundle_sha256, signature_sha256 } => {
+            Self::OpenPgp {
+                primary_fingerprint,
+                signing_fingerprint,
+                key_bundle_sha256,
+                signature_sha256,
+            } => {
                 if !valid_fingerprint(primary_fingerprint)
                     || !valid_fingerprint(signing_fingerprint)
                     || !valid_digest(key_bundle_sha256)
                     || !valid_digest(signature_sha256)
                 {
-                    return Err(CacheError::Corrupt("invalid repomd authentication evidence".into()));
+                    return Err(CacheError::Corrupt(
+                        "invalid repomd authentication evidence".into(),
+                    ));
                 }
                 Ok(())
             }
@@ -110,17 +117,23 @@ impl SelectedOrigin {
         {
             return Err(OriginError::Invalid);
         }
-        let base = value.strip_suffix("/repodata/repomd.xml").ok_or(OriginError::Invalid)?;
+        let base = value
+            .strip_suffix("/repodata/repomd.xml")
+            .ok_or(OriginError::Invalid)?;
         if base.is_empty() || base.ends_with('/') {
             return Err(OriginError::Invalid);
         }
         Ok(Self(value.into()))
     }
 
-    pub fn repomd_url(&self) -> &str { &self.0 }
+    pub fn repomd_url(&self) -> &str {
+        &self.0
+    }
 
     pub fn artifact_base(&self) -> &str {
-        self.0.strip_suffix("/repodata/repomd.xml").unwrap_or_default()
+        self.0
+            .strip_suffix("/repodata/repomd.xml")
+            .unwrap_or_default()
     }
 
     pub fn artifact_url(&self, href: &str) -> Result<String, OriginError> {
@@ -162,9 +175,15 @@ pub struct VerifiedBytes {
 }
 
 impl VerifiedBytes {
-    pub fn sha256(&self) -> &str { &self.sha256 }
-    pub const fn size(&self) -> u64 { self.size }
-    pub fn bytes(&self) -> &[u8] { &self.bytes }
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[derive(Debug)]
@@ -181,15 +200,33 @@ pub struct VerifiedCompleteGeneration {
 }
 
 impl VerifiedCompleteGeneration {
-    pub fn digest(&self) -> &str { &self.digest }
-    pub fn repository(&self) -> &str { &self.repository }
-    pub fn origin(&self) -> &SelectedOrigin { &self.origin }
-    pub fn repomd(&self) -> &VerifiedBytes { &self.repomd }
-    pub fn primary(&self) -> &VerifiedBytes { &self.primary }
-    pub fn filelists(&self) -> &VerifiedBytes { &self.filelists }
-    pub fn solver_inputs(&self) -> &[CompletePackage] { &self.solver_inputs }
-    pub fn filelist_inputs(&self) -> &[FileListPackage] { &self.filelist_inputs }
-    pub fn repomd_authentication(&self) -> &RepomdAuthentication { &self.repomd_authentication }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+    pub fn origin(&self) -> &SelectedOrigin {
+        &self.origin
+    }
+    pub fn repomd(&self) -> &VerifiedBytes {
+        &self.repomd
+    }
+    pub fn primary(&self) -> &VerifiedBytes {
+        &self.primary
+    }
+    pub fn filelists(&self) -> &VerifiedBytes {
+        &self.filelists
+    }
+    pub fn solver_inputs(&self) -> &[CompletePackage] {
+        &self.solver_inputs
+    }
+    pub fn filelist_inputs(&self) -> &[FileListPackage] {
+        &self.filelist_inputs
+    }
+    pub fn repomd_authentication(&self) -> &RepomdAuthentication {
+        &self.repomd_authentication
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -236,7 +273,10 @@ pub(crate) fn valid_digest(value: &str) -> bool {
 }
 
 fn valid_fingerprint(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase())
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase())
 }
 
 pub(crate) fn io_error(error: std::io::Error) -> CacheError {

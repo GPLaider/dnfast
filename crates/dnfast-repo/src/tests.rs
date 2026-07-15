@@ -28,7 +28,10 @@ fn parses_sources_and_case_insensitive_booleans() {
     assert!(repositories[0].enabled);
     assert_eq!(repositories[0].baseurls.len(), 2);
     assert!(!repositories[1].enabled);
-    assert_eq!(repositories[1].selected_source().unwrap().0, SourceKind::Metalink);
+    assert_eq!(
+        repositories[1].selected_source().unwrap().0,
+        SourceKind::Metalink
+    );
 }
 
 #[test]
@@ -46,8 +49,7 @@ fn rejects_malformed_boolean_with_provenance() {
 
 #[test]
 fn enabled_repository_requires_source() {
-    let error =
-        parse_repository_file(Path::new("empty.repo"), "[empty]\nenabled=1\n").unwrap_err();
+    let error = parse_repository_file(Path::new("empty.repo"), "[empty]\nenabled=1\n").unwrap_err();
     assert_eq!(
         error.to_string(),
         "empty.repo:1: enabled repository has no source"

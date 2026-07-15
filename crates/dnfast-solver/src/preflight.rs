@@ -4,53 +4,114 @@ use dnfast_core::Action;
 
 use crate::{CandidatePackage, PlanError, ResolvedAction, ResolvedOperation};
 
-pub(crate) fn validate_inputs(builder: &crate::PlanBuilder<'_>, actions: &[ResolvedAction]) -> Result<(), PlanError> {
-    if actions.is_empty() { return Err(PlanError::NoChanges); }
-    if actions.len() > dnfast_core::MAX_PLAN_ACTIONS { return Err(PlanError::Invalid("action limit exceeded")); }
+pub(crate) fn validate_inputs(
+    builder: &crate::PlanBuilder<'_>,
+    actions: &[ResolvedAction],
+) -> Result<(), PlanError> {
+    if actions.is_empty() {
+        return Err(PlanError::NoChanges);
+    }
+    if actions.len() > dnfast_core::MAX_PLAN_ACTIONS {
+        return Err(PlanError::Invalid("action limit exceeded"));
+    }
     validate_repository_selection(builder)?;
     validate_candidates(builder.candidates)?;
-    let bytes = actions.iter().filter_map(|item| item.candidate.as_ref()).try_fold(0_u64,
-        |total, item| total.checked_add(item.package_size).ok_or(PlanError::Invalid("artifact size overflow")))?;
-    if bytes > crate::MAX_PLAN_ARTIFACT_BYTES { return Err(PlanError::Invalid("artifact size limit exceeded")); }
-    let requested = builder.intent.packages().iter().map(|item| item.as_str()).collect::<BTreeSet<_>>();
-    let names = actions.iter().map(|item| item.name.as_str()).collect::<BTreeSet<_>>();
-    if names.len() != actions.len() { return Err(PlanError::DuplicateAction("name".into())); }
+    let bytes = actions
+        .iter()
+        .filter_map(|item| item.candidate.as_ref())
+        .try_fold(0_u64, |total, item| {
+            total
+                .checked_add(item.package_size)
+                .ok_or(PlanError::Invalid("artifact size overflow"))
+        })?;
+    if bytes > crate::MAX_PLAN_ARTIFACT_BYTES {
+        return Err(PlanError::Invalid("artifact size limit exceeded"));
+    }
+    let requested = builder
+        .intent
+        .packages()
+        .iter()
+        .map(|item| item.as_str())
+        .collect::<BTreeSet<_>>();
+    let names = actions
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if names.len() != actions.len() {
+        return Err(PlanError::DuplicateAction("name".into()));
+    }
     let mut covered = BTreeMap::<&str, usize>::new();
     let mut identities = BTreeSet::new();
     for action in actions {
-        if action.name.is_empty() || !action.unresolved_dependencies.is_empty() { return Err(PlanError::Unresolved(action.name.clone())); }
-        let identity = (action.operation, action.name.as_str(), action.installed_instance,
-            action.candidate.as_ref().map(|item| (&item.evra, item.repo_id.as_str())));
-        if !identities.insert(identity) { return Err(PlanError::DuplicateAction(action.name.clone())); }
-        let upgrade_all_root = action.requested && action.requested_spec.is_none()
-            && builder.intent.action() == Action::Upgrade && requested.is_empty()
+        if action.name.is_empty() || !action.unresolved_dependencies.is_empty() {
+            return Err(PlanError::Unresolved(action.name.clone()));
+        }
+        let identity = (
+            action.operation,
+            action.name.as_str(),
+            action.installed_instance,
+            action
+                .candidate
+                .as_ref()
+                .map(|item| (&item.evra, item.repo_id.as_str())),
+        );
+        if !identities.insert(identity) {
+            return Err(PlanError::DuplicateAction(action.name.clone()));
+        }
+        let upgrade_all_root = action.requested
+            && action.requested_spec.is_none()
+            && builder.intent.action() == Action::Upgrade
+            && requested.is_empty()
             && action.operation == ResolvedOperation::Upgrade;
         if action.requested != action.requested_spec.is_some() && !upgrade_all_root {
             return Err(PlanError::Invalid("requested action provenance differs"));
         }
-        if action.requested_relation && !action.requested { return Err(PlanError::Invalid("relation selector is not requested")); }
+        if action.requested_relation && !action.requested {
+            return Err(PlanError::Invalid("relation selector is not requested"));
+        }
         if action.requested {
             match action.requested_spec.as_ref() {
                 Some(spec) => {
-                    if !requested.contains(spec.as_str()) { return Err(PlanError::UnrelatedAction(action.name.clone())); }
+                    if !requested.contains(spec.as_str()) {
+                        return Err(PlanError::UnrelatedAction(action.name.clone()));
+                    }
                     *covered.entry(spec.as_str()).or_default() += 1;
                 }
                 None if builder.intent.action() == Action::Upgrade && requested.is_empty() => {}
-                None => return Err(PlanError::Invalid("requested action lacks selector provenance")),
+                None => {
+                    return Err(PlanError::Invalid(
+                        "requested action lacks selector provenance",
+                    ));
+                }
             }
         }
         for edge in &action.dependency_edges {
-            if edge.parent == action.name { return Err(PlanError::DependencyCycle); }
-            if !names.contains(edge.parent.as_str()) { return Err(PlanError::MissingParent(edge.parent.clone())); }
+            if edge.parent == action.name {
+                return Err(PlanError::DependencyCycle);
+            }
+            if !names.contains(edge.parent.as_str()) {
+                return Err(PlanError::MissingParent(edge.parent.clone()));
+            }
         }
-        if let Some(crate::ActionProvenance::ObsoletedBy { parent_action_identity }) = &action.provenance {
-            if action.operation != ResolvedOperation::Remove || !actions.iter().any(|parent| action_identity(parent).as_deref() == Some(parent_action_identity)) {
+        if let Some(crate::ActionProvenance::ObsoletedBy {
+            parent_action_identity,
+        }) = &action.provenance
+        {
+            if action.operation != ResolvedOperation::Remove
+                || !actions.iter().any(|parent| {
+                    action_identity(parent).as_deref() == Some(parent_action_identity)
+                })
+            {
                 return Err(PlanError::MissingParent(parent_action_identity.clone()));
             }
         }
         validate_kind(builder.intent.action(), action)?;
     }
-    if requested.iter().any(|name| covered.get(name).copied() != Some(1)) || covered.values().any(|count| *count != 1) {
+    if requested
+        .iter()
+        .any(|name| covered.get(name).copied() != Some(1))
+        || covered.values().any(|count| *count != 1)
+    {
         return Err(PlanError::IntentCoverage);
     }
     validate_reachable(actions)?;
@@ -59,7 +120,12 @@ pub(crate) fn validate_inputs(builder: &crate::PlanBuilder<'_>, actions: &[Resol
 
 fn validate_repository_selection(builder: &crate::PlanBuilder<'_>) -> Result<(), PlanError> {
     for candidate in builder.candidates {
-        if !builder.snapshots.selected_repositories().iter().any(|repository| repository.id() == candidate.repo_id) {
+        if !builder
+            .snapshots
+            .selected_repositories()
+            .iter()
+            .any(|repository| repository.id() == candidate.repo_id)
+        {
             return Err(PlanError::RepositoryNotSelected(candidate.repo_id.clone()));
         }
     }
@@ -67,66 +133,155 @@ fn validate_repository_selection(builder: &crate::PlanBuilder<'_>) -> Result<(),
 }
 
 fn validate_reachable(actions: &[ResolvedAction]) -> Result<(), PlanError> {
-    let mut reachable = actions.iter().filter(|item| item.requested).map(|item| item.name.as_str()).collect::<BTreeSet<_>>();
+    let mut reachable = actions
+        .iter()
+        .filter(|item| item.requested)
+        .map(|item| item.name.as_str())
+        .collect::<BTreeSet<_>>();
     loop {
         let before = reachable.len();
         for item in actions {
-            let obsolete_parent = item.provenance.as_ref().is_some_and(|provenance| match provenance {
-                crate::ActionProvenance::ObsoletedBy { parent_action_identity } => actions.iter().any(|parent|
-                    reachable.contains(parent.name.as_str()) && action_identity(parent).as_deref() == Some(parent_action_identity)),
-            });
-            if obsolete_parent || item.dependency_edges.iter().any(|edge| reachable.contains(edge.parent.as_str())) { reachable.insert(&item.name); }
+            let obsolete_parent =
+                item.provenance
+                    .as_ref()
+                    .is_some_and(|provenance| match provenance {
+                        crate::ActionProvenance::ObsoletedBy {
+                            parent_action_identity,
+                        } => actions.iter().any(|parent| {
+                            reachable.contains(parent.name.as_str())
+                                && action_identity(parent).as_deref()
+                                    == Some(parent_action_identity)
+                        }),
+                    });
+            if obsolete_parent
+                || item
+                    .dependency_edges
+                    .iter()
+                    .any(|edge| reachable.contains(edge.parent.as_str()))
+            {
+                reachable.insert(&item.name);
+            }
         }
-        if reachable.len() == before { break; }
+        if reachable.len() == before {
+            break;
+        }
     }
-    if reachable.len() == actions.len() { Ok(()) } else { Err(PlanError::DisconnectedGraph) }
+    if reachable.len() == actions.len() {
+        Ok(())
+    } else {
+        Err(PlanError::DisconnectedGraph)
+    }
 }
 
 fn validate_kind(intent: Action, action: &ResolvedAction) -> Result<(), PlanError> {
-    let side_effect = action.provenance.is_some() && action.operation == ResolvedOperation::Remove && intent != Action::Remove;
-    let valid = side_effect || match intent {
-        Action::Install => matches!(action.operation, ResolvedOperation::Install | ResolvedOperation::Upgrade),
-        Action::Remove => matches!(action.operation, ResolvedOperation::Remove) && action.provenance.is_none(),
-        Action::Upgrade => matches!(action.operation, ResolvedOperation::Upgrade),
-    };
-    if valid { Ok(()) } else { Err(PlanError::ConflictingAction(action.name.clone())) }
+    let side_effect = action.provenance.is_some()
+        && action.operation == ResolvedOperation::Remove
+        && intent != Action::Remove;
+    let valid = side_effect
+        || match intent {
+            Action::Install => matches!(
+                action.operation,
+                ResolvedOperation::Install | ResolvedOperation::Upgrade
+            ),
+            Action::Remove => {
+                matches!(action.operation, ResolvedOperation::Remove) && action.provenance.is_none()
+            }
+            Action::Upgrade => matches!(action.operation, ResolvedOperation::Upgrade),
+        };
+    if valid {
+        Ok(())
+    } else {
+        Err(PlanError::ConflictingAction(action.name.clone()))
+    }
 }
 
 fn validate_candidates(candidates: &[CandidatePackage]) -> Result<(), PlanError> {
     let mut exact = BTreeSet::new();
     let mut policy = BTreeMap::new();
     for item in candidates {
-        let exact_key = (&item.name, &item.evra, &item.repo_id, item.priority, item.cost,
-            &item.vendor, &item.checksum_sha256, &item.location);
-        if !exact.insert(exact_key) { return Err(PlanError::DuplicateCandidate(item.name.clone())); }
-        let key = (&item.name, &item.evra, &item.repo_id, item.priority, item.cost);
-        let identity = (&item.vendor, &item.checksum_sha256, &item.location, item.package_size, item.installed_size);
-        if policy.insert(key, identity).is_some_and(|previous| previous != identity) {
+        let exact_key = (
+            &item.name,
+            &item.evra,
+            &item.repo_id,
+            item.priority,
+            item.cost,
+            &item.vendor,
+            &item.checksum_sha256,
+            &item.location,
+        );
+        if !exact.insert(exact_key) {
+            return Err(PlanError::DuplicateCandidate(item.name.clone()));
+        }
+        let key = (
+            &item.name,
+            &item.evra,
+            &item.repo_id,
+            item.priority,
+            item.cost,
+        );
+        let identity = (
+            &item.vendor,
+            &item.checksum_sha256,
+            &item.location,
+            item.package_size,
+            item.installed_size,
+        );
+        if policy
+            .insert(key, identity)
+            .is_some_and(|previous| previous != identity)
+        {
             return Err(PlanError::AmbiguousCandidate(item.name.clone()));
         }
     }
     Ok(())
 }
 
-pub(crate) fn execution_order(resolved: &[ResolvedAction], actions: Vec<crate::ExplainedAction>) -> Result<Vec<crate::ExplainedAction>, PlanError> {
-    let mut remaining = actions.into_iter().map(|item| (item.name.clone(), item)).collect::<BTreeMap<_, _>>();
-    if remaining.len() != resolved.len() { return Err(PlanError::DuplicateAction("name".into())); }
-    let remove = resolved.first().is_some_and(|item| item.operation == ResolvedOperation::Remove);
+pub(crate) fn execution_order(
+    resolved: &[ResolvedAction],
+    actions: Vec<crate::ExplainedAction>,
+) -> Result<Vec<crate::ExplainedAction>, PlanError> {
+    let mut remaining = actions
+        .into_iter()
+        .map(|item| (item.name.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    if remaining.len() != resolved.len() {
+        return Err(PlanError::DuplicateAction("name".into()));
+    }
+    let remove = resolved
+        .first()
+        .is_some_and(|item| item.operation == ResolvedOperation::Remove);
     let mut edges = BTreeSet::new();
     for item in resolved {
         for dependency in &item.dependency_edges {
-            if !remaining.contains_key(&dependency.parent) { return Err(PlanError::MissingParent(dependency.parent.clone())); }
-            edges.insert(if remove { (dependency.parent.clone(), item.name.clone()) } else { (item.name.clone(), dependency.parent.clone()) });
+            if !remaining.contains_key(&dependency.parent) {
+                return Err(PlanError::MissingParent(dependency.parent.clone()));
+            }
+            edges.insert(if remove {
+                (dependency.parent.clone(), item.name.clone())
+            } else {
+                (item.name.clone(), dependency.parent.clone())
+            });
         }
-        if let Some(crate::ActionProvenance::ObsoletedBy { parent_action_identity }) = &item.provenance {
-            let parent = resolved.iter().find(|candidate| action_identity(candidate).as_deref() == Some(parent_action_identity))
+        if let Some(crate::ActionProvenance::ObsoletedBy {
+            parent_action_identity,
+        }) = &item.provenance
+        {
+            let parent = resolved
+                .iter()
+                .find(|candidate| {
+                    action_identity(candidate).as_deref() == Some(parent_action_identity)
+                })
                 .ok_or_else(|| PlanError::MissingParent(parent_action_identity.clone()))?;
             edges.insert((parent.name.clone(), item.name.clone()));
         }
     }
     let mut ordered = Vec::new();
     while !remaining.is_empty() {
-        let ready = remaining.keys().find(|name| !edges.iter().any(|(_, to)| to == *name)).cloned().ok_or(PlanError::DependencyCycle)?;
+        let ready = remaining
+            .keys()
+            .find(|name| !edges.iter().any(|(_, to)| to == *name))
+            .cloned()
+            .ok_or(PlanError::DependencyCycle)?;
         ordered.push(remaining.remove(&ready).ok_or(PlanError::DependencyCycle)?);
         edges.retain(|(from, _)| from != &ready);
     }
@@ -134,6 +289,15 @@ pub(crate) fn execution_order(resolved: &[ResolvedAction], actions: Vec<crate::E
 }
 
 fn action_identity(action: &ResolvedAction) -> Option<String> {
-    action.candidate.as_ref().map(|candidate| format!("{}:{}-{}:{}-{}.{}", candidate.repo_id, candidate.name,
-        candidate.evra.epoch(), candidate.evra.version(), candidate.evra.release(), candidate.evra.arch().as_rpm_arch()))
+    action.candidate.as_ref().map(|candidate| {
+        format!(
+            "{}:{}-{}:{}-{}.{}",
+            candidate.repo_id,
+            candidate.name,
+            candidate.evra.epoch(),
+            candidate.evra.version(),
+            candidate.evra.release(),
+            candidate.evra.arch().as_rpm_arch()
+        )
+    })
 }

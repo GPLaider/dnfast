@@ -4,7 +4,9 @@ pub(crate) const MAX_MIRRORS: usize = 32;
 
 pub(crate) fn parse(input: &[u8]) -> Result<Vec<String>, RefreshError> {
     if input.len() as u64 > MAX_METALINK_BYTES {
-        return Err(RefreshError::Policy("mirrorlist exceeds policy limit".into()));
+        return Err(RefreshError::Policy(
+            "mirrorlist exceeds policy limit".into(),
+        ));
     }
     let text = std::str::from_utf8(input)
         .map_err(|_| RefreshError::Policy("mirrorlist is not UTF-8".into()))?;
@@ -21,7 +23,9 @@ pub(crate) fn parse(input: &[u8]) -> Result<Vec<String>, RefreshError> {
         mirrors.push(value.trim_end_matches('/').to_owned());
     }
     if mirrors.is_empty() {
-        return Err(RefreshError::Policy("mirrorlist contains no HTTPS mirrors".into()));
+        return Err(RefreshError::Policy(
+            "mirrorlist contains no HTTPS mirrors".into(),
+        ));
     }
     Ok(mirrors)
 }

@@ -5,13 +5,13 @@ use std::{error::Error, fmt};
 mod metalink;
 mod mirrorlist;
 mod openpgp;
-mod repo_lock;
 mod orchestrator;
+mod repo_lock;
 mod transport;
 mod url_policy;
 
-pub use orchestrator::Refresher;
 pub use openpgp::MetadataTrust;
+pub use orchestrator::Refresher;
 pub use transport::{HttpTransport, Transport};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +46,6 @@ impl fmt::Display for RefreshError {
 impl Error for RefreshError {}
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod source_equivalence_tests;
+#[cfg(test)]
+mod tests;

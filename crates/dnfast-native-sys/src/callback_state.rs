@@ -1,4 +1,7 @@
-use std::{ffi::c_void, panic::{catch_unwind, AssertUnwindSafe}};
+use std::{
+    ffi::c_void,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 
 use crate::Context;
 

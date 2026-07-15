@@ -10,7 +10,11 @@ impl Variables {
         Self(pairs.into_iter().collect())
     }
 
-    pub(crate) fn with_system_release_and_arch(mut self, releasever: String, basearch: String) -> Self {
+    pub(crate) fn with_system_release_and_arch(
+        mut self,
+        releasever: String,
+        basearch: String,
+    ) -> Self {
         self.0.insert("releasever".into(), releasever);
         self.0.insert("basearch".into(), basearch.clone());
         self.0.insert("arch".into(), basearch);

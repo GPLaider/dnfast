@@ -1,9 +1,15 @@
-use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use dnfast_cache::Cache;
 use dnfast_planning::{RootPlanningPublisher, SYSTEM_CACHE_PATH};
 use dnfast_refresh::{HttpTransport, MetadataTrust, RefreshOutcome, Refresher, Source};
-use dnfast_repo::{MutationProfile, RepoConfig, key_bundle_digest, load_repository_dirs, load_system_mutation_profile};
+use dnfast_repo::{
+    MutationProfile, RepoConfig, key_bundle_digest, load_repository_dirs,
+    load_system_mutation_profile,
+};
 
 use crate::{
     commands::AppFailure,
@@ -11,27 +17,34 @@ use crate::{
     rendering::escaped_field,
 };
 
-pub(super) fn refresh(
-    requested: Vec<String>,
-) -> Result<String, AppFailure> {
+pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
     require_root()?;
     let publisher = RootPlanningPublisher::system().map_err(planning_failure)?;
-    publisher.prepare_system_cache_for_verified_refresh().map_err(planning_failure)?;
-    let profile = load_system_mutation_profile().map_err(|error| AppFailure::new(1, error.to_string()))?;
+    publisher
+        .prepare_system_cache_for_verified_refresh()
+        .map_err(planning_failure)?;
+    let profile =
+        load_system_mutation_profile().map_err(|error| AppFailure::new(1, error.to_string()))?;
     let cache = Cache::new(SYSTEM_CACHE_PATH);
     let refresher = Refresher::new(HttpTransport::new(), &cache);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)
-        .map_err(|error| AppFailure::new(1, error.to_string()))?.as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AppFailure::new(1, error.to_string()))?
+        .as_secs();
     let report = refresh_profile(
         &profile,
         requested,
         |repository, source| {
             let metadata_trust = metadata_trust(repository, now)?;
-            refresher.refresh_with_metadata_trust(
-                &repository.id, source, metadata_trust.as_ref(),
-            ).map_err(|error| error.to_string())
+            refresher
+                .refresh_with_metadata_trust(&repository.id, source, metadata_trust.as_ref())
+                .map_err(|error| error.to_string())
         },
-        |published_at_unix| publisher.publish_after_verified_refresh(published_at_unix).map_err(|error| error.to_string()),
+        |published_at_unix| {
+            publisher
+                .publish_after_verified_refresh(published_at_unix)
+                .map_err(|error| error.to_string())
+        },
         now,
     )?;
     Ok(format!(
@@ -61,11 +74,17 @@ where
     requested.sort();
     requested.dedup();
     for id in &requested {
-        if !profile.repositories.iter().any(|repository| repository.id == *id && repository.enabled) {
+        if !profile
+            .repositories
+            .iter()
+            .any(|repository| repository.id == *id && repository.enabled)
+        {
             return Err(AppFailure::new(1, format!("unknown repository: {id}")));
         }
     }
-    let mut selected = profile.repositories.iter()
+    let mut selected = profile
+        .repositories
+        .iter()
         .filter(|repository| repository.enabled)
         .filter(|repository| requested.is_empty() || requested.contains(&repository.id))
         .collect::<Vec<_>>();
@@ -86,19 +105,38 @@ where
                 Err(error) => last_error = Some(error),
             }
         }
-        outcome.ok_or_else(|| AppFailure::new(
-            1,
-            format!("{}: {}", repository.id, last_error.unwrap_or_else(|| "repository has no usable source".into())),
-        ))?;
+        outcome.ok_or_else(|| {
+            AppFailure::new(
+                1,
+                format!(
+                    "{}: {}",
+                    repository.id,
+                    last_error.unwrap_or_else(|| "repository has no usable source".into())
+                ),
+            )
+        })?;
         refreshed.push(escaped_field(&repository.id));
     }
-    let planning_snapshot = publish_snapshot(published_at_unix).map_err(|error| AppFailure::new(1, error))?;
-    Ok(RefreshReport { refreshed, planning_snapshot })
+    let planning_snapshot =
+        publish_snapshot(published_at_unix).map_err(|error| AppFailure::new(1, error))?;
+    Ok(RefreshReport {
+        refreshed,
+        planning_snapshot,
+    })
 }
 
-fn metadata_trust(repository: &RepoConfig, valid_at_unix: u64) -> Result<Option<MetadataTrust>, String> {
-    if !repository.repo_gpgcheck { return Ok(None); }
-    let paths = repository.gpgkey.iter().map(PathBuf::from).collect::<Vec<_>>();
+fn metadata_trust(
+    repository: &RepoConfig,
+    valid_at_unix: u64,
+) -> Result<Option<MetadataTrust>, String> {
+    if !repository.repo_gpgcheck {
+        return Ok(None);
+    }
+    let paths = repository
+        .gpgkey
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     let bundle = key_bundle_digest(&repository.id, &paths).map_err(|error| error.to_string())?;
     if repository.key_bundle_digest != Some(bundle.digest) {
         return Err("repository key bundle changed after profile validation".into());
@@ -108,19 +146,34 @@ fn metadata_trust(repository: &RepoConfig, valid_at_unix: u64) -> Result<Option<
         repository.allowed_fingerprints.clone(),
         hex::encode(bundle.digest),
         valid_at_unix,
-    ).map(Some).map_err(|error| error.to_string())
+    )
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
 fn sources(repository: &RepoConfig) -> Vec<Source> {
-    repository.baseurl.iter().cloned().map(Source::BaseUrl)
+    repository
+        .baseurl
+        .iter()
+        .cloned()
+        .map(Source::BaseUrl)
         .chain(repository.metalink.iter().cloned().map(Source::Metalink))
-        .chain(repository.mirrorlist.iter().cloned().map(Source::Mirrorlist))
+        .chain(
+            repository
+                .mirrorlist
+                .iter()
+                .cloned()
+                .map(Source::Mirrorlist),
+        )
         .collect()
 }
 
 fn require_root() -> Result<(), AppFailure> {
-    if rustix::process::geteuid().as_raw() == 0 { Ok(()) }
-    else { Err(AppFailure::new(1, "repo refresh requires root")) }
+    if rustix::process::geteuid().as_raw() == 0 {
+        Ok(())
+    } else {
+        Err(AppFailure::new(1, "repo refresh requires root"))
+    }
 }
 
 fn planning_failure(error: dnfast_planning::PlanningError) -> AppFailure {
@@ -152,7 +205,10 @@ mod tests {
             Vec::new(),
             |_, _| {
                 refreshed.set(refreshed.get() + 1);
-                Ok(RefreshOutcome { digest: "verified-generation".into(), packages: 1 })
+                Ok(RefreshOutcome {
+                    digest: "verified-generation".into(),
+                    packages: 1,
+                })
             },
             |timestamp| {
                 published_after.set(refreshed.get());
@@ -160,7 +216,8 @@ mod tests {
                 Ok("published-snapshot".into())
             },
             42,
-        ).expect("the fake verified refresh and publisher must succeed");
+        )
+        .expect("the fake verified refresh and publisher must succeed");
 
         assert_eq!(report.refreshed, ["first", "second"]);
         assert_eq!(report.planning_snapshot, "published-snapshot");
@@ -257,8 +314,8 @@ pub(super) fn list(
         repo_dirs = system_repo_dirs();
     }
     let variables = repository_variables(releasever, basearch)?;
-    let repositories = load_repository_dirs(&repo_dirs)
-        .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    let repositories =
+        load_repository_dirs(&repo_dirs).map_err(|error| AppFailure::new(1, error.to_string()))?;
     if repositories.is_empty() {
         return Err(AppFailure::new(1, "no repository definitions found"));
     }
@@ -271,13 +328,19 @@ pub(super) fn list(
                 variables
                     .expand(source)
                     .map(|source| (kind, source))
-                    .map_err(|error| AppFailure::new(1, format!("{}: {error}", repository.origin.display())))
+                    .map_err(|error| {
+                        AppFailure::new(1, format!("{}: {error}", repository.origin.display()))
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         listed.push(format!(
             "{}={}",
             escaped_field(&repository.id),
-            if repository.enabled { "enabled" } else { "disabled" },
+            if repository.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
         ));
     }
     Ok(format!("configured repositories: {}", listed.join(", ")))

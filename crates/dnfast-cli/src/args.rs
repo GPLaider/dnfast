@@ -13,7 +13,11 @@ use crate::response::JsonOutput;
     long_about = "dnfast refreshes and searches RPM metadata, resolves transactions directly with libsolv, verifies RPMs, and applies approved plans directly with librpm through a fixed root executor. It does not invoke DNF or DNF5."
 )]
 pub(crate) struct Cli {
-    #[arg(long, global = true, help = "Explicitly request the dnfast.cli.v1 JSON response")]
+    #[arg(
+        long,
+        global = true,
+        help = "Explicitly request the dnfast.cli.v1 JSON response"
+    )]
     json: bool,
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,

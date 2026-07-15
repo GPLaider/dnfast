@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{error::parse_error, parse_repository_file, RepoError, Repository};
+use crate::{RepoError, Repository, error::parse_error, parse_repository_file};
 
 pub fn load_repository_dirs(directories: &[PathBuf]) -> Result<Vec<Repository>, RepoError> {
     let mut paths = Vec::new();
@@ -89,8 +89,8 @@ fn has_symlink_ancestor(path: &Path) -> Result<bool, RepoError> {
 }
 
 fn read_stable_regular_file(path: &Path) -> Result<Vec<u8>, RepoError> {
-    let before = std::fs::symlink_metadata(path)
-        .map_err(|source| io_error(path.to_path_buf(), source))?;
+    let before =
+        std::fs::symlink_metadata(path).map_err(|source| io_error(path.to_path_buf(), source))?;
     if before.file_type().is_symlink() || !before.is_file() {
         return Err(parse_error(
             path,

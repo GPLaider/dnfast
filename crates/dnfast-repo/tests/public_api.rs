@@ -1,13 +1,13 @@
 use std::{
     error::Error,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use dnfast_repo::{
-    load_refresh_policy, load_repository_dirs, parse_repository_file, RepoError, Repository, SourceKind, Variables,
+    RepoError, Repository, SourceKind, Variables, load_refresh_policy, load_repository_dirs,
+    parse_repository_file,
 };
 
 struct TemporaryDirectory(PathBuf);
@@ -28,10 +28,20 @@ impl TemporaryDirectory {
 fn refresh_policy_rejects_insecure_transport_settings_before_use() {
     let directory = TemporaryDirectory::new();
     let path = directory.0.join("policy.repo");
-    fs::write(&path, "[fedora]\nbaseurl=https://example\nsslverify=false\n").unwrap();
-    let repository = parse_repository_file(&path, &fs::read_to_string(&path).unwrap()).unwrap().remove(0);
+    fs::write(
+        &path,
+        "[fedora]\nbaseurl=https://example\nsslverify=false\n",
+    )
+    .unwrap();
+    let repository = parse_repository_file(&path, &fs::read_to_string(&path).unwrap())
+        .unwrap()
+        .remove(0);
     assert!(load_refresh_policy(&repository).is_err());
-    fs::write(&path, "[fedora]\nbaseurl=https://example\nproxy=http://proxy\n").unwrap();
+    fs::write(
+        &path,
+        "[fedora]\nbaseurl=https://example\nproxy=http://proxy\n",
+    )
+    .unwrap();
     assert!(load_refresh_policy(&repository).is_err());
 }
 
@@ -40,8 +50,14 @@ fn refresh_policy_accepts_skip_only_with_mandatory_tls() {
     let directory = TemporaryDirectory::new();
     let path = directory.0.join("policy.repo");
     fs::write(&path, "[fedora]\nbaseurl=https://example\nsslverify=true\nskip_if_unavailable=true\nproxy=_none_\n").unwrap();
-    let repository = parse_repository_file(&path, &fs::read_to_string(&path).unwrap()).unwrap().remove(0);
-    assert!(load_refresh_policy(&repository).unwrap().skip_if_unavailable);
+    let repository = parse_repository_file(&path, &fs::read_to_string(&path).unwrap())
+        .unwrap()
+        .remove(0);
+    assert!(
+        load_refresh_policy(&repository)
+            .unwrap()
+            .skip_if_unavailable
+    );
 }
 
 impl Drop for TemporaryDirectory {
@@ -80,7 +96,10 @@ fn parser_preserves_sources_booleans_and_ignored_keys() {
     assert_eq!(repositories.len(), 2);
     assert_eq!(repositories[0].baseurls.len(), 2);
     assert!(!repositories[1].enabled);
-    assert_eq!(repositories[1].selected_source().unwrap().0, SourceKind::Metalink);
+    assert_eq!(
+        repositories[1].selected_source().unwrap().0,
+        SourceKind::Metalink
+    );
 }
 
 #[test]
@@ -94,7 +113,10 @@ fn parser_reports_each_malformed_input_class() {
             "[x]\nbaseurl=https://example\nenabled=perhaps",
             "broken.repo:3: invalid boolean for enabled: perhaps",
         ),
-        ("[x]\nenabled=1", "broken.repo:1: enabled repository has no source"),
+        (
+            "[x]\nenabled=1",
+            "broken.repo:1: enabled repository has no source",
+        ),
         (
             "[x]\nbaseurl=https://one\n[x]\nbaseurl=https://two",
             "broken.repo:3: duplicate repository id: x",
@@ -153,7 +175,10 @@ fn public_error_variants_preserve_display_and_sources() {
     assert!(parse.source().is_none());
     assert_eq!(io.to_string(), "x.repo: denied");
     assert!(io.source().is_some());
-    assert_eq!(utf8.to_string(), "x.repo: repository file is not valid UTF-8");
+    assert_eq!(
+        utf8.to_string(),
+        "x.repo: repository file is not valid UTF-8"
+    );
 }
 
 #[test]
@@ -163,7 +188,13 @@ fn loader_sorts_files_and_rejects_duplicate_ids_across_files() {
     fs::write(directory.0.join("a.repo"), "[a]\nbaseurl=https://a\n").unwrap();
 
     let repositories = load_repository_dirs(std::slice::from_ref(&directory.0)).unwrap();
-    assert_eq!(repositories.iter().map(|repo| repo.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(
+        repositories
+            .iter()
+            .map(|repo| repo.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
 
     fs::write(directory.0.join("b.repo"), "[a]\nbaseurl=https://b\n").unwrap();
     let error = load_repository_dirs(std::slice::from_ref(&directory.0)).unwrap_err();
@@ -200,5 +231,9 @@ fn loader_ignores_symlinked_files_roots_and_ancestors() {
     let linked = parent.0.join("linked");
     symlink(&real, &linked).unwrap();
     assert!(load_repository_dirs(&[linked.clone()]).unwrap().is_empty());
-    assert!(load_repository_dirs(&[linked.join("nested")]).unwrap().is_empty());
+    assert!(
+        load_repository_dirs(&[linked.join("nested")])
+            .unwrap()
+            .is_empty()
+    );
 }

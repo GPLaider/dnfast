@@ -20,7 +20,14 @@ pub struct Authority {
 impl Authority {
     pub fn acquire(name: &[u8]) -> Result<Self, i32> {
         let result = unsafe { dnfast_lock_acquire(name.as_ptr().cast(), name.len()) };
-        if result >= 0 { Ok(Self { fd: result, creator_pid: std::process::id() }) } else { Err(-result) }
+        if result >= 0 {
+            Ok(Self {
+                fd: result,
+                creator_pid: std::process::id(),
+            })
+        } else {
+            Err(-result)
+        }
     }
 }
 

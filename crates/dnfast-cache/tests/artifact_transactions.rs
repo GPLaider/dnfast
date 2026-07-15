@@ -1,16 +1,34 @@
-use std::{io::{BufRead, Cursor, Read, Write}, process::{Command, Stdio}, sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::{Duration, Instant}};
+use std::{
+    io::{BufRead, Cursor, Read, Write},
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use dnfast_cache::{ArtifactCache, ArtifactError, ArtifactResponse, ArtifactSpec, ArtifactTransport, Digest, TransactionRequest, MAX_CACHE_BYTES};
+use dnfast_cache::{
+    ArtifactCache, ArtifactError, ArtifactResponse, ArtifactSpec, ArtifactTransport, Digest,
+    MAX_CACHE_BYTES, TransactionRequest,
+};
 use sha2::{Digest as _, Sha256};
 
-struct BytesTransport<'a> { bytes: &'a [u8] }
+struct BytesTransport<'a> {
+    bytes: &'a [u8],
+}
 impl ArtifactTransport for BytesTransport<'_> {
     fn open(&self, _url: &str) -> Result<ArtifactResponse, ArtifactError> {
-        Ok(ArtifactResponse { status: 200, body: Box::new(Cursor::new(self.bytes.to_vec())) })
+        Ok(ArtifactResponse {
+            status: 200,
+            body: Box::new(Cursor::new(self.bytes.to_vec())),
+        })
     }
 }
 
-struct CountingTransport { calls: Arc<AtomicUsize> }
+struct CountingTransport {
+    calls: Arc<AtomicUsize>,
+}
 impl ArtifactTransport for CountingTransport {
     fn open(&self, _url: &str) -> Result<ArtifactResponse, ArtifactError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -18,9 +36,18 @@ impl ArtifactTransport for CountingTransport {
     }
 }
 
-fn digest(bytes: &[u8]) -> String { hex::encode(Sha256::digest(bytes)) }
+fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
 fn spec(name: &str, bytes: &[u8]) -> ArtifactSpec {
-    ArtifactSpec::new("https://repo.example/", "https://repo.example/", name, Digest::Sha256(digest(bytes)), bytes.len() as u64).unwrap()
+    ArtifactSpec::new(
+        "https://repo.example/",
+        "https://repo.example/",
+        name,
+        Digest::Sha256(digest(bytes)),
+        bytes.len() as u64,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -29,12 +56,17 @@ fn exact_cache_boundary_accepts_two_artifacts_in_one_reservation() {
     let temp = tempfile::tempdir().unwrap();
     let directory = temp.path().join("artifacts/sha256");
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::File::create(directory.join("unbound-cache-entry")).unwrap().set_len(MAX_CACHE_BYTES - 2).unwrap();
+    std::fs::File::create(directory.join("unbound-cache-entry"))
+        .unwrap()
+        .set_len(MAX_CACHE_BYTES - 2)
+        .unwrap();
     let first = spec("a.rpm", b"a");
     let second = spec("b.rpm", b"b");
     let request = TransactionRequest::for_specs(&[first.clone(), second.clone()]).unwrap();
     // When
-    let mut transaction = ArtifactCache::new(temp.path()).begin_transaction(&request).unwrap();
+    let mut transaction = ArtifactCache::new(temp.path())
+        .begin_transaction(&request)
+        .unwrap();
     let first_result = transaction.fetch(&first, &BytesTransport { bytes: b"a" });
     let second_result = transaction.fetch(&second, &BytesTransport { bytes: b"b" });
     // Then
@@ -53,14 +85,23 @@ fn partial_failure_retries_pending_artifact_and_rejects_replay() {
     let cache = ArtifactCache::new(temp.path());
     let mut transaction = cache.begin_transaction(&request).unwrap();
     // When
-    transaction.fetch(&first, &BytesTransport { bytes: b"a" }).unwrap();
+    transaction
+        .fetch(&first, &BytesTransport { bytes: b"a" })
+        .unwrap();
     let failed = transaction.fetch(&second, &BytesTransport { bytes: b"x" });
     let retried = transaction.fetch(&second, &BytesTransport { bytes: b"b" });
     let replayed = transaction.fetch(&first, &BytesTransport { bytes: b"a" });
     drop(transaction);
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut reopened = cache.begin_transaction(&TransactionRequest::for_specs(std::slice::from_ref(&first)).unwrap()).unwrap();
-    let existing = reopened.fetch(&first, &CountingTransport { calls: Arc::clone(&calls) });
+    let mut reopened = cache
+        .begin_transaction(&TransactionRequest::for_specs(std::slice::from_ref(&first)).unwrap())
+        .unwrap();
+    let existing = reopened.fetch(
+        &first,
+        &CountingTransport {
+            calls: Arc::clone(&calls),
+        },
+    );
     // Then
     assert!(matches!(failed, Err(ArtifactError::Integrity(_))));
     assert!(retried.is_ok());
@@ -75,22 +116,40 @@ fn concurrent_transactions_cannot_oversubscribe_cache_cap() {
     let temp = tempfile::tempdir().unwrap();
     let directory = temp.path().join("artifacts/sha256");
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::File::create(directory.join("unbound-cache-entry")).unwrap().set_len(MAX_CACHE_BYTES - 1024).unwrap();
+    std::fs::File::create(directory.join("unbound-cache-entry"))
+        .unwrap()
+        .set_len(MAX_CACHE_BYTES - 1024)
+        .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     // When
     let handles = ["1".repeat(64), "2".repeat(64)].map(|digest_value| {
         let root = temp.path().to_path_buf();
         let calls = Arc::clone(&calls);
         std::thread::spawn(move || {
-            let artifact = ArtifactSpec::new("https://repo.example/", "https://repo.example/", "p.rpm", Digest::Sha256(digest_value), 2048).unwrap();
+            let artifact = ArtifactSpec::new(
+                "https://repo.example/",
+                "https://repo.example/",
+                "p.rpm",
+                Digest::Sha256(digest_value),
+                2048,
+            )
+            .unwrap();
             let request = TransactionRequest::for_specs(std::slice::from_ref(&artifact)).unwrap();
-            ArtifactCache::new(root).begin_transaction(&request).map(|_| ())
-                .map_err(|error| { let _ = calls; error })
+            ArtifactCache::new(root)
+                .begin_transaction(&request)
+                .map(|_| ())
+                .map_err(|error| {
+                    let _ = calls;
+                    error
+                })
         })
     });
     let results = handles.map(|handle| handle.join().unwrap());
     // Then
-    assert!(results.into_iter().all(|result| matches!(result, Err(ArtifactError::Capacity(_) | ArtifactError::Busy(_)))));
+    assert!(results.into_iter().all(|result| matches!(
+        result,
+        Err(ArtifactError::Capacity(_) | ArtifactError::Busy(_))
+    )));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
@@ -129,14 +188,33 @@ fn verified_capability_starts_at_offset_zero() {
     let cache = ArtifactCache::new(temp.path());
     // When
     let mut first_session = cache.begin_transaction(&request).unwrap();
-    let first = first_session.fetch(&artifact, &BytesTransport { bytes: b"RPMH" }).unwrap();
+    let first = first_session
+        .fetch(&artifact, &BytesTransport { bytes: b"RPMH" })
+        .unwrap();
     drop(first_session);
     let mut second_session = cache.begin_transaction(&request).unwrap();
-    let existing = second_session.fetch(&artifact, &CountingTransport { calls: Arc::new(AtomicUsize::new(0)) }).unwrap();
+    let existing = second_session
+        .fetch(
+            &artifact,
+            &CountingTransport {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .unwrap();
     let mut first_bytes = [0_u8; 4];
     let mut existing_bytes = [0_u8; 4];
-    first.file().try_clone().unwrap().read_exact(&mut first_bytes).unwrap();
-    existing.file().try_clone().unwrap().read_exact(&mut existing_bytes).unwrap();
+    first
+        .file()
+        .try_clone()
+        .unwrap()
+        .read_exact(&mut first_bytes)
+        .unwrap();
+    existing
+        .file()
+        .try_clone()
+        .unwrap()
+        .read_exact(&mut existing_bytes)
+        .unwrap();
     // Then
     assert_eq!(&first_bytes, b"RPMH");
     assert_eq!(&existing_bytes, b"RPMH");
@@ -148,7 +226,9 @@ fn cross_process_contention_times_out_then_releases() {
         let root = std::env::var("DNFAST_LOCK_ROOT").unwrap();
         let artifact = spec("a.rpm", b"a");
         let request = TransactionRequest::for_specs(std::slice::from_ref(&artifact)).unwrap();
-        let _session = ArtifactCache::new(root).begin_transaction(&request).unwrap();
+        let _session = ArtifactCache::new(root)
+            .begin_transaction(&request)
+            .unwrap();
         println!("LOCK_READY");
         std::io::stdout().flush().unwrap();
         let mut byte = [0_u8; 1];
@@ -158,7 +238,11 @@ fn cross_process_contention_times_out_then_releases() {
     // Given
     let temp = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "cross_process_contention_times_out_then_releases", "--nocapture"])
+        .args([
+            "--exact",
+            "cross_process_contention_times_out_then_releases",
+            "--nocapture",
+        ])
         .env("DNFAST_LOCK_CHILD", "1")
         .env("DNFAST_LOCK_ROOT", temp.path())
         .stdin(Stdio::piped())
@@ -168,7 +252,9 @@ fn cross_process_contention_times_out_then_releases() {
     let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     while output.read_line(&mut line).unwrap() != 0 {
-        if line.contains("LOCK_READY") { break; }
+        if line.contains("LOCK_READY") {
+            break;
+        }
         line.clear();
     }
     let artifact = spec("a.rpm", b"a");
@@ -181,7 +267,11 @@ fn cross_process_contention_times_out_then_releases() {
     let status = child.wait().unwrap();
     let released = ArtifactCache::new(temp.path()).begin_transaction(&request);
     // Then
-    assert!(matches!(contended, Err(ArtifactError::Busy(_))), "{:?}", contended.as_ref().err());
+    assert!(
+        matches!(contended, Err(ArtifactError::Busy(_))),
+        "{:?}",
+        contended.as_ref().err()
+    );
     assert!(elapsed >= Duration::from_secs(2));
     assert!(elapsed < Duration::from_secs(3));
     assert!(status.success());
@@ -203,10 +293,15 @@ fn many_distinct_caches_hold_sessions_without_false_busy() {
     let session_count = usize::try_from(nofile.saturating_sub(64) / 6)
         .unwrap_or(256)
         .min(256);
-    assert!(session_count >= 32, "RLIMIT_NOFILE is too small for the cache-session stress test: {nofile}");
+    assert!(
+        session_count >= 32,
+        "RLIMIT_NOFILE is too small for the cache-session stress test: {nofile}"
+    );
     // When
     let sessions = (0..session_count)
-        .map(|index| ArtifactCache::new(temp.path().join(index.to_string())).begin_transaction(&request))
+        .map(|index| {
+            ArtifactCache::new(temp.path().join(index.to_string())).begin_transaction(&request)
+        })
         .collect::<Vec<_>>();
     // Then
     assert!(
@@ -224,7 +319,10 @@ fn malicious_transaction_controls_fail_closed_without_scrubbing() {
     let hidden = tempfile::tempdir().unwrap();
     let hidden_directory = hidden.path().join("artifacts/sha256");
     std::fs::create_dir_all(&hidden_directory).unwrap();
-    std::fs::File::create(hidden_directory.join(".transaction-hidden")).unwrap().set_len(MAX_CACHE_BYTES).unwrap();
+    std::fs::File::create(hidden_directory.join(".transaction-hidden"))
+        .unwrap()
+        .set_len(MAX_CACHE_BYTES)
+        .unwrap();
     // When
     let hidden_result = ArtifactCache::new(hidden.path()).begin_transaction(&request);
     // Then
@@ -246,7 +344,13 @@ fn malicious_transaction_controls_fail_closed_without_scrubbing() {
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     let child_pid = i32::try_from(child.id()).unwrap();
     let stat = std::fs::read_to_string(format!("/proc/{child_pid}/stat")).unwrap();
-    let start = stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19).unwrap();
+    let start = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap();
     let marker = format!(".transaction-owner-{child_pid}-{start}");
     for kind in ["symlink", "hardlink", "nonzero", "mode"] {
         let root = tempfile::tempdir().unwrap();
@@ -275,7 +379,10 @@ fn malicious_transaction_controls_fail_closed_without_scrubbing() {
         let result = ArtifactCache::new(root.path()).begin_transaction(&request);
         // Then
         assert!(matches!(result, Err(ArtifactError::Io(_))), "{kind}");
-        assert!(std::fs::symlink_metadata(&path).is_ok(), "{kind} was scrubbed");
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "{kind} was scrubbed"
+        );
     }
     child.kill().unwrap();
     child.wait().unwrap();

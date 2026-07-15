@@ -57,28 +57,63 @@ pub(crate) struct Response {
 }
 
 impl Response {
-    pub(crate) fn failed(command: &str, exit_code: u8, code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn failed(
+        command: &str,
+        exit_code: u8,
+        code: &str,
+        message: impl Into<String>,
+    ) -> Self {
         let message = message.into();
         Self {
-            schema: CLI_SCHEMA.into(), command: command.into(), status: Status::Failed, exit_code,
-            message: Some(message.clone()), plan_digest: None, plan_path: None, transaction_id: None,
-            actions: Vec::new(), errors: vec![Error { code: code.into(), message, context: BTreeMap::new() }],
+            schema: CLI_SCHEMA.into(),
+            command: command.into(),
+            status: Status::Failed,
+            exit_code,
+            message: Some(message.clone()),
+            plan_digest: None,
+            plan_path: None,
+            transaction_id: None,
+            actions: Vec::new(),
+            errors: vec![Error {
+                code: code.into(),
+                message,
+                context: BTreeMap::new(),
+            }],
         }
     }
 
-    pub(crate) fn planned(command: &str, plan_digest: String, plan_path: String, actions: Vec<Action>) -> Self {
+    pub(crate) fn planned(
+        command: &str,
+        plan_digest: String,
+        plan_path: String,
+        actions: Vec<Action>,
+    ) -> Self {
         Self {
-            schema: CLI_SCHEMA.into(), command: command.into(), status: Status::Planned, exit_code: 0,
-            message: None, plan_digest: Some(plan_digest), plan_path: Some(plan_path), transaction_id: None,
-            actions, errors: Vec::new(),
+            schema: CLI_SCHEMA.into(),
+            command: command.into(),
+            status: Status::Planned,
+            exit_code: 0,
+            message: None,
+            plan_digest: Some(plan_digest),
+            plan_path: Some(plan_path),
+            transaction_id: None,
+            actions,
+            errors: Vec::new(),
         }
     }
 
     pub(crate) fn completed(command: &str, message: impl Into<String>) -> Self {
         Self {
-            schema: CLI_SCHEMA.into(), command: command.into(), status: Status::Planned, exit_code: 0,
-            message: Some(message.into()), plan_digest: None, plan_path: None, transaction_id: None,
-            actions: Vec::new(), errors: Vec::new(),
+            schema: CLI_SCHEMA.into(),
+            command: command.into(),
+            status: Status::Planned,
+            exit_code: 0,
+            message: Some(message.into()),
+            plan_digest: None,
+            plan_path: None,
+            transaction_id: None,
+            actions: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -126,7 +161,10 @@ mod tests {
         // When the response crosses the JSON boundary.
         let encoded = response.json().unwrap();
         // Then all v1 fields are present in the specified order and consumers parse it.
-        assert_eq!(encoded, r#"{"schema":"dnfast.cli.v1","command":"group","status":"unsupported","exit_code":2,"message":"unsupported command: group","plan_digest":null,"plan_path":null,"transaction_id":null,"actions":[],"errors":[{"code":"unsupported_command","message":"unsupported command: group","context":{"command":"group"}}]}"#);
+        assert_eq!(
+            encoded,
+            r#"{"schema":"dnfast.cli.v1","command":"group","status":"unsupported","exit_code":2,"message":"unsupported command: group","plan_digest":null,"plan_path":null,"transaction_id":null,"actions":[],"errors":[{"code":"unsupported_command","message":"unsupported command: group","context":{"command":"group"}}]}"#
+        );
         let decoded: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.schema, CLI_SCHEMA);
         assert_eq!(decoded.status, Status::Unsupported);

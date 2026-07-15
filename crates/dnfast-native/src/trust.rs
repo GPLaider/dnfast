@@ -1,9 +1,13 @@
-use std::{os::{fd::AsRawFd, unix::fs::FileExt}, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    os::{fd::AsRawFd, unix::fs::FileExt},
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use dnfast_cache::CachedArtifact;
 use dnfast_core::{RepoTrustPolicy, SigningSubkeyRule};
-use thiserror::Error;
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 use crate::{KeyringInstalled, NativeError};
 
@@ -58,19 +62,29 @@ impl KeyringInstalled {
         repository: &str,
         keys: &[VerifiedStagedKey],
     ) -> Result<Self, TrustError> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)
-            .map_err(|error| TrustError::Bundle(error.to_string()))?.as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| TrustError::Bundle(error.to_string()))?
+            .as_secs();
         validate_staged_bundle(policy, repository, keys, now)?;
-        let certificates = keys.iter().map(|key| key.certificate.as_slice()).collect::<Vec<_>>();
+        let certificates = keys
+            .iter()
+            .map(|key| key.certificate.as_slice())
+            .collect::<Vec<_>>();
         let native = dnfast_native_sys::Keyring::open(&certificates).map_err(NativeError::from)?;
-        Ok(Self { native, allowed_primary_fingerprints: policy.allowed_primary_fingerprints().to_vec() })
+        Ok(Self {
+            native,
+            allowed_primary_fingerprints: policy.allowed_primary_fingerprints().to_vec(),
+        })
     }
 
     pub fn from_verified_staged_bundles(
         bundles: &[(&RepoTrustPolicy, &str, &[VerifiedStagedKey])],
     ) -> Result<Self, TrustError> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)
-            .map_err(|error| TrustError::Bundle(error.to_string()))?.as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| TrustError::Bundle(error.to_string()))?
+            .as_secs();
         let mut certificates = Vec::new();
         let mut allowed_primary_fingerprints = Vec::new();
         for (policy, repository, keys) in bundles {
@@ -78,9 +92,14 @@ impl KeyringInstalled {
             certificates.extend(keys.iter().map(|key| key.certificate.as_slice()));
             allowed_primary_fingerprints.extend_from_slice(policy.allowed_primary_fingerprints());
         }
-        if certificates.is_empty() { return Err(TrustError::Bundle("no staged repository keys".into())); }
+        if certificates.is_empty() {
+            return Err(TrustError::Bundle("no staged repository keys".into()));
+        }
         let native = dnfast_native_sys::Keyring::open(&certificates).map_err(NativeError::from)?;
-        Ok(Self { native, allowed_primary_fingerprints })
+        Ok(Self {
+            native,
+            allowed_primary_fingerprints,
+        })
     }
 
     pub fn from_repository(
@@ -89,10 +108,14 @@ impl KeyringInstalled {
         key_paths: &[PathBuf],
     ) -> Result<Self, TrustError> {
         if repository != policy.repo_id() {
-            return Err(TrustError::Bundle("repository id differs from trust policy".into()));
+            return Err(TrustError::Bundle(
+                "repository id differs from trust policy".into(),
+            ));
         }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)
-            .map_err(|error| TrustError::Bundle(error.to_string()))?.as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| TrustError::Bundle(error.to_string()))?
+            .as_secs();
         if now.abs_diff(policy.valid_at_unix()) > 300 {
             return Err(TrustError::VerificationTimeMismatch);
         }
@@ -102,9 +125,12 @@ impl KeyringInstalled {
         if digest != policy.key_bundle_sha256().as_str() {
             return Err(TrustError::BundleDigestMismatch);
         }
-        let certificates = bundle.certificates.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let native = dnfast_native_sys::Keyring::open(&certificates)
-            .map_err(NativeError::from)?;
+        let certificates = bundle
+            .certificates
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let native = dnfast_native_sys::Keyring::open(&certificates).map_err(NativeError::from)?;
         Ok(Self {
             native,
             allowed_primary_fingerprints: policy.allowed_primary_fingerprints().to_vec(),
@@ -117,11 +143,16 @@ impl KeyringInstalled {
         expected: &ExpectedPackage,
         subkey_rule: SigningSubkeyRule,
     ) -> Result<VerifiedArtifact, TrustError> {
-        let verified = self.native.verify_fd(artifact.file().as_raw_fd())
+        let verified = self
+            .native
+            .verify_fd(artifact.file().as_raw_fd())
             .map_err(NativeError::from)?;
         let actual = ExpectedPackage {
             name: verified.name,
-            epoch: verified.epoch.parse().map_err(|_| TrustError::NevraMismatch)?,
+            epoch: verified
+                .epoch
+                .parse()
+                .map_err(|_| TrustError::NevraMismatch)?,
             version: verified.version,
             release: verified.release,
             arch: verified.arch,
@@ -136,37 +167,76 @@ impl KeyringInstalled {
             expected,
         )?;
         let file = artifact.file();
-        let artifact_size = file.metadata().map_err(|error| TrustError::Bundle(error.to_string()))?.len();
+        let artifact_size = file
+            .metadata()
+            .map_err(|error| TrustError::Bundle(error.to_string()))?
+            .len();
         let mut digest = Sha256::new();
         let mut offset = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
         while offset < artifact_size {
-            let count = file.read_at(&mut buffer, offset).map_err(|error| TrustError::Bundle(error.to_string()))?;
-            if count == 0 { return Err(TrustError::Bundle("retained artifact truncated".into())); }
+            let count = file
+                .read_at(&mut buffer, offset)
+                .map_err(|error| TrustError::Bundle(error.to_string()))?;
+            if count == 0 {
+                return Err(TrustError::Bundle("retained artifact truncated".into()));
+            }
             digest.update(&buffer[..count]);
-            offset = offset.checked_add(u64::try_from(count).map_err(|error| TrustError::Bundle(error.to_string()))?)
+            offset = offset
+                .checked_add(
+                    u64::try_from(count).map_err(|error| TrustError::Bundle(error.to_string()))?,
+                )
                 .ok_or_else(|| TrustError::Bundle("retained artifact size overflow".into()))?;
         }
-        Ok(VerifiedArtifact { package: actual, primary_fingerprint: verified.primary_fingerprint,
-            signing_fingerprint: verified.signing_fingerprint, artifact_sha256: hex::encode(digest.finalize()), artifact_size })
+        Ok(VerifiedArtifact {
+            package: actual,
+            primary_fingerprint: verified.primary_fingerprint,
+            signing_fingerprint: verified.signing_fingerprint,
+            artifact_sha256: hex::encode(digest.finalize()),
+            artifact_size,
+        })
     }
 }
 
-fn validate_staged_bundle(policy: &RepoTrustPolicy, repository: &str, keys: &[VerifiedStagedKey], now: u64) -> Result<(), TrustError> {
-    if repository != policy.repo_id() { return Err(TrustError::Bundle("repository id differs from trust policy".into())); }
-    if now.abs_diff(policy.valid_at_unix()) > 300 { return Err(TrustError::VerificationTimeMismatch); }
+fn validate_staged_bundle(
+    policy: &RepoTrustPolicy,
+    repository: &str,
+    keys: &[VerifiedStagedKey],
+    now: u64,
+) -> Result<(), TrustError> {
+    if repository != policy.repo_id() {
+        return Err(TrustError::Bundle(
+            "repository id differs from trust policy".into(),
+        ));
+    }
+    if now.abs_diff(policy.valid_at_unix()) > 300 {
+        return Err(TrustError::VerificationTimeMismatch);
+    }
     let mut digest = Sha256::new();
     digest.update(b"dnfast-key-bundle-v1");
     let mut paths = std::collections::BTreeSet::new();
     for key in keys {
-        if !paths.insert(&key.bundle_path) { return Err(TrustError::Bundle("duplicate staged key path".into())); }
-        digest.update(u64::try_from(key.bundle_path.len()).map_err(|error| TrustError::Bundle(error.to_string()))?.to_be_bytes());
+        if !paths.insert(&key.bundle_path) {
+            return Err(TrustError::Bundle("duplicate staged key path".into()));
+        }
+        digest.update(
+            u64::try_from(key.bundle_path.len())
+                .map_err(|error| TrustError::Bundle(error.to_string()))?
+                .to_be_bytes(),
+        );
         digest.update(key.bundle_path.as_bytes());
-        digest.update(u64::try_from(key.certificate.len()).map_err(|error| TrustError::Bundle(error.to_string()))?.to_be_bytes());
+        digest.update(
+            u64::try_from(key.certificate.len())
+                .map_err(|error| TrustError::Bundle(error.to_string()))?
+                .to_be_bytes(),
+        );
         digest.update(&key.certificate);
     }
-    if hex::encode(digest.finalize()) == policy.key_bundle_sha256().as_str() { Ok(()) }
-    else { Err(TrustError::BundleDigestMismatch) }
+    if hex::encode(digest.finalize()) == policy.key_bundle_sha256().as_str() {
+        Ok(())
+    } else {
+        Err(TrustError::BundleDigestMismatch)
+    }
 }
 
 fn authorize(
@@ -183,9 +253,17 @@ fn authorize(
     if rule == SigningSubkeyRule::PrimaryOnly && signing != primary {
         return Err(TrustError::SigningSubkeyRejected);
     }
-    if actual.name != expected.name || actual.epoch != expected.epoch || actual.version != expected.version
-        || actual.release != expected.release || actual.arch != expected.arch { return Err(TrustError::NevraMismatch); }
-    if actual.vendor != expected.vendor && !(expected.vendor == "unknown" && actual.vendor.is_empty()) {
+    if actual.name != expected.name
+        || actual.epoch != expected.epoch
+        || actual.version != expected.version
+        || actual.release != expected.release
+        || actual.arch != expected.arch
+    {
+        return Err(TrustError::NevraMismatch);
+    }
+    if actual.vendor != expected.vendor
+        && !(expected.vendor == "unknown" && actual.vendor.is_empty())
+    {
         return Err(TrustError::VendorMismatch);
     }
     Ok(())
@@ -196,34 +274,91 @@ mod tests {
     use super::*;
 
     fn package() -> ExpectedPackage {
-        ExpectedPackage { name: "dnfast-app".into(), epoch: 0, version: "1.0".into(), release: "1".into(), arch: "noarch".into(), vendor: "Vendor".into() }
+        ExpectedPackage {
+            name: "dnfast-app".into(),
+            epoch: 0,
+            version: "1.0".into(),
+            release: "1".into(),
+            arch: "noarch".into(),
+            vendor: "Vendor".into(),
+        }
     }
 
     #[test]
     fn unrelated_cryptographically_valid_signer_is_rejected() {
         let actual = package();
-        let result = authorize(&["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()], "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", SigningSubkeyRule::AuthorizedSubkeys, &actual, &actual);
+        let result = authorize(
+            &["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            SigningSubkeyRule::AuthorizedSubkeys,
+            &actual,
+            &actual,
+        );
         assert!(matches!(result, Err(TrustError::UnauthorizedSigner)));
     }
 
     #[test]
     fn exact_nevra_and_authorized_subkey_are_required() {
         let expected = package();
-        assert!(authorize(&["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", SigningSubkeyRule::AuthorizedSubkeys, &expected, &expected).is_ok());
+        assert!(
+            authorize(
+                &["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                SigningSubkeyRule::AuthorizedSubkeys,
+                &expected,
+                &expected
+            )
+            .is_ok()
+        );
         let mut mismatch = package();
         mismatch.release = "2".into();
-        assert!(matches!(authorize(&["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", SigningSubkeyRule::AuthorizedSubkeys, &mismatch, &expected), Err(TrustError::NevraMismatch)));
-        assert!(matches!(authorize(&["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", SigningSubkeyRule::PrimaryOnly, &expected, &expected), Err(TrustError::SigningSubkeyRejected)));
+        assert!(matches!(
+            authorize(
+                &["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                SigningSubkeyRule::AuthorizedSubkeys,
+                &mismatch,
+                &expected
+            ),
+            Err(TrustError::NevraMismatch)
+        ));
+        assert!(matches!(
+            authorize(
+                &["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                SigningSubkeyRule::PrimaryOnly,
+                &expected,
+                &expected
+            ),
+            Err(TrustError::SigningSubkeyRejected)
+        ));
     }
 
     #[test]
     fn signed_package_with_vendor_different_from_metadata_is_rejected() {
         // Given: a signature from an authorized repository key and identical NEVRA.
-        let expected = ExpectedPackage { vendor: "Metadata Vendor".into(), ..package() };
-        let actual = ExpectedPackage { vendor: "RPM Header Vendor".into(), ..package() };
+        let expected = ExpectedPackage {
+            vendor: "Metadata Vendor".into(),
+            ..package()
+        };
+        let actual = ExpectedPackage {
+            vendor: "RPM Header Vendor".into(),
+            ..package()
+        };
 
         // When: the native verifier compares the signed RPM header with rpm-md.
-        let result = authorize(&["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", SigningSubkeyRule::AuthorizedSubkeys, &actual, &expected);
+        let result = authorize(
+            &["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            SigningSubkeyRule::AuthorizedSubkeys,
+            &actual,
+            &expected,
+        );
 
         // Then: a valid signature cannot substitute its Vendor provenance.
         assert!(matches!(result, Err(TrustError::VendorMismatch)));
@@ -232,11 +367,24 @@ mod tests {
     #[test]
     fn unknown_metadata_vendor_permits_only_an_absent_rpm_header_vendor() {
         // Given: rpm-md's canonical `unknown` marker for an absent Vendor header.
-        let expected = ExpectedPackage { vendor: "unknown".into(), ..package() };
-        let actual = ExpectedPackage { vendor: String::new(), ..package() };
+        let expected = ExpectedPackage {
+            vendor: "unknown".into(),
+            ..package()
+        };
+        let actual = ExpectedPackage {
+            vendor: String::new(),
+            ..package()
+        };
 
         // When: the trusted RPM header is compared with that canonical marker.
-        let result = authorize(&["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", SigningSubkeyRule::AuthorizedSubkeys, &actual, &expected);
+        let result = authorize(
+            &["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()],
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            SigningSubkeyRule::AuthorizedSubkeys,
+            &actual,
+            &expected,
+        );
 
         // Then: the only permitted unknown case is an actually absent header field.
         assert!(result.is_ok());

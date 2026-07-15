@@ -1,11 +1,11 @@
 use std::io::{Cursor, Write};
 
 use dnfast_metadata::{
+    MAX_PRIMARY_COMPRESSED_BYTES, MAX_PRIMARY_OPEN_BYTES, MetadataError, PrimaryRecord,
     decode_primary, decode_record, parse_filelists_record, parse_primary, parse_repomd, search,
-    verify_compressed, MetadataError, PrimaryRecord, MAX_PRIMARY_COMPRESSED_BYTES,
-    MAX_PRIMARY_OPEN_BYTES,
+    verify_compressed,
 };
-use flate2::{write::GzEncoder, Compression};
+use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
 
 const REPOMD: &str = r#"<?xml version="1.0"?>
@@ -45,7 +45,10 @@ fn compressed_record(href: &str, compressed: &[u8], open: &[u8]) -> PrimaryRecor
 #[test]
 fn parses_primary_record_from_repomd() {
     let record = parse_repomd(REPOMD.as_bytes()).expect("valid repomd");
-    assert_eq!((record.href.as_str(), record.size, record.open_size), ("repodata/primary.xml.zst", 123, 456));
+    assert_eq!(
+        (record.href.as_str(), record.size, record.open_size),
+        ("repodata/primary.xml.zst", 123, 456)
+    );
     assert_eq!(record.checksum.len(), 64);
 }
 
@@ -53,34 +56,64 @@ fn parses_primary_record_from_repomd() {
 fn parses_packages_and_ranks_search_deterministically() {
     let packages = parse_primary(PRIMARY.as_bytes()).expect("valid primary");
     assert_eq!(packages[0].nevra(), "ripgrep-0:14.1.1-1.fc44.aarch64");
-    assert_eq!(search(&packages, "ripgrep").iter().map(|package| package.name.as_str()).collect::<Vec<_>>(), ["ripgrep", "ripgrep-all"]);
+    assert_eq!(
+        search(&packages, "ripgrep")
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ripgrep", "ripgrep-all"]
+    );
     assert!(search(&packages, "missing").is_empty());
 }
 
 #[test]
 fn primary_requires_common_root_and_exact_package_count() {
     let wrong_root = PRIMARY.replace("metadata/common", "metadata/other");
-    assert_eq!(parse_primary(wrong_root.as_bytes()), Err(MetadataError::Xml("unexpected primary root or namespace".into())));
+    assert_eq!(
+        parse_primary(wrong_root.as_bytes()),
+        Err(MetadataError::Xml(
+            "unexpected primary root or namespace".into()
+        ))
+    );
     let wrong_count = PRIMARY.replace("packages=\"2\"", "packages=\"3\"");
-    assert_eq!(parse_primary(wrong_count.as_bytes()), Err(MetadataError::Xml("primary package count mismatch: declared 3, parsed 2".into())));
+    assert_eq!(
+        parse_primary(wrong_count.as_bytes()),
+        Err(MetadataError::Xml(
+            "primary package count mismatch: declared 3, parsed 2".into()
+        ))
+    );
 }
 
 #[test]
 fn rejects_invalid_open_checksum_syntax() {
-    let xml = REPOMD.replace("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "not-a-sha256");
-    assert_eq!(parse_repomd(xml.as_bytes()), Err(MetadataError::UnsupportedChecksum("not-a-sha256".into())));
+    let xml = REPOMD.replace(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "not-a-sha256",
+    );
+    assert_eq!(
+        parse_repomd(xml.as_bytes()),
+        Err(MetadataError::UnsupportedChecksum("not-a-sha256".into()))
+    );
 }
 
 #[test]
 fn rejects_repomd_from_wrong_namespace() {
     let xml = REPOMD.replace("metadata/repo", "metadata/common");
-    assert_eq!(parse_repomd(xml.as_bytes()), Err(MetadataError::Xml("unexpected repomd root or namespace".into())));
+    assert_eq!(
+        parse_repomd(xml.as_bytes()),
+        Err(MetadataError::Xml(
+            "unexpected repomd root or namespace".into()
+        ))
+    );
 }
 
 #[test]
 fn rejects_unsafe_primary_location() {
     let xml = REPOMD.replace("repodata/primary.xml.zst", "../escape.xml.zst");
-    assert_eq!(parse_repomd(xml.as_bytes()), Err(MetadataError::UnsafeLocation("../escape.xml.zst".into())));
+    assert_eq!(
+        parse_repomd(xml.as_bytes()),
+        Err(MetadataError::UnsafeLocation("../escape.xml.zst".into()))
+    );
 }
 
 #[test]
@@ -88,29 +121,64 @@ fn verifies_compressed_size_and_sha256() {
     let bytes = b"verified metadata";
     let record = compressed_record("repodata/primary.xml", bytes, bytes);
     assert_eq!(verify_compressed(bytes, &record), Ok(()));
-    assert_eq!(verify_compressed(b"corrupt metadata", &record), Err(MetadataError::SizeMismatch { expected: bytes.len() as u64, actual: 16 }));
+    assert_eq!(
+        verify_compressed(b"corrupt metadata", &record),
+        Err(MetadataError::SizeMismatch {
+            expected: bytes.len() as u64,
+            actual: 16
+        })
+    );
 }
 
 #[test]
 fn rejects_namespace_declaration_not_bound_to_repomd() {
     let xml = REPOMD.replace("xmlns=", "xmlns:repo=");
-    assert_eq!(parse_repomd(xml.as_bytes()), Err(MetadataError::Xml("unexpected repomd root or namespace".into())));
+    assert_eq!(
+        parse_repomd(xml.as_bytes()),
+        Err(MetadataError::Xml(
+            "unexpected repomd root or namespace".into()
+        ))
+    );
 }
 
 #[test]
 fn rejects_metadata_sizes_above_policy_caps() {
-    let too_large = REPOMD.replace("<size>123</size>", &format!("<size>{}</size>", MAX_PRIMARY_COMPRESSED_BYTES + 1));
-    assert_eq!(parse_repomd(too_large.as_bytes()), Err(MetadataError::SizeMismatch { expected: MAX_PRIMARY_COMPRESSED_BYTES, actual: MAX_PRIMARY_COMPRESSED_BYTES + 1 }));
-    let too_open = REPOMD.replace("<open-size>456</open-size>", &format!("<open-size>{}</open-size>", MAX_PRIMARY_OPEN_BYTES + 1));
-    assert_eq!(parse_repomd(too_open.as_bytes()), Err(MetadataError::SizeMismatch { expected: MAX_PRIMARY_OPEN_BYTES, actual: MAX_PRIMARY_OPEN_BYTES + 1 }));
+    let too_large = REPOMD.replace(
+        "<size>123</size>",
+        &format!("<size>{}</size>", MAX_PRIMARY_COMPRESSED_BYTES + 1),
+    );
+    assert_eq!(
+        parse_repomd(too_large.as_bytes()),
+        Err(MetadataError::SizeMismatch {
+            expected: MAX_PRIMARY_COMPRESSED_BYTES,
+            actual: MAX_PRIMARY_COMPRESSED_BYTES + 1
+        })
+    );
+    let too_open = REPOMD.replace(
+        "<open-size>456</open-size>",
+        &format!("<open-size>{}</open-size>", MAX_PRIMARY_OPEN_BYTES + 1),
+    );
+    assert_eq!(
+        parse_repomd(too_open.as_bytes()),
+        Err(MetadataError::SizeMismatch {
+            expected: MAX_PRIMARY_OPEN_BYTES,
+            actual: MAX_PRIMARY_OPEN_BYTES + 1
+        })
+    );
 }
 
 #[test]
 fn rejects_wrong_namespace_on_empty_version_and_non_rpm_package() {
     let namespace = PRIMARY.replace("<version epoch=", "<version xmlns=\"urn:wrong\" epoch=");
-    assert_eq!(parse_primary(namespace.as_bytes()), Err(MetadataError::Xml("unexpected primary namespace".into())));
+    assert_eq!(
+        parse_primary(namespace.as_bytes()),
+        Err(MetadataError::Xml("unexpected primary namespace".into()))
+    );
     let package_type = PRIMARY.replacen("type=\"rpm\"", "type=\"deb\"", 1);
-    assert_eq!(parse_primary(package_type.as_bytes()), Err(MetadataError::Xml("primary package type is not rpm".into())));
+    assert_eq!(
+        parse_primary(package_type.as_bytes()),
+        Err(MetadataError::Xml("primary package type is not rpm".into()))
+    );
 }
 
 #[test]
@@ -118,22 +186,46 @@ fn rejects_decompressed_output_above_declared_size() {
     let compressed = zstd::stream::encode_all(b"four".as_slice(), 1).expect("zstd encode");
     let mut record = compressed_record("repodata/primary.xml.zst", &compressed, b"four");
     record.open_size = 3;
-    assert_eq!(decode_primary(&compressed, &record), Err(MetadataError::SizeMismatch { expected: 3, actual: 4 }));
+    assert_eq!(
+        decode_primary(&compressed, &record),
+        Err(MetadataError::SizeMismatch {
+            expected: 3,
+            actual: 4
+        })
+    );
 }
 
 #[test]
 fn requires_open_integrity_fields() {
-    let no_checksum = REPOMD.replace(&format!("<open-checksum type=\"sha256\">{}</open-checksum>", "b".repeat(64)), "");
-    assert_eq!(parse_repomd(no_checksum.as_bytes()), Err(MetadataError::MissingPrimary));
+    let no_checksum = REPOMD.replace(
+        &format!(
+            "<open-checksum type=\"sha256\">{}</open-checksum>",
+            "b".repeat(64)
+        ),
+        "",
+    );
+    assert_eq!(
+        parse_repomd(no_checksum.as_bytes()),
+        Err(MetadataError::MissingPrimary)
+    );
     let no_size = REPOMD.replace("<open-size>456</open-size>", "");
-    assert_eq!(parse_repomd(no_size.as_bytes()), Err(MetadataError::MissingPrimary));
+    assert_eq!(
+        parse_repomd(no_size.as_bytes()),
+        Err(MetadataError::MissingPrimary)
+    );
 }
 
 #[test]
 fn requires_complete_single_xml_documents() {
-    assert_eq!(parse_repomd(b"<repomd xmlns=\"http://linux.duke.edu/metadata/repo\">"), Err(MetadataError::Xml("incomplete repomd root".into())));
+    assert_eq!(
+        parse_repomd(b"<repomd xmlns=\"http://linux.duke.edu/metadata/repo\">"),
+        Err(MetadataError::Xml("incomplete repomd root".into()))
+    );
     let trailing = format!("{PRIMARY}<extra/>");
-    assert_eq!(parse_primary(trailing.as_bytes()), Err(MetadataError::Xml("element outside primary root".into())));
+    assert_eq!(
+        parse_primary(trailing.as_bytes()),
+        Err(MetadataError::Xml("element outside primary root".into()))
+    );
 }
 
 #[test]
@@ -143,8 +235,22 @@ fn decodes_gzip_and_zstd_with_open_integrity() {
     encoder.write_all(open).expect("gzip write");
     let gzip = encoder.finish().expect("gzip finish");
     let zstd = zstd::stream::encode_all(open, 1).expect("zstd encode");
-    assert_eq!(decode_primary(&gzip, &compressed_record("repodata/primary.xml.gz", &gzip, open)).expect("gzip decode"), open);
-    assert_eq!(decode_primary(&zstd, &compressed_record("repodata/primary.xml.zst", &zstd, open)).expect("zstd decode"), open);
+    assert_eq!(
+        decode_primary(
+            &gzip,
+            &compressed_record("repodata/primary.xml.gz", &gzip, open)
+        )
+        .expect("gzip decode"),
+        open
+    );
+    assert_eq!(
+        decode_primary(
+            &zstd,
+            &compressed_record("repodata/primary.xml.zst", &zstd, open)
+        )
+        .expect("zstd decode"),
+        open
+    );
 }
 
 #[test]
@@ -168,7 +274,10 @@ fn record_decoder_uses_content_magic_not_href_suffix() {
 
     // Then: bytes, not a location spelling, choose the decoder.
     for (bytes, href) in cases {
-        assert_eq!(decode_record(bytes, &compressed_record(href, bytes, open)).expect("decode by content"), open);
+        assert_eq!(
+            decode_record(bytes, &compressed_record(href, bytes, open)).expect("decode by content"),
+            open
+        );
     }
 }
 

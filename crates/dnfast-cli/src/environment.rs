@@ -1,4 +1,8 @@
-use std::{ffi::OsStr, fs, path::{Path, PathBuf}};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use dnfast_planning::SYSTEM_CACHE_PATH;
 use dnfast_repo::Variables;
@@ -11,14 +15,26 @@ pub(crate) fn cache_directory(value: Option<PathBuf>) -> Result<PathBuf, AppFail
     }
     let xdg = std::env::var_os("XDG_CACHE_HOME");
     let home = std::env::var_os("HOME");
-    default_cache_directory(xdg.as_deref(), home.as_deref(), rustix::process::geteuid().as_raw() == 0)
-        .ok_or_else(|| AppFailure::new(1, "cannot determine cache directory; pass --cache-dir"))
+    default_cache_directory(
+        xdg.as_deref(),
+        home.as_deref(),
+        rustix::process::geteuid().as_raw() == 0,
+    )
+    .ok_or_else(|| AppFailure::new(1, "cannot determine cache directory; pass --cache-dir"))
 }
 
-fn default_cache_directory(xdg: Option<&OsStr>, home: Option<&OsStr>, root: bool) -> Option<PathBuf> {
-    xdg.map(PathBuf::from).map(|path| path.join("dnfast")).or_else(|| {
-        root.then(|| PathBuf::from(SYSTEM_CACHE_PATH))
-    }).or_else(|| home.map(PathBuf::from).map(|path| path.join(".cache/dnfast")))
+fn default_cache_directory(
+    xdg: Option<&OsStr>,
+    home: Option<&OsStr>,
+    root: bool,
+) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
+        .map(|path| path.join("dnfast"))
+        .or_else(|| root.then(|| PathBuf::from(SYSTEM_CACHE_PATH)))
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .map(|path| path.join(".cache/dnfast"))
+        })
 }
 
 pub(crate) fn system_repo_dirs() -> Vec<PathBuf> {
@@ -74,8 +90,21 @@ mod tests {
 
     #[test]
     fn root_defaults_to_the_refresh_cache_while_nonroot_retains_a_user_cache() {
-        assert_eq!(super::default_cache_directory(None, Some(OsStr::new("/root")), true), Some(Path::new(SYSTEM_CACHE_PATH).into()));
-        assert_eq!(super::default_cache_directory(None, Some(OsStr::new("/home/alice")), false), Some(Path::new("/home/alice/.cache/dnfast").into()));
-        assert_eq!(super::default_cache_directory(Some(OsStr::new("/explicit")), Some(OsStr::new("/root")), true), Some(Path::new("/explicit/dnfast").into()));
+        assert_eq!(
+            super::default_cache_directory(None, Some(OsStr::new("/root")), true),
+            Some(Path::new(SYSTEM_CACHE_PATH).into())
+        );
+        assert_eq!(
+            super::default_cache_directory(None, Some(OsStr::new("/home/alice")), false),
+            Some(Path::new("/home/alice/.cache/dnfast").into())
+        );
+        assert_eq!(
+            super::default_cache_directory(
+                Some(OsStr::new("/explicit")),
+                Some(OsStr::new("/root")),
+                true
+            ),
+            Some(Path::new("/explicit/dnfast").into())
+        );
     }
 }

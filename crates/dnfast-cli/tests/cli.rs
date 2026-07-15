@@ -41,7 +41,13 @@ fn generation(package: &Package) -> (Vec<u8>, Vec<u8>) {
 
 #[test]
 fn plan_never_claims_resolution_when_the_root_published_snapshot_is_absent() {
-    let output = dnfast(&["plan", "install", "bash", "--output", "/tmp/dnfast-missing-snapshot-plan.json"]);
+    let output = dnfast(&[
+        "plan",
+        "install",
+        "bash",
+        "--output",
+        "/tmp/dnfast-missing-snapshot-plan.json",
+    ]);
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stderr.is_empty());
@@ -83,8 +89,18 @@ fn repo_list_is_expanded_and_deterministic() {
     assert_eq!(response["schema"], "dnfast.cli.v1");
     assert_eq!(response["command"], "repo");
     assert_eq!(response["status"], "planned");
-    assert!(response["message"].as_str().unwrap().contains("fedora=enabled"));
-    assert!(response["message"].as_str().unwrap().contains("disabled=disabled"));
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap()
+            .contains("fedora=enabled")
+    );
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap()
+            .contains("disabled=disabled")
+    );
     assert!(!response["message"].as_str().unwrap().contains("https://"));
 }
 
@@ -100,7 +116,12 @@ fn malformed_repo_exits_one_with_provenance() {
     assert!(output.stderr.is_empty());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["status"], "failed");
-    assert!(response["errors"][0]["message"].as_str().unwrap().contains("broken.repo:3: invalid boolean for enabled: perhaps"));
+    assert!(
+        response["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("broken.repo:3: invalid boolean for enabled: perhaps")
+    );
 }
 
 #[test]
@@ -115,7 +136,12 @@ fn unresolved_variable_in_secondary_baseurl_fails_closed() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(response["errors"][0]["message"].as_str().unwrap().contains("unresolved repository variable: unknown"));
+    assert!(
+        response["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unresolved repository variable: unknown")
+    );
 }
 
 #[test]
@@ -145,7 +171,12 @@ fn help_lists_root_only_refresh_and_offline_search() {
     let help = dnfast(&["--help"]);
     assert!(help.status.success());
     let help_response: serde_json::Value = serde_json::from_slice(&help.stdout).unwrap();
-    assert!(help_response["message"].as_str().unwrap().contains("search"));
+    assert!(
+        help_response["message"]
+            .as_str()
+            .unwrap()
+            .contains("search")
+    );
     let refresh = dnfast(&["repo", "refresh", "--help"]);
     assert!(refresh.status.success(), "{}", stderr(&refresh));
     let refresh_response: serde_json::Value = serde_json::from_slice(&refresh.stdout).unwrap();
@@ -183,7 +214,12 @@ fn search_reads_published_cache_offline() {
     assert_eq!(response["schema"], "dnfast.cli.v1");
     assert_eq!(response["command"], "search");
     assert_eq!(response["status"], "planned");
-    assert!(response["message"].as_str().unwrap().contains("fedora ripgrep-0:14.1.1-1.fc44.aarch64 Fast search"));
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap()
+            .contains("fedora ripgrep-0:14.1.1-1.fc44.aarch64 Fast search")
+    );
 
     let all_repositories = Command::new(env!("CARGO_BIN_EXE_dnfast"))
         .args(["search", "--cache-dir"])
@@ -197,7 +233,12 @@ fn search_reads_published_cache_offline() {
         stderr(&all_repositories)
     );
     let all_response: serde_json::Value = serde_json::from_slice(&all_repositories.stdout).unwrap();
-    assert!(all_response["message"].as_str().unwrap().contains("fedora ripgrep-0:14.1.1-1.fc44.aarch64"));
+    assert!(
+        all_response["message"]
+            .as_str()
+            .unwrap()
+            .contains("fedora ripgrep-0:14.1.1-1.fc44.aarch64")
+    );
 }
 
 #[test]
@@ -213,7 +254,12 @@ fn search_missing_cache_and_deprecated_refresh_paths_fail_closed() {
     assert!(missing.stderr.is_empty());
     let missing_response: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
     assert_eq!(missing_response["status"], "failed");
-    assert!(missing_response["errors"][0]["message"].as_str().unwrap().contains("MissingSnapshot"));
+    assert!(
+        missing_response["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("MissingSnapshot")
+    );
 
     for arguments in [
         &["repo", "refresh", "--repo-dir", "/tmp/untrusted"][..],

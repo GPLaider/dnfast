@@ -42,11 +42,18 @@ pub(crate) struct InputRepositoryTrust {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct InputFile { pub(crate) name: String, pub(crate) sha256: String, pub(crate) size: u64 }
+pub(crate) struct InputFile {
+    pub(crate) name: String,
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct InputKey { pub(crate) file: InputFile, pub(crate) bundle_path: String }
+pub(crate) struct InputKey {
+    pub(crate) file: InputFile,
+    pub(crate) bundle_path: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

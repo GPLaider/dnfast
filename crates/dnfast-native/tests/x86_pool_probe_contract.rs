@@ -47,9 +47,18 @@ fn x86_pool_probe_when_using_rpm_md_fixture_passes_uncompressed_metadata_to_nati
     let filelists = "zstd -qdf fixtures/rpm/generated-build10/repos/main/repodata/filelists.xml.zst -o /tmp/dnfast-x86-pool-probe-filelists.xml";
 
     // Then: libsolv's rpm-md reader receives XML rather than compressed bytes.
-    assert!(script.contains(primary), "x86 probe must decompress primary metadata");
-    assert!(script.contains(filelists), "x86 probe must decompress filelists metadata");
-    assert!(script.contains(X86_POOL_PROBE), "x86 probe must pass decompressed metadata paths");
+    assert!(
+        script.contains(primary),
+        "x86 probe must decompress primary metadata"
+    );
+    assert!(
+        script.contains(filelists),
+        "x86 probe must decompress filelists metadata"
+    );
+    assert!(
+        script.contains(X86_POOL_PROBE),
+        "x86 probe must pass decompressed metadata paths"
+    );
 }
 
 #[test]
@@ -68,7 +77,10 @@ fn x86_pool_probe_when_complete_emits_a_verifiable_host_receipt() {
         "x86_pool_probe_runtime_cleanup=completed",
         "--validate-x86-pool-probe-receipt",
     ] {
-        assert!(script.contains(marker), "x86 probe receipt must include {marker}");
+        assert!(
+            script.contains(marker),
+            "x86 probe receipt must include {marker}"
+        );
     }
 }
 

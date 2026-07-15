@@ -60,7 +60,12 @@ impl<'a, T: Transport> Refresher<'a, T> {
                     if bytes.len() as u64 == metalink.size
                         && hex::encode(Sha256::digest(&bytes)) == metalink.sha256
                     {
-                        match self.finish_generation(repository, &resource.url, bytes, metadata_trust) {
+                        match self.finish_generation(
+                            repository,
+                            &resource.url,
+                            bytes,
+                            metadata_trust,
+                        ) {
                             Ok(outcome) => return Ok(outcome),
                             Err(error) => last_error = Some(error),
                         }
@@ -76,14 +81,18 @@ impl<'a, T: Transport> Refresher<'a, T> {
                 let mut last_error = None;
                 for base in mirrorlist::parse(&list)? {
                     let repomd_url = format!("{base}/repodata/repomd.xml");
-                    match self.transport.get(&repomd_url, MAX_REPOMD_BYTES)
-                        .and_then(|bytes| self.finish_generation(repository, &repomd_url, bytes, metadata_trust))
-                    {
+                    match self
+                        .transport
+                        .get(&repomd_url, MAX_REPOMD_BYTES)
+                        .and_then(|bytes| {
+                            self.finish_generation(repository, &repomd_url, bytes, metadata_trust)
+                        }) {
                         Ok(outcome) => return Ok(outcome),
                         Err(error) => last_error = Some(error),
                     }
                 }
-                Err(last_error.unwrap_or_else(|| RefreshError::Transport("all mirrors failed".into())))
+                Err(last_error
+                    .unwrap_or_else(|| RefreshError::Transport("all mirrors failed".into())))
             }
         }
     }
@@ -107,16 +116,23 @@ impl<'a, T: Transport> Refresher<'a, T> {
             .map_err(|error| RefreshError::Metadata(error.to_string()))?;
         let origin = SelectedOrigin::parse(repomd_url)
             .map_err(|error| RefreshError::Policy(error.to_string()))?;
-        let primary_url = origin.artifact_url(&records.primary.href)
+        let primary_url = origin
+            .artifact_url(&records.primary.href)
             .map_err(|error| RefreshError::Policy(error.to_string()))?;
         let primary = self.transport.get(&primary_url, records.primary.size)?;
-        let filelists_url = origin.artifact_url(&records.filelists.href)
+        let filelists_url = origin
+            .artifact_url(&records.filelists.href)
             .map_err(|error| RefreshError::Policy(error.to_string()))?;
         let filelists = self.transport.get(&filelists_url, records.filelists.size)?;
         let snapshot = self
             .cache
             .publish_complete_with_origin_and_authentication(
-                repository, &repomd, &primary, &filelists, Some(origin.repomd_url()), authentication,
+                repository,
+                &repomd,
+                &primary,
+                &filelists,
+                Some(origin.repomd_url()),
+                authentication,
             )
             .map_err(|error| RefreshError::Cache(error.to_string()))?;
         Ok(RefreshOutcome {

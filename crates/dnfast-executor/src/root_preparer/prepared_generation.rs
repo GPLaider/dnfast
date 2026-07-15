@@ -8,7 +8,9 @@ use std::{
 };
 
 use base64::Engine as _;
-use dnfast_cache::{ArtifactCache, ArtifactError, ArtifactSpec, ArtifactTransport, Digest, TransactionRequest};
+use dnfast_cache::{
+    ArtifactCache, ArtifactError, ArtifactSpec, ArtifactTransport, Digest, TransactionRequest,
+};
 use dnfast_core::CanonicalDocument;
 use dnfast_planning::{PlanningRepository, SYSTEM_CACHE_PATH};
 use rustix::{
@@ -19,17 +21,20 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     ExecutorError,
-    input_model::{InputArtifact, InputFile, InputKey, InputManifest, InputOrigin, InputRepository, InputRepositoryTrust},
+    input_model::{
+        InputArtifact, InputFile, InputKey, InputManifest, InputOrigin, InputRepository,
+        InputRepositoryTrust,
+    },
     root_inputs::INPUT_PATH,
     staging::system_directory,
 };
 
 use super::PreparationError;
 
+use digest::{artifact_key, descriptor};
 pub(crate) use digest::{metadata_digest, trust_digest};
 #[cfg(test)]
 pub(crate) use publication::{Publication, remove_generation};
-use digest::{artifact_key, descriptor};
 
 pub(crate) const PREPARING_PREFIX: &str = ".prepare-";
 
@@ -62,63 +67,150 @@ impl InputDraft {
             let name = format!("{PREPARING_PREFIX}{}", nonce()?);
             match mkdirat(&parent, &name, Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
-                    let directory = openat2(&parent, &name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                        Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS).map_err(errno)?;
-                    return Ok(Self { parent, directory, root_path: root_path.into(), name });
+                    let directory = openat2(
+                        &parent,
+                        &name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                        ResolveFlags::BENEATH
+                            | ResolveFlags::NO_SYMLINKS
+                            | ResolveFlags::NO_MAGICLINKS,
+                    )
+                    .map_err(errno)?;
+                    return Ok(Self {
+                        parent,
+                        directory,
+                        root_path: root_path.into(),
+                        name,
+                    });
                 }
                 Err(Errno::EXIST) => {}
                 Err(error) => return Err(errno(error)),
             }
         }
-        Err(PreparationError::Publish("could not create unique preparation directory".into()))
+        Err(PreparationError::Publish(
+            "could not create unique preparation directory".into(),
+        ))
     }
 
-    pub(crate) fn write_repository(&mut self, repository: &PlanningRepository, index: usize) -> Result<MaterializedRepository, PreparationError> {
+    pub(crate) fn write_repository(
+        &mut self,
+        repository: &PlanningRepository,
+        index: usize,
+    ) -> Result<MaterializedRepository, PreparationError> {
         let prefix = format!("repo-{index}");
         let repomd_bytes = payload_bytes("repomd", &repository.repomd)?;
         let primary_bytes = payload_bytes("primary", &repository.primary)?;
         let filelists_bytes = payload_bytes("filelists", &repository.filelists)?;
-        let records = dnfast_metadata::parse_repomd_records(&repomd_bytes).map_err(|error| materialization("repomd", error))?;
-        let native_primary = dnfast_metadata::decode_primary(&primary_bytes, &records.primary).map_err(|error| materialization("primary", error))?;
-        let native_filelists = dnfast_metadata::decode_record(&filelists_bytes, &records.filelists).map_err(|error| materialization("filelists", error))?;
+        let records = dnfast_metadata::parse_repomd_records(&repomd_bytes)
+            .map_err(|error| materialization("repomd", error))?;
+        let native_primary = dnfast_metadata::decode_primary(&primary_bytes, &records.primary)
+            .map_err(|error| materialization("primary", error))?;
+        let native_filelists = dnfast_metadata::decode_record(&filelists_bytes, &records.filelists)
+            .map_err(|error| materialization("filelists", error))?;
         let repomd = self.write_bytes(&format!("{prefix}-repomd"), &repomd_bytes)?;
         let primary = self.write_bytes(&format!("{prefix}-primary"), &primary_bytes)?;
         let filelists = self.write_bytes(&format!("{prefix}-filelists"), &filelists_bytes)?;
-        let native_primary = self.write_bytes(&format!("{prefix}-native-primary.xml"), &native_primary)?;
-        let native_filelists = self.write_bytes(&format!("{prefix}-native-filelists.xml"), &native_filelists)?;
+        let native_primary =
+            self.write_bytes(&format!("{prefix}-native-primary.xml"), &native_primary)?;
+        let native_filelists =
+            self.write_bytes(&format!("{prefix}-native-filelists.xml"), &native_filelists)?;
         let trust_bytes = repository.trust.to_canonical_json().map_err(domain)?;
         let trust_policy = self.write_bytes(&format!("{prefix}-trust.json"), &trust_bytes)?;
-        let keys = repository.keys.iter().enumerate().map(|(key_index, key)| {
-            let bytes = base64::engine::general_purpose::STANDARD.decode(&key.certificate_base64)
-                .map_err(|_| PreparationError::Snapshot("planning key is not base64".into()))?;
-            Ok(InputKey { file: self.write_bytes(&format!("{prefix}-key-{key_index}"), &bytes)?, bundle_path: key.bundle_path.clone() })
-        }).collect::<Result<Vec<_>, PreparationError>>()?;
+        let keys = repository
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(key_index, key)| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&key.certificate_base64)
+                    .map_err(|_| PreparationError::Snapshot("planning key is not base64".into()))?;
+                Ok(InputKey {
+                    file: self.write_bytes(&format!("{prefix}-key-{key_index}"), &bytes)?,
+                    bundle_path: key.bundle_path.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, PreparationError>>()?;
         let input = InputRepository {
             id: repository.id.clone(),
-            priority: i32::try_from(repository.priority).map_err(|error| PreparationError::Snapshot(error.to_string()))?,
-            cost: i32::try_from(repository.cost).map_err(|error| PreparationError::Snapshot(error.to_string()))?,
+            priority: i32::try_from(repository.priority)
+                .map_err(|error| PreparationError::Snapshot(error.to_string()))?,
+            cost: i32::try_from(repository.cost)
+                .map_err(|error| PreparationError::Snapshot(error.to_string()))?,
             generation_sha256: repository.generation_sha256.clone(),
-            origin: InputOrigin { repomd_url: repository.origin.repomd_url.clone(), sha256: repository.origin.sha256.clone() },
+            origin: InputOrigin {
+                repomd_url: repository.origin.repomd_url.clone(),
+                sha256: repository.origin.sha256.clone(),
+            },
             repomd,
             primary,
             filelists,
-            trust: InputRepositoryTrust { policy: trust_policy, sha256: repository.trust.canonical_sha256().map_err(domain)?.as_str().into(), keys },
+            trust: InputRepositoryTrust {
+                policy: trust_policy,
+                sha256: repository
+                    .trust
+                    .canonical_sha256()
+                    .map_err(domain)?
+                    .as_str()
+                    .into(),
+                keys,
+            },
         };
-        Ok(MaterializedRepository { input, native_primary, native_filelists })
+        Ok(MaterializedRepository {
+            input,
+            native_primary,
+            native_filelists,
+        })
     }
 
-    pub(crate) fn fetch_artifacts(&mut self, proposal: &dnfast_solver::CanonicalSolverPlan, repositories: &[InputRepository], transport: &dyn ArtifactTransport) -> Result<Vec<InputArtifact>, PreparationError> {
-        let specs = proposal.actions().iter().filter_map(|action| action.artifact.as_ref().map(|record| {
-            let repo_id = action.repo_id.as_deref().ok_or_else(|| PreparationError::Inputs("planned artifact has no repository".into()))?;
-            let repository = repositories.iter().find(|repository| repository.id == repo_id)
-                .ok_or_else(|| PreparationError::Inputs("planned artifact repository is absent".into()))?;
-            let base = repository.origin.repomd_url.strip_suffix("/repodata/repomd.xml")
-                .ok_or_else(|| PreparationError::Inputs("selected artifact origin is invalid".into()))?;
-            let spec = ArtifactSpec::from_selected_mirror(base, &record.location, Digest::Sha256(record.checksum_sha256.clone()), record.package_size).map_err(artifact)?;
-            Ok((action, repository, spec))
-        })).collect::<Result<Vec<_>, PreparationError>>()?;
-        if specs.is_empty() { return Ok(Vec::new()); }
-        let request = TransactionRequest::for_specs(&specs.iter().map(|(_, _, spec)| spec.clone()).collect::<Vec<_>>()).map_err(artifact)?;
+    pub(crate) fn fetch_artifacts(
+        &mut self,
+        proposal: &dnfast_solver::CanonicalSolverPlan,
+        repositories: &[InputRepository],
+        transport: &dyn ArtifactTransport,
+    ) -> Result<Vec<InputArtifact>, PreparationError> {
+        let specs = proposal
+            .actions()
+            .iter()
+            .filter_map(|action| {
+                action.artifact.as_ref().map(|record| {
+                    let repo_id = action.repo_id.as_deref().ok_or_else(|| {
+                        PreparationError::Inputs("planned artifact has no repository".into())
+                    })?;
+                    let repository = repositories
+                        .iter()
+                        .find(|repository| repository.id == repo_id)
+                        .ok_or_else(|| {
+                            PreparationError::Inputs("planned artifact repository is absent".into())
+                        })?;
+                    let base = repository
+                        .origin
+                        .repomd_url
+                        .strip_suffix("/repodata/repomd.xml")
+                        .ok_or_else(|| {
+                            PreparationError::Inputs("selected artifact origin is invalid".into())
+                        })?;
+                    let spec = ArtifactSpec::from_selected_mirror(
+                        base,
+                        &record.location,
+                        Digest::Sha256(record.checksum_sha256.clone()),
+                        record.package_size,
+                    )
+                    .map_err(artifact)?;
+                    Ok((action, repository, spec))
+                })
+            })
+            .collect::<Result<Vec<_>, PreparationError>>()?;
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = TransactionRequest::for_specs(
+            &specs
+                .iter()
+                .map(|(_, _, spec)| spec.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(artifact)?;
         let cache = ArtifactCache::new(SYSTEM_CACHE_PATH);
         let mut transaction = cache.begin_transaction(&request).map_err(artifact)?;
         let mut artifacts = Vec::with_capacity(specs.len());
@@ -136,22 +228,41 @@ impl InputDraft {
                 version: action.target_evra.version().into(),
                 release: action.target_evra.release().into(),
                 arch: action.target_evra.arch().as_rpm_arch().into(),
-                vendor: action.vendor.clone().ok_or_else(|| PreparationError::Inputs("planned artifact has no vendor".into()))?,
+                vendor: action.vendor.clone().ok_or_else(|| {
+                    PreparationError::Inputs("planned artifact has no vendor".into())
+                })?,
             });
         }
-        if transaction.remaining() != 0 { return Err(PreparationError::Artifact("artifact transaction did not drain".into())); }
+        if transaction.remaining() != 0 {
+            return Err(PreparationError::Artifact(
+                "artifact transaction did not drain".into(),
+            ));
+        }
         artifacts.sort_by(|left, right| artifact_key(left).cmp(&artifact_key(right)));
         Ok(artifacts)
     }
 
     #[cfg(test)]
-    pub(crate) fn write_payload(&mut self, name: &str, payload: &dnfast_planning::PlanningBytes) -> Result<InputFile, PreparationError> {
+    pub(crate) fn write_payload(
+        &mut self,
+        name: &str,
+        payload: &dnfast_planning::PlanningBytes,
+    ) -> Result<InputFile, PreparationError> {
         self.write_bytes(name, &payload_bytes("payload", payload)?)
     }
 
-    pub(crate) fn write_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<InputFile, PreparationError> {
-        let fd = openat(&self.directory, name, OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600)).map_err(errno)?;
+    pub(crate) fn write_bytes(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<InputFile, PreparationError> {
+        let fd = openat(
+            &self.directory,
+            name,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(errno)?;
         let mut file = File::from(fd);
         file.write_all(bytes).map_err(io)?;
         file.sync_all().map_err(io)?;
@@ -160,37 +271,65 @@ impl InputDraft {
 
     fn copy_file(&mut self, name: &str, source: &File) -> Result<InputFile, PreparationError> {
         let mut source = source.try_clone().map_err(io)?;
-        let fd = openat(&self.directory, name, OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600)).map_err(errno)?;
+        let fd = openat(
+            &self.directory,
+            name,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(errno)?;
         let mut output = File::from(fd);
         let mut hasher = Sha256::new();
         let mut size = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let count = source.read(&mut buffer).map_err(io)?;
-            if count == 0 { break; }
+            if count == 0 {
+                break;
+            }
             output.write_all(&buffer[..count]).map_err(io)?;
             hasher.update(&buffer[..count]);
-            size = size.checked_add(u64::try_from(count).map_err(|error| PreparationError::Publish(error.to_string()))?)
+            size = size
+                .checked_add(
+                    u64::try_from(count)
+                        .map_err(|error| PreparationError::Publish(error.to_string()))?,
+                )
                 .ok_or_else(|| PreparationError::Publish("artifact size overflow".into()))?;
         }
         output.sync_all().map_err(io)?;
-        Ok(InputFile { name: name.into(), sha256: format!("{:x}", hasher.finalize()), size })
+        Ok(InputFile {
+            name: name.into(),
+            sha256: format!("{:x}", hasher.finalize()),
+            size,
+        })
     }
 
-    pub(crate) fn write_manifest(&mut self, manifest: &InputManifest) -> Result<(), PreparationError> {
-        let bytes = serde_json::to_vec(manifest).map_err(|error| PreparationError::Publish(error.to_string()))?;
+    pub(crate) fn write_manifest(
+        &mut self,
+        manifest: &InputManifest,
+    ) -> Result<(), PreparationError> {
+        let bytes = serde_json::to_vec(manifest)
+            .map_err(|error| PreparationError::Publish(error.to_string()))?;
         self.write_bytes("manifest.json", &bytes)?;
         fsync(&self.directory).map_err(errno)
     }
 
     pub(crate) fn open(&self, input: &InputFile) -> Result<File, PreparationError> {
-        let fd = openat2(&self.directory, &input.name, OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS).map_err(errno)?;
+        let fd = openat2(
+            &self.directory,
+            &input.name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .map_err(errno)?;
         Ok(File::from(fd))
     }
 
-    pub(crate) fn discard_native_metadata(&mut self, repositories: &[MaterializedRepository]) -> Result<(), PreparationError> {
+    pub(crate) fn discard_native_metadata(
+        &mut self,
+        repositories: &[MaterializedRepository],
+    ) -> Result<(), PreparationError> {
         for repository in repositories {
             self.remove(&repository.native_primary)?;
             self.remove(&repository.native_filelists)?;
@@ -205,16 +344,27 @@ impl InputDraft {
     pub(crate) fn absolute_path(&self, name: &str) -> String {
         format!("{}/{}/{}", self.root_path, self.name, name)
     }
-
 }
 
-pub(crate) fn payload_bytes(role: &'static str, payload: &dnfast_planning::PlanningBytes) -> Result<Vec<u8>, PreparationError> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(&payload.base64)
-        .map_err(|_| PreparationError::Snapshot(format!("{role} planning payload is not base64")))?;
-    if format!("{:x}", Sha256::digest(&bytes)) == payload.sha256 && u64::try_from(bytes.len()).map_err(|error| PreparationError::Snapshot(error.to_string()))? == payload.size {
+pub(crate) fn payload_bytes(
+    role: &'static str,
+    payload: &dnfast_planning::PlanningBytes,
+) -> Result<Vec<u8>, PreparationError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&payload.base64)
+        .map_err(|_| {
+            PreparationError::Snapshot(format!("{role} planning payload is not base64"))
+        })?;
+    if format!("{:x}", Sha256::digest(&bytes)) == payload.sha256
+        && u64::try_from(bytes.len())
+            .map_err(|error| PreparationError::Snapshot(error.to_string()))?
+            == payload.size
+    {
         Ok(bytes)
     } else {
-        Err(PreparationError::Snapshot(format!("{role} planning payload digest differs")))
+        Err(PreparationError::Snapshot(format!(
+            "{role} planning payload digest differs"
+        )))
     }
 }
 
@@ -224,11 +374,21 @@ fn nonce() -> Result<String, PreparationError> {
     Ok(hex::encode(bytes))
 }
 
-fn artifact(error: ArtifactError) -> PreparationError { PreparationError::Artifact(error.to_string()) }
-fn domain(error: dnfast_core::DomainError) -> PreparationError { PreparationError::Domain(error.to_string()) }
-pub(crate) fn inputs(error: ExecutorError) -> PreparationError { PreparationError::Inputs(error.to_string()) }
-pub(crate) fn io(error: std::io::Error) -> PreparationError { PreparationError::Publish(error.to_string()) }
+fn artifact(error: ArtifactError) -> PreparationError {
+    PreparationError::Artifact(error.to_string())
+}
+fn domain(error: dnfast_core::DomainError) -> PreparationError {
+    PreparationError::Domain(error.to_string())
+}
+pub(crate) fn inputs(error: ExecutorError) -> PreparationError {
+    PreparationError::Inputs(error.to_string())
+}
+pub(crate) fn io(error: std::io::Error) -> PreparationError {
+    PreparationError::Publish(error.to_string())
+}
 fn materialization(role: &'static str, error: dnfast_metadata::MetadataError) -> PreparationError {
     PreparationError::Snapshot(format!("{role} rpm-md materialization failed: {error}"))
 }
-pub(crate) fn errno(error: Errno) -> PreparationError { PreparationError::Publish(error.to_string()) }
+pub(crate) fn errno(error: Errno) -> PreparationError {
+    PreparationError::Publish(error.to_string())
+}

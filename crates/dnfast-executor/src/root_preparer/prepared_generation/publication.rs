@@ -1,25 +1,36 @@
 use std::os::fd::OwnedFd;
 
 use rustix::{
-    fs::{AtFlags, Mode, OFlags, RenameFlags, ResolveFlags, fsync, openat2, renameat_with, unlinkat},
+    fs::{
+        AtFlags, Mode, OFlags, RenameFlags, ResolveFlags, fsync, openat2, renameat_with, unlinkat,
+    },
     io::Errno,
 };
 
 use crate::RootInputs;
 
+use super::super::{PreparationError, PreparedInputs};
 use super::{InputDraft, errno, inputs, io};
-use super::super::{PreparedInputs, PreparationError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Publication { Published, Existing }
+pub(crate) enum Publication {
+    Published,
+    Existing,
+}
 
 impl InputDraft {
-    pub(crate) fn publish(mut self, digest: &str, proposal: &dnfast_solver::CanonicalSolverPlan) -> Result<PreparedInputs, PreparationError> {
+    pub(crate) fn publish(
+        mut self,
+        digest: &str,
+        proposal: &dnfast_solver::CanonicalSolverPlan,
+    ) -> Result<PreparedInputs, PreparationError> {
         match self.publish_generation(digest)? {
             Publication::Published => {
                 fsync(&self.parent).map_err(errno)?;
                 match RootInputs::open(proposal).map_err(inputs) {
-                    Ok(_) => Ok(PreparedInputs { digest: digest.into() }),
+                    Ok(_) => Ok(PreparedInputs {
+                        digest: digest.into(),
+                    }),
                     Err(error) => {
                         remove_generation(&self.parent, digest).map_err(|cleanup| {
                             PreparationError::Publish(format!("published input validation failed: {error}; generation cleanup failed: {cleanup}"))
@@ -30,13 +41,24 @@ impl InputDraft {
             }
             Publication::Existing => {
                 RootInputs::open(proposal).map_err(inputs)?;
-                Ok(PreparedInputs { digest: digest.into() })
+                Ok(PreparedInputs {
+                    digest: digest.into(),
+                })
             }
         }
     }
 
-    pub(crate) fn publish_generation(&mut self, digest: &str) -> Result<Publication, PreparationError> {
-        match renameat_with(&self.parent, &self.name, &self.parent, digest, RenameFlags::NOREPLACE) {
+    pub(crate) fn publish_generation(
+        &mut self,
+        digest: &str,
+    ) -> Result<Publication, PreparationError> {
+        match renameat_with(
+            &self.parent,
+            &self.name,
+            &self.parent,
+            digest,
+            RenameFlags::NOREPLACE,
+        ) {
             Ok(()) => {
                 self.name.clear();
                 Ok(Publication::Published)
@@ -50,7 +72,10 @@ impl InputDraft {
 impl Drop for InputDraft {
     fn drop(&mut self) {
         if !self.name.is_empty() {
-            let entries = std::fs::read_dir(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&self.directory)));
+            let entries = std::fs::read_dir(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&self.directory)
+            ));
             if let Ok(entries) = entries {
                 for entry in entries.flatten() {
                     let _ = unlinkat(&self.directory, entry.file_name(), AtFlags::empty());
@@ -63,9 +88,19 @@ impl Drop for InputDraft {
 }
 
 pub(crate) fn remove_generation(parent: &OwnedFd, name: &str) -> Result<(), PreparationError> {
-    let directory = openat2(parent, name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS).map_err(errno)?;
-    let entries = std::fs::read_dir(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&directory))).map_err(io)?;
+    let directory = openat2(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(errno)?;
+    let entries = std::fs::read_dir(format!(
+        "/proc/self/fd/{}",
+        std::os::fd::AsRawFd::as_raw_fd(&directory)
+    ))
+    .map_err(io)?;
     for entry in entries {
         unlinkat(&directory, entry.map_err(io)?.file_name(), AtFlags::empty()).map_err(errno)?;
     }

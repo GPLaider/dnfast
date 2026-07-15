@@ -56,7 +56,12 @@ fn publication_rejects_primary_not_bound_to_repomd() {
 
     // Then
     assert!(matches!(result, Err(CacheError::Corrupt(_))));
-    assert!(cache.repositories().expect("cache must enumerate").is_empty());
+    assert!(
+        cache
+            .repositories()
+            .expect("cache must enumerate")
+            .is_empty()
+    );
 }
 
 #[cfg(unix)]

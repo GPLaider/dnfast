@@ -1,4 +1,8 @@
-use std::{fs, os::fd::OwnedFd, time::{Duration, Instant}};
+use std::{
+    fs,
+    os::fd::OwnedFd,
+    time::{Duration, Instant},
+};
 
 use rustix::fs::{FlockOperation, Mode, OFlags, flock, fstat, mkdirat, open, openat};
 use sha2::{Digest, Sha256};
@@ -7,42 +11,81 @@ use crate::RefreshError;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) struct RepositoryLock { _file: OwnedFd }
+pub(crate) struct RepositoryLock {
+    _file: OwnedFd,
+}
 
 impl RepositoryLock {
     pub(crate) fn acquire(root: &std::path::Path, repository: &str) -> Result<Self, RefreshError> {
         Self::acquire_with_timeout(root, repository, LOCK_TIMEOUT)
     }
 
-    fn acquire_with_timeout(root: &std::path::Path, repository: &str, timeout: Duration) -> Result<Self, RefreshError> {
+    fn acquire_with_timeout(
+        root: &std::path::Path,
+        repository: &str,
+        timeout: Duration,
+    ) -> Result<Self, RefreshError> {
         reject_symlinks(root)?;
         create_private(root).map_err(io_error)?;
-        let root_fd = open(root, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()).map_err(errno)?;
+        let root_fd = open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(errno)?;
         verify(&root_fd, true)?;
         match mkdirat(&root_fd, "refresh-locks", Mode::from_raw_mode(0o700)) {
             Ok(()) | Err(rustix::io::Errno::EXIST) => {}
             Err(error) => return Err(errno(error)),
         }
-        let directory = openat(&root_fd, "refresh-locks", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()).map_err(errno)?;
+        let directory = openat(
+            &root_fd,
+            "refresh-locks",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(errno)?;
         verify(&directory, true)?;
-        let name = format!("{}.lock", hex::encode(Sha256::digest(repository.as_bytes())));
-        let fd = openat(&directory, name, OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::from_raw_mode(0o600)).map_err(errno)?;
+        let name = format!(
+            "{}.lock",
+            hex::encode(Sha256::digest(repository.as_bytes()))
+        );
+        let fd = openat(
+            &directory,
+            name,
+            OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(errno)?;
         verify(&fd, false)?;
         let started = Instant::now();
         loop {
             match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => {
                     acquisition_hook(repository);
-                    let current = open(root, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()).map_err(errno)?;
+                    let current = open(
+                        root,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(errno)?;
                     let anchored = fstat(&root_fd).map_err(errno)?;
                     let visible = fstat(&current).map_err(errno)?;
                     if anchored.st_dev != visible.st_dev || anchored.st_ino != visible.st_ino {
-                        return Err(RefreshError::Cache("cache root changed during lock acquisition".into()));
+                        return Err(RefreshError::Cache(
+                            "cache root changed during lock acquisition".into(),
+                        ));
                     }
                     return Ok(Self { _file: fd });
                 }
-                Err(rustix::io::Errno::WOULDBLOCK) if started.elapsed() < timeout => std::thread::sleep(Duration::from_millis(10)),
-                Err(rustix::io::Errno::WOULDBLOCK) => return Err(RefreshError::Cache("repository refresh lock timed out".into())),
+                Err(rustix::io::Errno::WOULDBLOCK) if started.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    return Err(RefreshError::Cache(
+                        "repository refresh lock timed out".into(),
+                    ));
+                }
                 Err(error) => return Err(errno(error)),
             }
         }
@@ -52,8 +95,14 @@ impl RepositoryLock {
 fn verify(fd: &OwnedFd, directory: bool) -> Result<(), RefreshError> {
     let metadata = fstat(fd).map_err(errno)?;
     let kind = if directory { 0o040000 } else { 0o100000 };
-    if metadata.st_uid != rustix::process::geteuid().as_raw() || metadata.st_mode & 0o170000 != kind || metadata.st_mode & 0o022 != 0 || (!directory && metadata.st_nlink != 1) {
-        return Err(RefreshError::Cache("unsafe repository refresh lock path".into()));
+    if metadata.st_uid != rustix::process::geteuid().as_raw()
+        || metadata.st_mode & 0o170000 != kind
+        || metadata.st_mode & 0o022 != 0
+        || (!directory && metadata.st_nlink != 1)
+    {
+        return Err(RefreshError::Cache(
+            "unsafe repository refresh lock path".into(),
+        ));
     }
     Ok(())
 }
@@ -61,7 +110,9 @@ fn verify(fd: &OwnedFd, directory: bool) -> Result<(), RefreshError> {
 fn reject_symlinks(path: &std::path::Path) -> Result<(), RefreshError> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Err(RefreshError::Cache("symlinked cache root ancestor".into())),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(RefreshError::Cache("symlinked cache root ancestor".into()));
+            }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(error)),
@@ -77,18 +128,31 @@ fn create_private(path: &std::path::Path) -> std::io::Result<()> {
     builder.recursive(true).mode(0o700).create(path)
 }
 #[cfg(not(unix))]
-fn create_private(path: &std::path::Path) -> std::io::Result<()> { fs::create_dir_all(path) }
-fn io_error(error: std::io::Error) -> RefreshError { RefreshError::Cache(error.to_string()) }
-fn errno(error: rustix::io::Errno) -> RefreshError { RefreshError::Cache(error.to_string()) }
+fn create_private(path: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
+}
+fn io_error(error: std::io::Error) -> RefreshError {
+    RefreshError::Cache(error.to_string())
+}
+fn errno(error: rustix::io::Errno) -> RefreshError {
+    RefreshError::Cache(error.to_string())
+}
 
 #[cfg(test)]
-static ACQUIRE_HOOK: std::sync::Mutex<Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>> = std::sync::Mutex::new(None);
+static ACQUIRE_HOOK: std::sync::Mutex<
+    Option<std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 fn acquisition_hook(repository: &str) {
-    if repository != "swap-target" { return; }
+    if repository != "swap-target" {
+        return;
+    }
     let hook = ACQUIRE_HOOK.lock().unwrap().clone();
-    if let Some(hook) = hook { hook.0.wait(); hook.1.wait(); }
+    if let Some(hook) = hook {
+        hook.0.wait();
+        hook.1.wait();
+    }
 }
 
 #[cfg(not(test))]
@@ -96,8 +160,8 @@ fn acquisition_hook(_repository: &str) {}
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::symlink;
     use sha2::Digest;
+    use std::os::unix::fs::symlink;
 
     use super::RepositoryLock;
 
@@ -142,7 +206,10 @@ mod tests {
             tx.send(()).unwrap();
             drop(second);
         });
-        assert!(rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
         drop(first);
         rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         worker.join().unwrap();
@@ -162,7 +229,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let held = RepositoryLock::acquire(root.path(), "fedora").unwrap();
         let started = std::time::Instant::now();
-        let result = RepositoryLock::acquire_with_timeout(root.path(), "fedora", std::time::Duration::from_millis(40));
+        let result = RepositoryLock::acquire_with_timeout(
+            root.path(),
+            "fedora",
+            std::time::Duration::from_millis(40),
+        );
         let elapsed = started.elapsed();
         assert!(result.is_err());
         assert!(elapsed >= std::time::Duration::from_millis(40));
@@ -183,7 +254,12 @@ mod tests {
         symlink(&attacker, &root).unwrap();
         drop(lock);
         assert_eq!(std::fs::read_dir(attacker).unwrap().count(), 0);
-        assert_eq!(std::fs::read_dir(retained.join("refresh-locks")).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(retained.join("refresh-locks"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -194,7 +270,8 @@ mod tests {
         let hook = std::sync::Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
         *super::ACQUIRE_HOOK.lock().unwrap() = Some(hook.clone());
         let acquire_root = root.clone();
-        let worker = std::thread::spawn(move || RepositoryLock::acquire(&acquire_root, "swap-target"));
+        let worker =
+            std::thread::spawn(move || RepositoryLock::acquire(&acquire_root, "swap-target"));
         hook.0.wait();
         std::fs::rename(&root, parent.path().join("retained")).unwrap();
         std::fs::create_dir(&root).unwrap();
@@ -207,7 +284,9 @@ mod tests {
 
     #[test]
     fn lock_holder_process() {
-        let Ok(root) = std::env::var("DNFAST_LOCK_HOLDER_ROOT") else { return; };
+        let Ok(root) = std::env::var("DNFAST_LOCK_HOLDER_ROOT") else {
+            return;
+        };
         let lock = RepositoryLock::acquire(std::path::Path::new(&root), "fedora").unwrap();
         std::fs::write(std::path::Path::new(&root).join("ready"), b"ready").unwrap();
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -220,14 +299,22 @@ mod tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "repo_lock::tests::lock_holder_process"])
             .env("DNFAST_LOCK_HOLDER_ROOT", root.path())
-            .spawn().unwrap();
+            .spawn()
+            .unwrap();
         let ready = root.path().join("ready");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !ready.exists() && std::time::Instant::now() < deadline { std::thread::sleep(std::time::Duration::from_millis(10)); }
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(ready.exists());
         child.kill().unwrap();
         child.wait().unwrap();
-        let lock = RepositoryLock::acquire_with_timeout(root.path(), "fedora", std::time::Duration::from_secs(1)).unwrap();
+        let lock = RepositoryLock::acquire_with_timeout(
+            root.path(),
+            "fedora",
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
         drop(lock);
     }
 }

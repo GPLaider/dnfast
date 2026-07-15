@@ -35,9 +35,18 @@ fn every_deferred_top_level_command_exits_two_with_one_v1_json_object() {
         // When the actual process starts.
         let stdout = String::from_utf8(output.stdout).unwrap();
         // Then it cannot reach configuration, networking, or solving and has one response.
-        assert_eq!(output.status.code(), Some(2), "command={command}, stderr={}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "command={command}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(output.stderr.is_empty(), "command={command}");
-        assert_eq!(stdout.lines().count(), 1, "command={command}, stdout={stdout:?}");
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "command={command}, stdout={stdout:?}"
+        );
         let response: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(response["schema"], "dnfast.cli.v1");
         assert_eq!(response["command"], *command);
@@ -170,7 +179,10 @@ fn refresh_as_a_non_root_user_is_a_v1_failure_before_system_config_or_cache_acce
 fn refresh_rejects_deprecated_caller_controlled_path_flags_before_system_access() {
     // Given: a legacy refresh command that tries to redirect root refresh to a caller path.
     let output = dnfast(&[
-        "repo", "refresh", "--repo-dir", "/tmp/dnfast-untrusted-repositories",
+        "repo",
+        "refresh",
+        "--repo-dir",
+        "/tmp/dnfast-untrusted-repositories",
     ]);
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -186,8 +198,15 @@ fn refresh_rejects_deprecated_caller_controlled_path_flags_before_system_access(
 #[test]
 fn duplicate_repository_selection_is_a_v1_syntax_failure_before_snapshot_access() {
     let output = dnfast(&[
-        "plan", "install", "bash", "--output", "/tmp/dnfast-duplicate-repository-plan.json",
-        "--repo", "main", "--repo", "main",
+        "plan",
+        "install",
+        "bash",
+        "--output",
+        "/tmp/dnfast-duplicate-repository-plan.json",
+        "--repo",
+        "main",
+        "--repo",
+        "main",
     ]);
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(2));
@@ -199,8 +218,15 @@ fn duplicate_repository_selection_is_a_v1_syntax_failure_before_snapshot_access(
 #[test]
 fn enable_repo_is_the_same_canonical_selection_alias_as_repo() {
     let output = dnfast(&[
-        "plan", "install", "bash", "--output", "/tmp/dnfast-enable-repository-plan.json",
-        "--enable-repo", "main", "--repo", "main",
+        "plan",
+        "install",
+        "bash",
+        "--output",
+        "/tmp/dnfast-enable-repository-plan.json",
+        "--enable-repo",
+        "main",
+        "--repo",
+        "main",
     ]);
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(2));

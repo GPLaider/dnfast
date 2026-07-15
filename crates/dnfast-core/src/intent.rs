@@ -3,17 +3,25 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{canonical, CanonicalDocument, DomainError};
+use crate::{CanonicalDocument, DomainError, canonical};
 
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Action { Install, Upgrade, Remove }
+pub enum Action {
+    Install,
+    Upgrade,
+    Remove,
+}
 
 impl Action {
     pub const fn as_str(self) -> &'static str {
-        match self { Self::Install => "install", Self::Upgrade => "upgrade", Self::Remove => "remove" }
+        match self {
+            Self::Install => "install",
+            Self::Upgrade => "upgrade",
+            Self::Remove => "remove",
+        }
     }
 }
 
@@ -31,14 +39,22 @@ impl<'de> Deserialize<'de> for PackageSpec {
 impl PackageSpec {
     pub fn parse(value: impl Into<String>) -> Result<Self, IntentError> {
         let value = value.into();
-        if value.trim().is_empty() { return Err(IntentError::EmptyPackage); }
-        if value.trim_start().starts_with('-') { return Err(IntentError::OptionLikePackage(value)); }
+        if value.trim().is_empty() {
+            return Err(IntentError::EmptyPackage);
+        }
+        if value.trim_start().starts_with('-') {
+            return Err(IntentError::OptionLikePackage(value));
+        }
         if value.chars().any(char::is_control) {
-            return Err(IntentError::ControlCharacter(value.escape_default().to_string()));
+            return Err(IntentError::ControlCharacter(
+                value.escape_default().to_string(),
+            ));
         }
         Ok(Self(value))
     }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -51,12 +67,20 @@ pub struct TransactionIntent {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTransactionIntent { schema_version: u32, action: Action, packages: Vec<PackageSpec> }
+struct RawTransactionIntent {
+    schema_version: u32,
+    action: Action,
+    packages: Vec<PackageSpec>,
+}
 
 impl<'de> Deserialize<'de> for TransactionIntent {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = RawTransactionIntent::deserialize(deserializer)?;
-        let value = Self { schema_version: raw.schema_version, action: raw.action, packages: raw.packages };
+        let value = Self {
+            schema_version: raw.schema_version,
+            action: raw.action,
+            packages: raw.packages,
+        };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
     }
@@ -66,34 +90,54 @@ impl TransactionIntent {
     pub fn new(action: Action, packages: Vec<PackageSpec>) -> Result<Self, IntentError> {
         let mut packages = packages;
         packages.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        let value = Self { schema_version: SCHEMA_VERSION, action, packages };
+        let value = Self {
+            schema_version: SCHEMA_VERSION,
+            action,
+            packages,
+        };
         value.validate()?;
         Ok(value)
     }
     pub fn from_package_names(action: Action, names: &[&str]) -> Result<Self, IntentError> {
-        let packages = names.iter().map(|name| PackageSpec::parse(*name)).collect::<Result<Vec<_>, _>>()?;
+        let packages = names
+            .iter()
+            .map(|name| PackageSpec::parse(*name))
+            .collect::<Result<Vec<_>, _>>()?;
         Self::new(action, packages)
     }
     pub fn from_json(bytes: &[u8]) -> Result<Self, IntentError> {
         Self::from_canonical_json(bytes).map_err(|error| IntentError::Json(error.to_string()))
     }
     pub fn to_json(&self) -> Result<Vec<u8>, IntentError> {
-        self.to_canonical_json().map_err(|error| IntentError::Json(error.to_string()))
+        self.to_canonical_json()
+            .map_err(|error| IntentError::Json(error.to_string()))
     }
-    pub const fn action(&self) -> Action { self.action }
-    pub fn packages(&self) -> &[PackageSpec] { &self.packages }
+    pub const fn action(&self) -> Action {
+        self.action
+    }
+    pub fn packages(&self) -> &[PackageSpec] {
+        &self.packages
+    }
     fn validate(&self) -> Result<(), IntentError> {
-        if self.schema_version != SCHEMA_VERSION { return Err(IntentError::SchemaVersion(self.schema_version)); }
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(IntentError::SchemaVersion(self.schema_version));
+        }
         if matches!(self.action, Action::Install | Action::Remove) && self.packages.is_empty() {
             return Err(IntentError::MissingPackages(self.action));
         }
         let mut seen = HashSet::with_capacity(self.packages.len());
-        if self.packages.windows(2).any(|pair| pair[0].as_str() >= pair[1].as_str()) {
+        if self
+            .packages
+            .windows(2)
+            .any(|pair| pair[0].as_str() >= pair[1].as_str())
+        {
             return Err(IntentError::NonCanonicalPackages);
         }
         for package in &self.packages {
             PackageSpec::parse(package.as_str())?;
-            if !seen.insert(package.as_str()) { return Err(IntentError::DuplicatePackage(package.as_str().to_owned())); }
+            if !seen.insert(package.as_str()) {
+                return Err(IntentError::DuplicatePackage(package.as_str().to_owned()));
+            }
         }
         Ok(())
     }
@@ -102,12 +146,15 @@ impl TransactionIntent {
 impl CanonicalDocument for TransactionIntent {
     fn from_canonical_json(bytes: &[u8]) -> Result<Self, DomainError> {
         let value: Self = canonical::parse(bytes)?;
-        value.validate().map_err(|error| DomainError::Json(error.to_string()))?;
+        value
+            .validate()
+            .map_err(|error| DomainError::Json(error.to_string()))?;
         Ok(value)
     }
 
     fn to_canonical_json(&self) -> Result<Vec<u8>, DomainError> {
-        self.validate().map_err(|error| DomainError::Json(error.to_string()))?;
+        self.validate()
+            .map_err(|error| DomainError::Json(error.to_string()))?;
         canonical::serialize(self)
     }
 }

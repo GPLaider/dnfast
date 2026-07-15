@@ -1,4 +1,9 @@
-use std::{fs, os::unix::fs::{symlink, PermissionsExt}, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use dnfast_repo::{key_bundle_digest, load_mutation_profile_from, parse_main_config};
 use sha2::{Digest, Sha256};
@@ -7,9 +12,14 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = PathBuf::from(std::env::var_os("HOME").expect("HOME must identify the test user's trusted directory"))
-            .join(format!("dnfast-t3-{label}-{}-{nonce}", std::process::id()));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = PathBuf::from(
+            std::env::var_os("HOME").expect("HOME must identify the test user's trusted directory"),
+        )
+        .join(format!("dnfast-t3-{label}-{}-{nonce}", std::process::id()));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         Self(path)
@@ -28,7 +38,11 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture { fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); } }
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
 
 #[test]
 fn explicit_main_list_resets_exclude_stock_repository_and_variable_directories() {
@@ -42,7 +56,9 @@ fn explicit_main_list_resets_exclude_stock_repository_and_variable_directories()
     // Then the selected configuration has no stock source directories.
     assert_eq!(main.reposdir, [PathBuf::from("/etc/dnfast-public-repos")]);
     assert_eq!(main.varsdir, [PathBuf::from("/etc/dnfast-public-vars")]);
-    assert!(parse_main_config(Path::new("matrix.conf"), "[main]\nbest=true\nbest=false\n").is_err());
+    assert!(
+        parse_main_config(Path::new("matrix.conf"), "[main]\nbest=true\nbest=false\n").is_err()
+    );
 }
 
 #[test]
@@ -52,17 +68,42 @@ fn loader_reads_sorted_sources_expands_vars_and_rejects_cross_file_duplicates() 
     let repos = fixture.directory("repos");
     let vars = fixture.directory("vars");
     Fixture::file(&vars.join("releasever"), "44\n");
-    Fixture::file(&repos.join("b.repo"), "[b]\nbaseurl=https://b/$releasever\n");
-    Fixture::file(&repos.join("a.repo"), "[a]\nbaseurl=https://a/$releasever\n");
+    Fixture::file(
+        &repos.join("b.repo"),
+        "[b]\nbaseurl=https://b/$releasever\n",
+    );
+    Fixture::file(
+        &repos.join("a.repo"),
+        "[a]\nbaseurl=https://a/$releasever\n",
+    );
     let main = fixture.0.join("dnf.conf");
-    Fixture::file(&main, format!("[main]\nreposdir={}\nvarsdir={}\n", repos.display(), vars.display()));
+    Fixture::file(
+        &main,
+        format!(
+            "[main]\nreposdir={}\nvarsdir={}\n",
+            repos.display(),
+            vars.display()
+        ),
+    );
     // When the mutation source loader runs.
     let profile = load_mutation_profile_from(&main).unwrap();
     // Then file order and variable expansion are observable.
-    assert_eq!(profile.repositories.iter().map(|repo| repo.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(
+        profile
+            .repositories
+            .iter()
+            .map(|repo| repo.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
     assert_eq!(profile.repositories[0].baseurl, ["https://a/44"]);
     Fixture::file(&repos.join("b.repo"), "[a]\nbaseurl=x\n");
-    assert!(load_mutation_profile_from(&main).unwrap_err().to_string().contains("duplicate repository id across files"));
+    assert!(
+        load_mutation_profile_from(&main)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate repository id across files")
+    );
 }
 
 #[test]
@@ -72,12 +113,24 @@ fn loader_rejects_writable_and_symlinked_sources_and_cleans_up() {
     let repos = fixture.directory("repos");
     let vars = fixture.directory("vars");
     let main = fixture.0.join("dnf.conf");
-    Fixture::file(&main, format!("[main]\nreposdir={}\nvarsdir={}\n", repos.display(), vars.display()));
+    Fixture::file(
+        &main,
+        format!(
+            "[main]\nreposdir={}\nvarsdir={}\n",
+            repos.display(),
+            vars.display()
+        ),
+    );
     let target = repos.join("target");
     Fixture::file(&target, "[x]\nbaseurl=x\n");
     symlink(&target, repos.join("linked.repo")).unwrap();
     // When loaded, then symlinks are ignored and writable main files are rejected.
-    assert!(load_mutation_profile_from(&main).unwrap().repositories.is_empty());
+    assert!(
+        load_mutation_profile_from(&main)
+            .unwrap()
+            .repositories
+            .is_empty()
+    );
     fs::set_permissions(&main, fs::Permissions::from_mode(0o666)).unwrap();
     assert!(load_mutation_profile_from(&main).is_err());
 }
@@ -87,7 +140,10 @@ fn key_bundle_digest_binds_domain_paths_lengths_contents_and_order() {
     // Given two root-owned key files beneath the exact repository key root.
     let repo = format!("dnfast-test-{}", std::process::id());
     let root = PathBuf::from("/etc/dnfast/keys").join(&repo);
-    if fs::create_dir_all(&root).is_err() { assert!(key_bundle_digest(&repo, &[]).is_ok()); return; }
+    if fs::create_dir_all(&root).is_err() {
+        assert!(key_bundle_digest(&repo, &[]).is_ok());
+        return;
+    }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
     let first = root.join("a.gpg");
     let second = root.join("b.gpg");
@@ -105,7 +161,10 @@ fn key_bundle_digest_binds_domain_paths_lengths_contents_and_order() {
         expected.update(bytes);
     }
     assert_eq!(bundle.digest.as_slice(), expected.finalize().as_slice());
-    assert_ne!(bundle.digest, key_bundle_digest(&repo, &[second, first]).unwrap().digest);
+    assert_ne!(
+        bundle.digest,
+        key_bundle_digest(&repo, &[second, first]).unwrap().digest
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -134,9 +193,27 @@ fn aggregate_config_file_limit_accepts_256_and_rejects_257() {
     let repos = fixture.directory("repos");
     let vars = fixture.directory("vars");
     let main = fixture.0.join("dnf.conf");
-    Fixture::file(&main, format!("[main]\nreposdir={}\nvarsdir={}\n", repos.display(), vars.display()));
-    for index in 0..255 { Fixture::file(&repos.join(format!("{index:03}.repo")), format!("[r{index}]\nbaseurl=x\n")); }
-    assert_eq!(load_mutation_profile_from(&main).unwrap().repositories.len(), 255);
+    Fixture::file(
+        &main,
+        format!(
+            "[main]\nreposdir={}\nvarsdir={}\n",
+            repos.display(),
+            vars.display()
+        ),
+    );
+    for index in 0..255 {
+        Fixture::file(
+            &repos.join(format!("{index:03}.repo")),
+            format!("[r{index}]\nbaseurl=x\n"),
+        );
+    }
+    assert_eq!(
+        load_mutation_profile_from(&main)
+            .unwrap()
+            .repositories
+            .len(),
+        255
+    );
     // Given one additional file, then the aggregate limit rejects it.
     Fixture::file(&repos.join("overflow.repo"), "[overflow]\nbaseurl=x\n");
     assert!(load_mutation_profile_from(&main).is_err());

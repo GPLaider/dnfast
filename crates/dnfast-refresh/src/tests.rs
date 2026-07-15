@@ -3,10 +3,7 @@ use std::{collections::HashMap, sync::Mutex};
 use dnfast_cache::Cache;
 use sha2::{Digest, Sha256};
 
-use crate::{
-    MetadataTrust, RefreshError, Refresher, Source, Transport,
-    metalink::parse_metalink,
-};
+use crate::{MetadataTrust, RefreshError, Refresher, Source, Transport, metalink::parse_metalink};
 
 pub(crate) struct FakeTransport {
     responses: Mutex<HashMap<String, Vec<u8>>>,
@@ -81,7 +78,10 @@ fn refreshes_verified_baseurl_into_cache() {
         .refresh("fedora", Source::BaseUrl(base.into()))
         .unwrap();
     assert_eq!(outcome.packages, 1);
-    assert_eq!(outcome.digest, hex::encode(Sha256::digest(&metadata_fixture().0)));
+    assert_eq!(
+        outcome.digest,
+        hex::encode(Sha256::digest(&metadata_fixture().0))
+    );
     assert_eq!(cache.load("fedora").unwrap().packages[0].name, "ripgrep");
 }
 
@@ -97,11 +97,20 @@ fn metalink_falls_back_after_corrupt_mirror() {
         ("https://meta.example/list".into(), metalink),
         ("https://bad.example/repodata/repomd.xml".into(), corrupt),
         ("https://good.example/repodata/repomd.xml".into(), repomd),
-        ("https://good.example/repodata/primary.xml.zst".into(), primary),
-        ("https://good.example/repodata/filelists.xml.zst".into(), filelists),
+        (
+            "https://good.example/repodata/primary.xml.zst".into(),
+            primary,
+        ),
+        (
+            "https://good.example/repodata/filelists.xml.zst".into(),
+            filelists,
+        ),
     ]);
     let outcome = Refresher::new(transport, &cache)
-        .refresh("fedora", Source::Metalink("https://meta.example/list".into()))
+        .refresh(
+            "fedora",
+            Source::Metalink("https://meta.example/list".into()),
+        )
         .unwrap();
     assert_eq!(outcome.packages, 1);
 }
@@ -111,7 +120,10 @@ fn rejects_non_https_source() {
     let directory = tempfile::tempdir().unwrap();
     let cache = Cache::new(directory.path());
     let error = Refresher::new(FakeTransport::new([]), &cache)
-        .refresh("fedora", Source::BaseUrl("http://mirror.example/fedora".into()))
+        .refresh(
+            "fedora",
+            Source::BaseUrl("http://mirror.example/fedora".into()),
+        )
         .unwrap_err();
     assert!(matches!(error, RefreshError::Policy(_)));
 }
@@ -121,18 +133,30 @@ fn failed_refresh_preserves_current_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let cache = Cache::new(directory.path());
     let (old_repomd, old_primary, _) = metadata_fixture();
-    let old_digest = cache.publish("fedora", &old_repomd, &old_primary).unwrap().digest;
-    let pointer = directory.path().join("repos").join(hex::encode(Sha256::digest(b"fedora"))).join("current");
+    let old_digest = cache
+        .publish("fedora", &old_repomd, &old_primary)
+        .unwrap()
+        .digest;
+    let pointer = directory
+        .path()
+        .join("repos")
+        .join(hex::encode(Sha256::digest(b"fedora")))
+        .join("current");
     let current_before = std::fs::read(&pointer).unwrap();
     let (repomd, _, _) = metadata_fixture();
     let base = "https://mirror.example/fedora";
     let transport = FakeTransport::new([
         (format!("{base}/repodata/repomd.xml"), repomd),
-        (format!("{base}/repodata/primary.xml.zst"), b"corrupt".to_vec()),
+        (
+            format!("{base}/repodata/primary.xml.zst"),
+            b"corrupt".to_vec(),
+        ),
     ]);
-    assert!(Refresher::new(transport, &cache)
-        .refresh("fedora", Source::BaseUrl(base.into()))
-        .is_err());
+    assert!(
+        Refresher::new(transport, &cache)
+            .refresh("fedora", Source::BaseUrl(base.into()))
+            .is_err()
+    );
     let snapshot = cache.load("fedora").unwrap();
     assert_eq!(snapshot.digest, old_digest);
     assert_eq!(snapshot.packages[0].name, "ripgrep");
@@ -145,15 +169,33 @@ fn metalink_retries_complete_generation_after_primary_failure() {
     let cache = Cache::new(directory.path());
     let (repomd, primary, filelists) = metadata_fixture();
     let transport = FakeTransport::new([
-        ("https://meta.example/list".into(), metalink_fixture(&repomd)),
-        ("https://bad.example/repodata/repomd.xml".into(), repomd.clone()),
-        ("https://bad.example/repodata/primary.xml.zst".into(), b"corrupt".to_vec()),
+        (
+            "https://meta.example/list".into(),
+            metalink_fixture(&repomd),
+        ),
+        (
+            "https://bad.example/repodata/repomd.xml".into(),
+            repomd.clone(),
+        ),
+        (
+            "https://bad.example/repodata/primary.xml.zst".into(),
+            b"corrupt".to_vec(),
+        ),
         ("https://good.example/repodata/repomd.xml".into(), repomd),
-        ("https://good.example/repodata/primary.xml.zst".into(), primary),
-        ("https://good.example/repodata/filelists.xml.zst".into(), filelists),
+        (
+            "https://good.example/repodata/primary.xml.zst".into(),
+            primary,
+        ),
+        (
+            "https://good.example/repodata/filelists.xml.zst".into(),
+            filelists,
+        ),
     ]);
     let outcome = Refresher::new(transport, &cache)
-        .refresh("fedora", Source::Metalink("https://meta.example/list".into()))
+        .refresh(
+            "fedora",
+            Source::Metalink("https://meta.example/list".into()),
+        )
         .unwrap();
     assert_eq!(outcome.packages, 1);
 }
@@ -164,20 +206,41 @@ fn mirrorlist_preserves_document_order_and_publishes_complete_metadata() {
     let cache = Cache::new(directory.path());
     let (repomd, primary, filelists) = metadata_fixture();
     let transport = FakeTransport::new([
-        ("https://list.example/mirrors".into(), b"# mirrors\nhttps://mirror.example/fedora\n".to_vec()),
-        ("https://mirror.example/fedora/repodata/repomd.xml".into(), repomd),
-        ("https://mirror.example/fedora/repodata/primary.xml.zst".into(), primary),
-        ("https://mirror.example/fedora/repodata/filelists.xml.zst".into(), filelists),
+        (
+            "https://list.example/mirrors".into(),
+            b"# mirrors\nhttps://mirror.example/fedora\n".to_vec(),
+        ),
+        (
+            "https://mirror.example/fedora/repodata/repomd.xml".into(),
+            repomd,
+        ),
+        (
+            "https://mirror.example/fedora/repodata/primary.xml.zst".into(),
+            primary,
+        ),
+        (
+            "https://mirror.example/fedora/repodata/filelists.xml.zst".into(),
+            filelists,
+        ),
     ]);
 
     let outcome = Refresher::new(transport, &cache)
-        .refresh("fedora", Source::Mirrorlist("https://list.example/mirrors".into()))
+        .refresh(
+            "fedora",
+            Source::Mirrorlist("https://list.example/mirrors".into()),
+        )
         .unwrap();
 
     assert_eq!(outcome.packages, 1);
     let snapshot = cache.open_by_digest(&outcome.digest).unwrap();
     assert_eq!(snapshot.filelists.len(), 1);
-    assert_eq!(snapshot.source_origin.as_ref().map(dnfast_cache::SelectedOrigin::repomd_url), Some("https://mirror.example/fedora/repodata/repomd.xml"));
+    assert_eq!(
+        snapshot
+            .source_origin
+            .as_ref()
+            .map(dnfast_cache::SelectedOrigin::repomd_url),
+        Some("https://mirror.example/fedora/repodata/repomd.xml")
+    );
 }
 
 #[test]
@@ -189,7 +252,8 @@ fn source_origin_rejects_query_and_fragment() {
         "https://mirror.example/fedora#fragment",
     ] {
         assert!(matches!(
-            Refresher::new(FakeTransport::new([]), &cache).refresh("fedora", Source::BaseUrl(source.into())),
+            Refresher::new(FakeTransport::new([]), &cache)
+                .refresh("fedora", Source::BaseUrl(source.into())),
             Err(RefreshError::Policy(_))
         ));
     }
@@ -197,17 +261,38 @@ fn source_origin_rejects_query_and_fragment() {
 
 #[test]
 fn mirrorlist_accepts_exact_entry_cap_and_rejects_plus_one() {
-    let exact = (0..32).map(|index| format!("https://m{index}.example/repo\n")).collect::<String>();
-    assert_eq!(super::mirrorlist::parse(exact.as_bytes()).unwrap().len(), 32);
+    let exact = (0..32)
+        .map(|index| format!("https://m{index}.example/repo\n"))
+        .collect::<String>();
+    assert_eq!(
+        super::mirrorlist::parse(exact.as_bytes()).unwrap().len(),
+        32
+    );
     let plus_one = format!("{exact}https://overflow.example/repo\n");
     assert!(super::mirrorlist::parse(plus_one.as_bytes()).is_err());
 }
 
 #[test]
 fn metalink_accepts_exact_resource_cap_and_rejects_plus_one() {
-    let resources = |count| (0..count).map(|index| format!("<url>https://m{index}.example/repodata/repomd.xml</url>")).collect::<String>();
-    let document = |count| format!("<metalink xmlns=\"http://www.metalinker.org/\"><file name=\"repomd.xml\"><hash type=\"sha256\">{}</hash><size>1</size>{}</file></metalink>", "a".repeat(64), resources(count));
-    assert_eq!(parse_metalink(document(32).as_bytes()).unwrap().resources.len(), 32);
+    let resources = |count| {
+        (0..count)
+            .map(|index| format!("<url>https://m{index}.example/repodata/repomd.xml</url>"))
+            .collect::<String>()
+    };
+    let document = |count| {
+        format!(
+            "<metalink xmlns=\"http://www.metalinker.org/\"><file name=\"repomd.xml\"><hash type=\"sha256\">{}</hash><size>1</size>{}</file></metalink>",
+            "a".repeat(64),
+            resources(count)
+        )
+    };
+    assert_eq!(
+        parse_metalink(document(32).as_bytes())
+            .unwrap()
+            .resources
+            .len(),
+        32
+    );
     assert!(parse_metalink(document(33).as_bytes()).is_err());
 }
 
@@ -227,17 +312,41 @@ fn wrong_filelists_restarts_generation_and_publishes_once() {
     let cache = Cache::new(directory.path());
     let (repomd, primary, filelists) = metadata_fixture();
     let transport = FakeTransport::new([
-        ("https://meta.example/list".into(), metalink_fixture(&repomd)),
-        ("https://bad.example/repodata/repomd.xml".into(), repomd.clone()),
-        ("https://bad.example/repodata/primary.xml.zst".into(), primary.clone()),
-        ("https://bad.example/repodata/filelists.xml.zst".into(), b"wrong-generation".to_vec()),
+        (
+            "https://meta.example/list".into(),
+            metalink_fixture(&repomd),
+        ),
+        (
+            "https://bad.example/repodata/repomd.xml".into(),
+            repomd.clone(),
+        ),
+        (
+            "https://bad.example/repodata/primary.xml.zst".into(),
+            primary.clone(),
+        ),
+        (
+            "https://bad.example/repodata/filelists.xml.zst".into(),
+            b"wrong-generation".to_vec(),
+        ),
         ("https://good.example/repodata/repomd.xml".into(), repomd),
-        ("https://good.example/repodata/primary.xml.zst".into(), primary),
-        ("https://good.example/repodata/filelists.xml.zst".into(), filelists),
+        (
+            "https://good.example/repodata/primary.xml.zst".into(),
+            primary,
+        ),
+        (
+            "https://good.example/repodata/filelists.xml.zst".into(),
+            filelists,
+        ),
     ]);
     let outcome = Refresher::new(transport, &cache)
-        .refresh("fedora", Source::Metalink("https://meta.example/list".into())).unwrap();
-    let objects = std::fs::read_dir(directory.path().join("objects/sha256")).unwrap().count();
+        .refresh(
+            "fedora",
+            Source::Metalink("https://meta.example/list".into()),
+        )
+        .unwrap();
+    let objects = std::fs::read_dir(directory.path().join("objects/sha256"))
+        .unwrap()
+        .count();
     assert_eq!(objects, 1);
     assert_eq!(cache.load("fedora").unwrap().digest, outcome.digest);
 }
@@ -263,14 +372,18 @@ fn openpgp_authenticated_refresh_binds_signer_evidence_and_rejects_missing_signa
     let cache = Cache::new(directory.path());
     let (repomd, primary, filelists) = metadata_fixture();
     let (certificate, fingerprint, signature, now) = super::openpgp::signed_fixture(&repomd);
-    let trust = MetadataTrust::new(
-        [certificate], [fingerprint.clone()], "a".repeat(64), now,
-    ).unwrap();
+    let trust =
+        MetadataTrust::new([certificate], [fingerprint.clone()], "a".repeat(64), now).unwrap();
     let base = "https://signed.example/fedora";
-    cache.publish_complete_with_origin(
-        "fedora", &repomd, &primary, &filelists,
-        Some(&format!("{base}/repodata/repomd.xml")),
-    ).unwrap();
+    cache
+        .publish_complete_with_origin(
+            "fedora",
+            &repomd,
+            &primary,
+            &filelists,
+            Some(&format!("{base}/repodata/repomd.xml")),
+        )
+        .unwrap();
     let transport = FakeTransport::new([
         (format!("{base}/repodata/repomd.xml"), repomd.clone()),
         (format!("{base}/repodata/repomd.xml.asc"), signature),
@@ -281,22 +394,29 @@ fn openpgp_authenticated_refresh_binds_signer_evidence_and_rejects_missing_signa
     let outcome = Refresher::new(transport, &cache)
         .refresh_with_metadata_trust("fedora", Source::BaseUrl(base.into()), Some(&trust))
         .unwrap();
-    let generation = cache.open_current_verified_complete_generation("fedora").unwrap();
+    let generation = cache
+        .open_current_verified_complete_generation("fedora")
+        .unwrap();
 
     assert_eq!(generation.digest(), outcome.digest);
-    assert!(matches!(generation.repomd_authentication(), dnfast_cache::RepomdAuthentication::OpenPgp {
+    assert!(
+        matches!(generation.repomd_authentication(), dnfast_cache::RepomdAuthentication::OpenPgp {
         primary_fingerprint, ..
-    } if primary_fingerprint == &fingerprint));
-    let missing = Refresher::new(FakeTransport::new([
-        (format!("{base}/repodata/repomd.xml"), repomd),
-    ]), &Cache::new(tempfile::tempdir().unwrap().keep()))
-        .refresh_with_metadata_trust("fedora", Source::BaseUrl(base.into()), Some(&trust));
+    } if primary_fingerprint == &fingerprint)
+    );
+    let missing = Refresher::new(
+        FakeTransport::new([(format!("{base}/repodata/repomd.xml"), repomd)]),
+        &Cache::new(tempfile::tempdir().unwrap().keep()),
+    )
+    .refresh_with_metadata_trust("fedora", Source::BaseUrl(base.into()), Some(&trust));
     assert!(missing.is_err());
 }
-
 
 #[test]
 fn rejects_metalink_namespace_declaration_not_bound_to_root() {
     let xml = br#"<evil:metalink xmlns:evil="urn:evil" xmlns:unused="http://www.metalinker.org/"><file name="repomd.xml"/></evil:metalink>"#;
-    assert!(matches!(parse_metalink(xml), Err(RefreshError::Metalink(_))));
+    assert!(matches!(
+        parse_metalink(xml),
+        Err(RefreshError::Metalink(_))
+    ));
 }

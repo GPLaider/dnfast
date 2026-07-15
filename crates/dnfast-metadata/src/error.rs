@@ -10,10 +10,17 @@ pub enum MetadataError {
     UnsafeLocation(String),
     UnsupportedChecksum(String),
     ChecksumMismatch,
-    SizeMismatch { expected: u64, actual: u64 },
+    SizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
     UnsupportedCompression(String),
     Io(String),
-    LimitExceeded { kind: &'static str, maximum: u64, actual: u64 },
+    LimitExceeded {
+        kind: &'static str,
+        maximum: u64,
+        actual: u64,
+    },
 }
 
 impl fmt::Display for MetadataError {

@@ -1,4 +1,8 @@
-use quick_xml::{encoding::Decoder, events::{BytesStart, BytesText}, Reader};
+use quick_xml::{
+    Reader,
+    encoding::Decoder,
+    events::{BytesStart, BytesText},
+};
 
 use crate::MetadataError;
 
@@ -44,12 +48,16 @@ pub(crate) fn attribute_streaming(
 }
 
 pub(crate) fn decode_text(event: &BytesText<'_>) -> Result<String, MetadataError> {
-    let decoded = event.decode().map_err(|error| MetadataError::Xml(error.to_string()))?;
+    let decoded = event
+        .decode()
+        .map_err(|error| MetadataError::Xml(error.to_string()))?;
     quick_xml::escape::unescape(&decoded)
         .map(|value| value.into_owned())
         .map_err(|error| MetadataError::Xml(error.to_string()))
 }
 
 pub(crate) fn parse_number(value: &str) -> Result<u64, MetadataError> {
-    value.parse().map_err(|_| MetadataError::InvalidNumber(value.to_owned()))
+    value
+        .parse()
+        .map_err(|_| MetadataError::InvalidNumber(value.to_owned()))
 }

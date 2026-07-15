@@ -1,4 +1,7 @@
-use std::{process::Command, time::{Duration, Instant}};
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use dnfast_cache::{ArtifactCache, ArtifactError, ArtifactSpec, Digest, TransactionRequest};
 
@@ -46,13 +49,19 @@ fn nested_busy_does_not_release_live_parent_process_lock() {
 
 fn run_child(root: &std::path::Path) -> String {
     let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "nested_busy_does_not_release_live_parent_process_lock", "--nocapture"])
+        .args([
+            "--exact",
+            "nested_busy_does_not_release_live_parent_process_lock",
+            "--nocapture",
+        ])
         .env("DNFAST_REENTRANT_CHILD", "1")
         .env("DNFAST_REENTRANT_ROOT", root)
         .output()
         .unwrap();
     assert!(output.status.success());
-    String::from_utf8(output.stdout).unwrap().lines()
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
         .find(|line| matches!(*line, "BUSY" | "ACQUIRED"))
         .unwrap()
         .to_owned()

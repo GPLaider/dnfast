@@ -1,7 +1,30 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=DNFAST_NATIVE_REAL");
     println!("cargo:rerun-if-changed=../../native/include/dnfast_native.h");
-    for file in ["common.c", "solver.c", "solver_state.c", "decisions.c", "actions.c", "installed.c", "inventory.c", "inventory_write.c", "transaction.c", "transaction_run.c", "transaction_result.c", "transaction_payload_fault.c", "keyring.c", "keyring_identity.c", "rpm_signature.c", "rpm_payload.c", "limits.c", "metadata_io.c", "rpm.c", "callbacks.c", "authority.c", "executor_fd.c"] {
+    for file in [
+        "common.c",
+        "solver.c",
+        "solver_state.c",
+        "decisions.c",
+        "actions.c",
+        "installed.c",
+        "inventory.c",
+        "inventory_write.c",
+        "transaction.c",
+        "transaction_run.c",
+        "transaction_result.c",
+        "transaction_payload_fault.c",
+        "keyring.c",
+        "keyring_identity.c",
+        "rpm_signature.c",
+        "rpm_payload.c",
+        "limits.c",
+        "metadata_io.c",
+        "rpm.c",
+        "callbacks.c",
+        "authority.c",
+        "executor_fd.c",
+    ] {
         println!("cargo:rerun-if-changed=../../native/src/{file}");
     }
     let mut build = cc::Build::new();
@@ -25,7 +48,10 @@ fn main() {
         }
         build.define("DNFAST_NATIVE_REAL", None);
         append_unique(&mut real_link_libraries, solv.libs);
-        append_unique(&mut real_link_libraries, ["solvext".into(), "rpm".into(), "rpmio".into()]);
+        append_unique(
+            &mut real_link_libraries,
+            ["solvext".into(), "rpm".into(), "rpmio".into()],
+        );
         append_unique(&mut real_link_libraries, rpm.libs);
     }
     build
@@ -66,6 +92,8 @@ fn main() {
 
 fn append_unique(target: &mut Vec<String>, libraries: impl IntoIterator<Item = String>) {
     for library in libraries {
-        if !target.contains(&library) { target.push(library); }
+        if !target.contains(&library) {
+            target.push(library);
+        }
     }
 }

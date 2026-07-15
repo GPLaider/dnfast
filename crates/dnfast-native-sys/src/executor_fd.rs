@@ -8,7 +8,11 @@ unsafe extern "C" {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExecutorApproval { Prompt, Yes, No }
+pub enum ExecutorApproval {
+    Prompt,
+    Yes,
+    No,
+}
 
 impl ExecutorApproval {
     const fn raw(self) -> u8 {
@@ -25,11 +29,19 @@ pub fn exec_fixed_executor(plan: OwnedFd, approval: ExecutorApproval) -> Result<
     // SAFETY: [Category 8 — FFI boundary UB] ownership of a valid descriptor
     // moves to C, which either replaces this process or returns a launch error.
     if unsafe { dnfast_executor_exec_fixed(plan_fd, approval.raw()) } < 0 {
-        return Err(NativeError { status: 1, component: "executor".into(),
-            symbol: "execve".into(), message: "fixed executor launch failed".into() });
+        return Err(NativeError {
+            status: 1,
+            component: "executor".into(),
+            symbol: "execve".into(),
+            message: "fixed executor launch failed".into(),
+        });
     }
-    Err(NativeError { status: 1, component: "executor".into(), symbol: "execve".into(),
-        message: "fixed executor unexpectedly returned".into() })
+    Err(NativeError {
+        status: 1,
+        component: "executor".into(),
+        symbol: "execve".into(),
+        message: "fixed executor unexpectedly returned".into(),
+    })
 }
 
 #[cfg(test)]
@@ -49,8 +61,12 @@ pub fn take_inherited_plan_fd() -> Result<OwnedFd, NativeError> {
     // pointers and returns either -1 or a fresh CLOEXEC descriptor it owns.
     let raw = unsafe { dnfast_executor_take_plan_fd() };
     if raw < 0 {
-        return Err(NativeError { status: 1, component: "executor".into(),
-            symbol: "fd3".into(), message: "missing or invalid inherited plan descriptor".into() });
+        return Err(NativeError {
+            status: 1,
+            component: "executor".into(),
+            symbol: "fd3".into(),
+            message: "missing or invalid inherited plan descriptor".into(),
+        });
     }
     // SAFETY: [Category 12 — invalid free] the C wrapper returned a fresh
     // descriptor via F_DUPFD_CLOEXEC, transferring its single close duty here.

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::{error::parse_error, RepoError, Repository};
+use crate::{RepoError, Repository, error::parse_error};
 
 #[derive(Debug)]
 struct RepositoryBuilder {
@@ -49,11 +49,19 @@ pub fn parse_repository_file(path: &Path, input: &str) -> Result<Vec<Repository>
         }
         if line.starts_with('[') {
             if !line.ends_with(']') {
-                return Err(parse_error(path, line_number, "malformed repository section"));
+                return Err(parse_error(
+                    path,
+                    line_number,
+                    "malformed repository section",
+                ));
             }
             let id = line[1..line.len() - 1].trim();
             if id.is_empty() {
-                return Err(parse_error(path, line_number, "repository id cannot be empty"));
+                return Err(parse_error(
+                    path,
+                    line_number,
+                    "repository id cannot be empty",
+                ));
             }
             finish_repository(path, current.take(), &mut repositories)?;
             current = Some(RepositoryBuilder {
@@ -71,7 +79,11 @@ pub fn parse_repository_file(path: &Path, input: &str) -> Result<Vec<Repository>
         }
 
         let Some(current) = current.as_mut() else {
-            return Err(parse_error(path, line_number, "key outside repository section"));
+            return Err(parse_error(
+                path,
+                line_number,
+                "key outside repository section",
+            ));
         };
         let Some((key, value)) = line.split_once('=') else {
             return Err(parse_error(path, line_number, "expected key=value"));

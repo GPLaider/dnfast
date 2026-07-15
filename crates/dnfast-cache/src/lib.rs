@@ -1,25 +1,25 @@
 #![forbid(unsafe_code)]
 
-mod fs_safety;
 mod artifact;
 mod artifact_lock;
 mod artifact_store;
+mod fs_safety;
 mod loading;
 mod model;
 mod publication;
 
 use std::path::{Path, PathBuf};
 
+pub use artifact::{
+    ArtifactError, ArtifactResponse, ArtifactSpec, ArtifactTransport, Capacity, Digest,
+    HttpArtifactTransport, MAX_ARTIFACT_BYTES, MAX_CACHE_BYTES, MAX_TRANSACTION_ARTIFACTS,
+    MAX_TRANSACTION_BYTES, TransactionRequest,
+};
+pub use artifact_store::{ArtifactCache, ArtifactTransaction, CachedArtifact};
 pub use model::{
     CacheError, CompleteSnapshot, OriginError, RepomdAuthentication, SelectedOrigin, Snapshot,
     SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration,
 };
-pub use artifact::{
-    ArtifactError, ArtifactResponse, ArtifactSpec, ArtifactTransport, Capacity, Digest,
-    HttpArtifactTransport, TransactionRequest, MAX_ARTIFACT_BYTES, MAX_CACHE_BYTES,
-    MAX_TRANSACTION_ARTIFACTS, MAX_TRANSACTION_BYTES,
-};
-pub use artifact_store::{ArtifactCache, ArtifactTransaction, CachedArtifact};
 
 #[derive(Debug)]
 pub struct Cache {

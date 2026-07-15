@@ -83,21 +83,45 @@ pub struct Evra {
 }
 
 impl Evra {
-    pub fn new(epoch: u32, version: impl Into<String>, release: impl Into<String>, arch: Architecture) -> Self {
-        Self { epoch, version: version.into(), release: release.into(), arch }
+    pub fn new(
+        epoch: u32,
+        version: impl Into<String>,
+        release: impl Into<String>,
+        arch: Architecture,
+    ) -> Self {
+        Self {
+            epoch,
+            version: version.into(),
+            release: release.into(),
+            arch,
+        }
     }
 
-    pub const fn epoch(&self) -> u32 { self.epoch }
-    pub fn version(&self) -> &str { &self.version }
-    pub fn release(&self) -> &str { &self.release }
-    pub const fn arch(&self) -> Architecture { self.arch }
+    pub const fn epoch(&self) -> u32 {
+        self.epoch
+    }
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+    pub fn release(&self) -> &str {
+        &self.release
+    }
+    pub const fn arch(&self) -> Architecture {
+        self.arch
+    }
     pub(crate) fn validate(&self) -> Result<(), DomainError> {
-        if self.version.is_empty() { return Err(DomainError::Empty { field: "version" }); }
-        if self.release.is_empty() { return Err(DomainError::Empty { field: "release" }); }
+        if self.version.is_empty() {
+            return Err(DomainError::Empty { field: "version" });
+        }
+        if self.release.is_empty() {
+            return Err(DomainError::Empty { field: "release" });
+        }
         Ok(())
     }
     pub fn is_strictly_newer_than(&self, installed: &Self) -> bool {
-        if self.epoch != installed.epoch { return self.epoch > installed.epoch; }
+        if self.epoch != installed.epoch {
+            return self.epoch > installed.epoch;
+        }
         match rpm_part_cmp(&self.version, &installed.version) {
             std::cmp::Ordering::Equal => rpm_part_cmp(&self.release, &installed.release).is_gt(),
             ordering => ordering.is_gt(),
@@ -107,12 +131,22 @@ impl Evra {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawEvra { epoch: u32, version: String, release: String, arch: Architecture }
+struct RawEvra {
+    epoch: u32,
+    version: String,
+    release: String,
+    arch: Architecture,
+}
 
 impl<'de> Deserialize<'de> for Evra {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = RawEvra::deserialize(deserializer)?;
-        let value = Self { epoch: raw.epoch, version: raw.version, release: raw.release, arch: raw.arch };
+        let value = Self {
+            epoch: raw.epoch,
+            version: raw.version,
+            release: raw.release,
+            arch: raw.arch,
+        };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
     }
@@ -123,19 +157,42 @@ fn rpm_part_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     let right = right.as_bytes();
     let (mut li, mut ri) = (0usize, 0usize);
     loop {
-        while li < left.len() && !left[li].is_ascii_alphanumeric() && !matches!(left[li], b'~' | b'^') { li += 1; }
-        while ri < right.len() && !right[ri].is_ascii_alphanumeric() && !matches!(right[ri], b'~' | b'^') { ri += 1; }
+        while li < left.len()
+            && !left[li].is_ascii_alphanumeric()
+            && !matches!(left[li], b'~' | b'^')
+        {
+            li += 1;
+        }
+        while ri < right.len()
+            && !right[ri].is_ascii_alphanumeric()
+            && !matches!(right[ri], b'~' | b'^')
+        {
+            ri += 1;
+        }
         if left.get(li) == Some(&b'~') || right.get(ri) == Some(&b'~') {
             match (left.get(li) == Some(&b'~'), right.get(ri) == Some(&b'~')) {
-                (true, true) => { li += 1; ri += 1; continue; }
+                (true, true) => {
+                    li += 1;
+                    ri += 1;
+                    continue;
+                }
                 (true, false) => return std::cmp::Ordering::Less,
                 (false, true) => return std::cmp::Ordering::Greater,
                 (false, false) => return std::cmp::Ordering::Equal,
             }
         }
         if left.get(li) == Some(&b'^') || right.get(ri) == Some(&b'^') {
-            match (left.get(li) == Some(&b'^'), right.get(ri) == Some(&b'^'), li == left.len(), ri == right.len()) {
-                (true, true, _, _) => { li += 1; ri += 1; continue; }
+            match (
+                left.get(li) == Some(&b'^'),
+                right.get(ri) == Some(&b'^'),
+                li == left.len(),
+                ri == right.len(),
+            ) {
+                (true, true, _, _) => {
+                    li += 1;
+                    ri += 1;
+                    continue;
+                }
                 (true, false, _, true) => return std::cmp::Ordering::Greater,
                 (false, true, true, _) => return std::cmp::Ordering::Less,
                 (true, false, _, false) => return std::cmp::Ordering::Less,
@@ -143,20 +200,46 @@ fn rpm_part_cmp(left: &str, right: &str) -> std::cmp::Ordering {
                 _ => return std::cmp::Ordering::Equal,
             }
         }
-        if li == left.len() || ri == right.len() { return (left.len() - li).cmp(&(right.len() - ri)); }
+        if li == left.len() || ri == right.len() {
+            return (left.len() - li).cmp(&(right.len() - ri));
+        }
         let numeric = left[li].is_ascii_digit();
-        if numeric != right[ri].is_ascii_digit() { return if numeric { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }; }
+        if numeric != right[ri].is_ascii_digit() {
+            return if numeric {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
         let (ls, rs) = (li, ri);
-        while li < left.len() && left[li].is_ascii_digit() == numeric && left[li].is_ascii_alphanumeric() { li += 1; }
-        while ri < right.len() && right[ri].is_ascii_digit() == numeric && right[ri].is_ascii_alphanumeric() { ri += 1; }
+        while li < left.len()
+            && left[li].is_ascii_digit() == numeric
+            && left[li].is_ascii_alphanumeric()
+        {
+            li += 1;
+        }
+        while ri < right.len()
+            && right[ri].is_ascii_digit() == numeric
+            && right[ri].is_ascii_alphanumeric()
+        {
+            ri += 1;
+        }
         let (mut la, mut ra) = (&left[ls..li], &right[rs..ri]);
         if numeric {
-            while la.first() == Some(&b'0') { la = &la[1..]; }
-            while ra.first() == Some(&b'0') { ra = &ra[1..]; }
+            while la.first() == Some(&b'0') {
+                la = &la[1..];
+            }
+            while ra.first() == Some(&b'0') {
+                ra = &ra[1..];
+            }
             let length = la.len().cmp(&ra.len());
-            if !length.is_eq() { return length; }
+            if !length.is_eq() {
+                return length;
+            }
         }
         let ordering = la.cmp(ra);
-        if !ordering.is_eq() { return ordering; }
+        if !ordering.is_eq() {
+            return ordering;
+        }
     }
 }

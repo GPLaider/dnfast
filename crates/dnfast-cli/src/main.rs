@@ -56,12 +56,21 @@ fn main() -> ExitCode {
     ) {
         Ok(cli) => cli,
         Err(error) => {
-            if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
                 let command = command_from_arguments(arguments.iter().cloned()).unwrap_or("cli");
                 return emit_completed(command, error.to_string(), JsonOutput::NativeV1);
             }
             let command = command_from_arguments(arguments.iter().cloned()).unwrap_or("cli");
-            return emit_failure(command, 2, "syntax_error", error.to_string(), JsonOutput::NativeV1);
+            return emit_failure(
+                command,
+                2,
+                "syntax_error",
+                error.to_string(),
+                JsonOutput::NativeV1,
+            );
         }
     };
     let output = cli.json_output();
@@ -77,7 +86,13 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Err(error) => emit_failure(command_name, error.code, error.error_code, error.message, output),
+        Err(error) => emit_failure(
+            command_name,
+            error.code,
+            error.error_code,
+            error.message,
+            output,
+        ),
     }
 }
 
@@ -99,7 +114,13 @@ fn emit_completed(command: &str, message: String, output: JsonOutput) -> ExitCod
     }
 }
 
-fn emit_failure(command: &str, exit_code: u8, code: &str, message: String, output: JsonOutput) -> ExitCode {
+fn emit_failure(
+    command: &str,
+    exit_code: u8,
+    code: &str,
+    message: String,
+    output: JsonOutput,
+) -> ExitCode {
     match emit(&Response::failed(command, exit_code, code, message), output) {
         Ok(()) => ExitCode::from(exit_code),
         Err(error) => {
@@ -123,7 +144,9 @@ fn command_from_arguments(arguments: impl IntoIterator<Item = String>) -> Option
     }
 }
 
-fn unsupported_top_level_command(arguments: impl IntoIterator<Item = String>) -> Option<&'static str> {
+fn unsupported_top_level_command(
+    arguments: impl IntoIterator<Item = String>,
+) -> Option<&'static str> {
     let first = first_command_argument(arguments)?;
     UNSUPPORTED_COMMANDS
         .iter()

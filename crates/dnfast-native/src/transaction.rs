@@ -28,7 +28,9 @@ impl TransactionProblem {
         Ok(Self(value))
     }
 
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -55,13 +57,21 @@ pub struct TransactionCounts {
 
 impl From<dnfast_native_sys::TransactionCounts> for TransactionCounts {
     fn from(value: dnfast_native_sys::TransactionCounts) -> Self {
-        Self { fd_open: value.fd_open, fd_close: value.fd_close,
-            open_attempted: value.open_attempted, open_failed: value.open_failed,
-            rewind_attempted: value.rewind_attempted, rewind_succeeded: value.rewind_succeeded,
-            rewind_failed: value.rewind_failed, close_attempted: value.close_attempted,
+        Self {
+            fd_open: value.fd_open,
+            fd_close: value.fd_close,
+            open_attempted: value.open_attempted,
+            open_failed: value.open_failed,
+            rewind_attempted: value.rewind_attempted,
+            rewind_succeeded: value.rewind_succeeded,
+            rewind_failed: value.rewind_failed,
+            close_attempted: value.close_attempted,
             close_failed: value.close_failed,
-            script_start: value.script_start, script_stop: value.script_stop,
-            package_stop: value.package_stop, test_run: value.test_run,
-            real_run: value.real_run }
+            script_start: value.script_start,
+            script_stop: value.script_stop,
+            package_stop: value.package_stop,
+            test_run: value.test_run,
+            real_run: value.real_run,
+        }
     }
 }

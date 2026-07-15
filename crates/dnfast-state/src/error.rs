@@ -14,5 +14,9 @@ pub enum StateError {
     Busy,
 }
 
-pub(crate) fn io(error: std::io::Error) -> StateError { StateError::Io(error.to_string()) }
-pub(crate) fn errno(error: rustix::io::Errno) -> StateError { StateError::Io(error.to_string()) }
+pub(crate) fn io(error: std::io::Error) -> StateError {
+    StateError::Io(error.to_string())
+}
+pub(crate) fn errno(error: rustix::io::Errno) -> StateError {
+    StateError::Io(error.to_string())
+}

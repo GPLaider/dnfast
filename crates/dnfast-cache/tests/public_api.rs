@@ -40,7 +40,10 @@ fn new_preserves_root_and_debug_representation() {
 
     // Then
     assert_eq!(cache.root(), directory.path());
-    assert_eq!(format!("{cache:?}"), format!("Cache {{ root: {:?} }}", directory.path()));
+    assert_eq!(
+        format!("{cache:?}"),
+        format!("Cache {{ root: {:?} }}", directory.path())
+    );
 }
 
 #[test]
@@ -116,7 +119,9 @@ fn load_reports_corrupt_pointer() {
     let result = cache.load("fedora");
 
     // Then
-    assert!(matches!(result, Err(CacheError::Corrupt(message)) if message == "invalid current digest"));
+    assert!(
+        matches!(result, Err(CacheError::Corrupt(message)) if message == "invalid current digest")
+    );
 }
 
 #[test]
@@ -186,7 +191,11 @@ fn cache_error_display_and_source_are_stable() {
             "cache error: Io(\"disk full\")",
         ]
     );
-    assert!(errors.iter().all(|error| std::error::Error::source(error).is_none()));
+    assert!(
+        errors
+            .iter()
+            .all(|error| std::error::Error::source(error).is_none())
+    );
 }
 
 #[cfg(unix)]
@@ -206,5 +215,7 @@ fn load_rejects_symlinked_current_pointer() {
     let result = cache.load("fedora");
 
     // Then
-    assert!(matches!(result, Err(CacheError::Corrupt(message)) if message == "current is not a regular file"));
+    assert!(
+        matches!(result, Err(CacheError::Corrupt(message)) if message == "current is not a regular file")
+    );
 }
