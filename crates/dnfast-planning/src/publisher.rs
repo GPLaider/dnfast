@@ -530,16 +530,35 @@ fn repository_payload(
     let generation = cache
         .open_current_verified_complete_generation(&repository.id)
         .map_err(|error| PlanningError::Cache(error.to_string()))?;
-    generation_payload(repository, generation, trust, bundle, blob_store)
+    let records = dnfast_metadata::parse_repomd_records(generation.repomd().bytes())
+        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    let group = records
+        .group
+        .as_ref()
+        .map(|record| cache.open_auxiliary(record))
+        .transpose()
+        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    let modules = records
+        .modules
+        .as_ref()
+        .map(|record| cache.open_auxiliary(record))
+        .transpose()
+        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    generation_payload(
+        repository, generation, group, modules, trust, bundle, blob_store,
+    )
 }
 
 fn generation_payload(
     repository: &RepoConfig,
     generation: VerifiedCompleteGeneration,
+    group: Option<dnfast_cache::VerifiedBytes>,
+    modules: Option<dnfast_cache::VerifiedBytes>,
     trust: RepoTrustPolicy,
     bundle: KeyBundle,
     blob_store: Option<&TrustedDirectory>,
 ) -> Result<PlanningRepository, PlanningError> {
+    let file_provides = crate::file_provides::build(&generation, blob_store)?;
     let keys = bundle
         .paths
         .iter()
@@ -567,6 +586,9 @@ fn generation_payload(
         ] {
             crate::snapshot_store::publish_blob(planning, payload.sha256(), payload.bytes())?;
         }
+        for payload in group.iter().chain(modules.iter()) {
+            crate::snapshot_store::publish_blob(planning, payload.sha256(), payload.bytes())?;
+        }
     }
     let origin = generation.origin();
     Ok(PlanningRepository {
@@ -581,6 +603,13 @@ fn generation_payload(
         repomd: crate::model::PlanningBytes::from_verified(generation.repomd()),
         primary: crate::model::PlanningBytes::from_verified(generation.primary()),
         filelists: crate::model::PlanningBytes::from_verified(generation.filelists()),
+        file_provides: Some(file_provides),
+        group: group
+            .as_ref()
+            .map(crate::model::PlanningBytes::from_verified),
+        modules: modules
+            .as_ref()
+            .map(crate::model::PlanningBytes::from_verified),
         trust,
         keys,
         repomd_authentication: generation.repomd_authentication().clone(),

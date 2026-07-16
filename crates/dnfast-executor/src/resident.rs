@@ -20,10 +20,13 @@ use dnfast_core::{
     TransactionIntent,
 };
 use dnfast_native::{
-    ExpectedPackage, InventorySnapshot, NativeContext, Repository, VerifiedStagedKey,
+    ExpectedPackage, FileProvider, InventorySnapshot, MappedSelector, NativeContext, Repository,
+    VerifiedStagedKey,
 };
 use dnfast_planning::{PlanningRepository, PlanningSnapshot, SYSTEM_CACHE_PATH};
-use dnfast_solver::{CandidatePackage, CanonicalSolverPlan, NativeSolveOutput, PlanBuilder};
+use dnfast_solver::{
+    CandidatePackage, CanonicalSolverPlan, NativePackageEvidence, NativeSolveOutput, PlanBuilder,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -449,7 +452,11 @@ fn handle_connection(state: &mut DaemonState, stream: &mut UnixStream) -> Result
         } => {
             require_schema(&schema)?;
             canonical_repository_ids(&repositories)?;
-            if requires_filelists(&packages) {
+            let action = parse_action(&action)?;
+            if state
+                .planner
+                .requires_full_filelists(action, &packages, &repositories)?
+            {
                 return write_frame(
                     stream,
                     &ServerMessage::Fallback {
@@ -458,9 +465,7 @@ fn handle_connection(state: &mut DaemonState, stream: &mut UnixStream) -> Result
                     },
                 );
             }
-            let solved = state
-                .planner
-                .solve(parse_action(&action)?, packages, &repositories)?;
+            let solved = state.planner.solve(action, packages, &repositories)?;
             revalidate_solved(&solved)?;
             let bytes = solved.plan.canonical_json().map_err(planning)?;
             write_frame(
@@ -480,7 +485,11 @@ fn handle_connection(state: &mut DaemonState, stream: &mut UnixStream) -> Result
         } => {
             require_schema(&schema)?;
             canonical_repository_ids(&repositories)?;
-            if requires_filelists(&packages) {
+            let action = parse_action(&action)?;
+            if state
+                .planner
+                .requires_full_filelists(action, &packages, &repositories)?
+            {
                 return write_frame(
                     stream,
                     &ServerMessage::Fallback {
@@ -489,7 +498,6 @@ fn handle_connection(state: &mut DaemonState, stream: &mut UnixStream) -> Result
                     },
                 );
             }
-            let action = parse_action(&action)?;
             let solved = state.planner.solve(action, packages, &repositories)?;
             state.prepare_and_execute(stream, solved)
         }
@@ -517,6 +525,15 @@ impl DaemonState {
         let started = Instant::now();
         let plan_bytes = solved.plan.canonical_json().map_err(planning)?;
         revalidate_solved(&solved)?;
+        let snapshot = PlanningSnapshot::open_system().map_err(planning)?;
+        snapshot.revalidate_system_state().map_err(planning)?;
+        if PlanningSnapshot::current_system_digest().map_err(planning)?
+            != solved.integrity.planning_snapshot_sha256().as_str()
+        {
+            return Err(DaemonError::Planning(
+                "root-published planning snapshot changed before staging".into(),
+            ));
+        }
         let architecture = solved.policy.base_arch();
         if self.recovered_architecture != Some(architecture) {
             recover_pending_transactions(&self.journal, architecture).map_err(executor)?;
@@ -653,6 +670,7 @@ struct ResidentPlanner {
 }
 
 struct ResidentPool {
+    snapshot: PlanningSnapshot,
     repository_ids: Vec<String>,
     integrity: dnfast_core::PlanIntegrity,
     policy: SolverPolicy,
@@ -661,7 +679,9 @@ struct ResidentPool {
     inventory: InstalledInventory,
     rpmdb_cookie: String,
     candidates: Vec<CandidatePackage>,
-    metadata: Vec<(String, dnfast_metadata::CompletePackage)>,
+    metadata: Vec<(String, NativePackageEvidence)>,
+    primary_paths: Vec<String>,
+    primary_identities: Vec<(String, Vec<String>)>,
     last_solve: Option<CachedResidentSolve>,
 }
 
@@ -696,6 +716,27 @@ impl ResidentPlanner {
     fn warm(&mut self, repositories: &[String]) -> Result<&str, DaemonError> {
         self.ensure(repositories)?;
         Ok(&self.cached.as_ref().expect("resident pool").rpmdb_cookie)
+    }
+
+    fn requires_full_filelists(
+        &mut self,
+        action: Action,
+        packages: &[String],
+        repositories: &[String],
+    ) -> Result<bool, DaemonError> {
+        if !packages.iter().any(|package| package.starts_with('/')) {
+            return Ok(false);
+        }
+        self.ensure(repositories)?;
+        let cached = self.cached.as_ref().expect("resident pool");
+        Ok(
+            paths_require_full_filelists(packages, &cached.primary_paths)
+                && (action != Action::Install
+                    || cached
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.file_provides.is_none())),
+        )
     }
 
     fn solve(
@@ -746,12 +787,19 @@ impl ResidentPlanner {
             });
         }
         let policy = cached.policy.clone();
+        let mapped = mapped_file_selectors(cached, &names)?;
         let result = match action {
-            Action::Install => {
+            Action::Install if mapped.is_empty() => {
                 cached
                     .context
                     .solve_install_many(&names, policy.install_weak_deps(), policy.best())
             }
+            Action::Install => cached.context.solve_install_many_mapped(
+                &names,
+                policy.install_weak_deps(),
+                policy.best(),
+                &mapped,
+            ),
             Action::Upgrade => cached.context.solve_upgrade_many(&names, policy.best()),
             Action::Remove => cached.context.solve_erase_many(&names),
         }
@@ -769,7 +817,7 @@ impl ResidentPlanner {
             .iter()
             .map(|(repository, package)| (repository.as_str(), package))
             .collect::<Vec<_>>();
-        let transcript = NativeSolveOutput::from_native(
+        let transcript = NativeSolveOutput::from_native_compact(
             result,
             cached.integrity.metadata_sha256().as_str().into(),
             &metadata,
@@ -779,7 +827,7 @@ impl ResidentPlanner {
         trace_phase(trace, started, "resident-native-adapter");
         let satisfied_specs = transcript.satisfied_specs().to_vec();
         let resolved = transcript
-            .into_resolved(&names, &cached.candidates, &metadata, &cached.inventory)
+            .into_resolved_compact(&names, &cached.candidates, &metadata, &cached.inventory)
             .map_err(planning)?;
         trace_phase(trace, started, "resident-resolved");
         let plan = PlanBuilder {
@@ -947,6 +995,8 @@ fn build_pool(
     let workspace = tempfile::tempdir().map_err(|error| DaemonError::Io(error.to_string()))?;
     let mut candidates = Vec::new();
     let mut metadata = Vec::new();
+    let mut primary_paths = Vec::new();
+    let mut primary_identities = Vec::new();
     for (index, repository) in selected.iter().enumerate() {
         let (paths, solver_inputs) = materialize(&snapshot, workspace.path(), index, repository)?;
         context
@@ -959,30 +1009,37 @@ fn build_pool(
                 cost: i32::try_from(repository.cost).map_err(planning)?,
             })
             .map_err(planning)?;
-        candidates.extend(candidates_for(
-            repository,
-            &solver_inputs,
-            policy.base_arch(),
-        )?);
+        let records = resident_records_for(repository, solver_inputs, policy.base_arch())?;
+        candidates.extend(records.candidates);
         metadata.extend(
-            solver_inputs
-                .iter()
-                .cloned()
+            records
+                .metadata
+                .into_iter()
                 .map(|package| (repository.id.clone(), package)),
         );
+        primary_paths.extend(records.primary_paths);
+        primary_identities.push((repository.id.clone(), records.primary_identities));
     }
+    primary_paths.sort();
+    primary_paths.dedup();
+    context.prepare_solver().map_err(planning)?;
+    dnfast_native::release_unused_memory();
     let verified_cookie = rpmdb_cookie.clone();
+    let repositories = selected.into_iter().cloned().collect();
     Ok((
         ResidentPool {
+            snapshot,
             repository_ids,
             integrity,
             policy,
-            repositories: selected.into_iter().cloned().collect(),
+            repositories,
             context,
             inventory,
             rpmdb_cookie,
             candidates,
             metadata,
+            primary_paths,
+            primary_identities,
             last_solve: None,
         },
         verified_cookie,
@@ -1201,13 +1258,27 @@ fn display(path: &Path) -> Result<String, DaemonError> {
         .ok_or_else(|| DaemonError::Planning("temporary metadata path is not UTF-8".into()))
 }
 
-fn candidates_for(
+struct ResidentRepositoryRecords {
+    candidates: Vec<CandidatePackage>,
+    metadata: Vec<NativePackageEvidence>,
+    primary_paths: Vec<String>,
+    primary_identities: Vec<String>,
+}
+
+fn resident_records_for(
     repository: &PlanningRepository,
-    solver_inputs: &[dnfast_metadata::CompletePackage],
+    solver_inputs: Vec<dnfast_metadata::CompletePackage>,
     base_architecture: Architecture,
-) -> Result<Vec<CandidatePackage>, DaemonError> {
+) -> Result<ResidentRepositoryRecords, DaemonError> {
     let mut candidates = Vec::new();
-    for item in solver_inputs {
+    let mut metadata = Vec::new();
+    let mut primary_paths = Vec::new();
+    let mut primary_identities = Vec::with_capacity(solver_inputs.len());
+    for mut item in solver_inputs {
+        primary_identities.push(format!(
+            "{}-{}:{}-{}.{}",
+            item.name, item.epoch, item.version, item.release, item.arch
+        ));
         let architecture = match item.arch.as_str() {
             "aarch64" => Architecture::Aarch64,
             "x86_64" => Architecture::X86_64,
@@ -1223,6 +1294,7 @@ fn candidates_for(
             .epoch
             .parse()
             .map_err(|_| DaemonError::Planning("invalid metadata epoch".into()))?;
+        primary_paths.extend(std::mem::take(&mut item.files));
         candidates.push(CandidatePackage {
             name: item.name.clone(),
             evra: Evra::new(
@@ -1246,8 +1318,71 @@ fn candidates_for(
             excluded: false,
             modular: false,
         });
+        metadata.push(NativePackageEvidence::from_complete(item));
     }
-    Ok(candidates)
+    Ok(ResidentRepositoryRecords {
+        candidates,
+        metadata,
+        primary_paths,
+        primary_identities,
+    })
+}
+
+fn mapped_file_selectors(
+    cached: &ResidentPool,
+    names: &[&str],
+) -> Result<Vec<MappedSelector>, DaemonError> {
+    let mut mapped = Vec::new();
+    for (selector_index, selector) in names.iter().enumerate() {
+        if !selector.starts_with('/')
+            || cached
+                .primary_paths
+                .binary_search_by(|path| path.as_str().cmp(selector))
+                .is_ok()
+        {
+            continue;
+        }
+        let mut providers = Vec::new();
+        for repository in &cached.repositories {
+            for ordinal in cached
+                .snapshot
+                .file_providers(repository, selector)
+                .map_err(planning)?
+            {
+                let identities = cached
+                    .primary_identities
+                    .iter()
+                    .find(|(id, _)| id == &repository.id)
+                    .map(|(_, identities)| identities)
+                    .ok_or_else(|| {
+                        DaemonError::Planning(
+                            "file-provides repository identities disappeared".into(),
+                        )
+                    })?;
+                let identity = identities.get(ordinal as usize).ok_or_else(|| {
+                    DaemonError::Planning("file-provides package ordinal is out of range".into())
+                })?;
+                providers.push(FileProvider {
+                    repository_id: repository.id.clone(),
+                    package_ordinal: ordinal,
+                    expected_identity: identity.clone(),
+                });
+            }
+        }
+        if !providers.is_empty() {
+            providers.sort_by(|left, right| {
+                left.repository_id
+                    .cmp(&right.repository_id)
+                    .then_with(|| left.package_ordinal.cmp(&right.package_ordinal))
+            });
+            providers.dedup();
+            mapped.push(MappedSelector {
+                selector_index,
+                providers,
+            });
+        }
+    }
+    Ok(mapped)
 }
 
 fn solve_token(
@@ -1335,8 +1470,21 @@ fn canonical_repository_ids(repositories: &[String]) -> Result<(), DaemonError> 
     }
 }
 
-fn requires_filelists(packages: &[String]) -> bool {
-    packages.iter().any(|package| package.starts_with('/'))
+fn paths_require_full_filelists(packages: &[String], primary_paths: &[String]) -> bool {
+    paths_require_full_filelists_by(packages, |selector| {
+        primary_paths
+            .binary_search_by(|path| path.as_str().cmp(selector))
+            .is_ok()
+    })
+}
+
+fn paths_require_full_filelists_by(
+    packages: &[String],
+    primary_contains: impl Fn(&str) -> bool,
+) -> bool {
+    packages
+        .iter()
+        .any(|selector| selector.starts_with('/') && !primary_contains(selector))
 }
 
 fn require_schema(schema: &str) -> Result<(), DaemonError> {
@@ -1457,15 +1605,19 @@ mod tests {
     }
 
     #[test]
-    fn only_absolute_path_intents_require_the_full_filelists_fallback() {
-        assert!(requires_filelists(&["/usr/bin/example".into()]));
-        assert!(requires_filelists(&[
-            "ordinary-package".into(),
-            "/opt/example".into()
-        ]));
-        assert!(!requires_filelists(&[
-            "ordinary-package".into(),
-            "capability(foo) >= 1".into()
-        ]));
+    fn only_paths_missing_from_primary_require_the_full_filelists_fallback() {
+        let primary_contains = |path: &str| path == "/usr/bin/example";
+        assert!(!paths_require_full_filelists_by(
+            &["/usr/bin/example".into()],
+            primary_contains
+        ));
+        assert!(paths_require_full_filelists_by(
+            &["ordinary-package".into(), "/opt/example".into()],
+            primary_contains
+        ));
+        assert!(!paths_require_full_filelists_by(
+            &["ordinary-package".into(), "capability(foo) >= 1".into()],
+            primary_contains
+        ));
     }
 }

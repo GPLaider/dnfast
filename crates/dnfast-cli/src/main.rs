@@ -14,9 +14,7 @@ use clap::{CommandFactory, Parser};
 use response::{JsonOutput, Response, emit};
 
 const UNSUPPORTED_COMMANDS: &[&str] = &[
-    "group",
     "environment",
-    "module",
     "plugin",
     "copr",
     "system-upgrade",
@@ -141,6 +139,8 @@ fn command_from_arguments(arguments: impl IntoIterator<Item = String>) -> Option
         "history" => Some("history"),
         "search" => Some("search"),
         "doctor" => Some("doctor"),
+        "group" => Some("group"),
+        "module" => Some("module"),
         _ => Some("cli"),
     }
 }
@@ -166,10 +166,10 @@ mod tests {
     #[test]
     fn unsupported_command_is_detected_before_clap() {
         // Given an unsupported mutation command.
-        let arguments = ["module".to_owned(), "enable".to_owned()];
+        let arguments = ["plugin".to_owned(), "enable".to_owned()];
         // When the pre-dispatch boundary examines the command.
         let detected = unsupported_top_level_command(arguments);
         // Then it is classified before any configuration or solver is reachable.
-        assert_eq!(detected, Some("module"));
+        assert_eq!(detected, Some("plugin"));
     }
 }

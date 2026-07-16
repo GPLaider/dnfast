@@ -42,6 +42,30 @@ pub(crate) fn publish_blob(
     digest: &str,
     bytes: &[u8],
 ) -> Result<(), PlanningError> {
+    publish_blob_inner(planning, digest, bytes, true)
+}
+
+pub(crate) fn publish_blob_deferred(
+    planning: &TrustedDirectory,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), PlanningError> {
+    publish_blob_inner(planning, digest, bytes, false)
+}
+
+pub(crate) fn sync_blobs(planning: &TrustedDirectory) -> Result<(), PlanningError> {
+    planning
+        .child("blobs", false, 0)?
+        .child("sha256", false, 0)?
+        .sync()
+}
+
+fn publish_blob_inner(
+    planning: &TrustedDirectory,
+    digest: &str,
+    bytes: &[u8],
+    sync_directory: bool,
+) -> Result<(), PlanningError> {
     if !valid_digest(digest) || format!("{:x}", sha2::Sha256::digest(bytes)) != digest {
         return Err(PlanningError::UnsafeSnapshot(
             "planning blob digest differs from payload".into(),
@@ -70,7 +94,8 @@ pub(crate) fn publish_blob(
         digest
     );
     match fs::rename(&temporary, &target) {
-        Ok(()) => sha256.sync(),
+        Ok(()) if sync_directory => sha256.sync(),
+        Ok(()) => Ok(()),
         Err(_error) if sha256.read_if_present(digest, bytes.len())?.is_some() => {
             fs::remove_file(&temporary).map_err(io)?;
             let existing = sha256.read(digest, bytes.len())?;

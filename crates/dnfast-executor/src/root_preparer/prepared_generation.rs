@@ -33,8 +33,10 @@ use crate::{
 
 use super::PreparationError;
 
+#[cfg(test)]
+pub(crate) use digest::metadata_digest;
 use digest::{artifact_key, descriptor};
-pub(crate) use digest::{metadata_digest, trust_digest};
+pub(crate) use digest::{metadata_digest_v4, trust_digest};
 #[cfg(test)]
 pub(crate) use publication::{Publication, remove_generation};
 
@@ -104,7 +106,29 @@ impl InputDraft {
         let metadata = snapshot
             .materialize_native_xml(repository)
             .map_err(|error| PreparationError::Snapshot(error.to_string()))?;
-        self.write_materialized_repository(repository, index, &metadata)
+        let file_provides = self.write_optional_payload(
+            snapshot,
+            repository.file_provides.as_ref(),
+            &format!("repo-{index}-file-provides"),
+        )?;
+        let group = self.write_optional_payload(
+            snapshot,
+            repository.group.as_ref(),
+            &format!("repo-{index}-group"),
+        )?;
+        let modules = self.write_optional_payload(
+            snapshot,
+            repository.modules.as_ref(),
+            &format!("repo-{index}-modules"),
+        )?;
+        self.write_materialized_repository(
+            repository,
+            index,
+            &metadata,
+            file_provides,
+            group,
+            modules,
+        )
     }
 
     #[cfg(test)]
@@ -116,7 +140,7 @@ impl InputDraft {
         let metadata = repository
             .materialize_native_xml()
             .map_err(|error| PreparationError::Snapshot(error.to_string()))?;
-        self.write_materialized_repository(repository, index, &metadata)
+        self.write_materialized_repository(repository, index, &metadata, None, None, None)
     }
 
     fn write_materialized_repository(
@@ -124,6 +148,9 @@ impl InputDraft {
         repository: &PlanningRepository,
         index: usize,
         metadata: &NativeRepositoryXml,
+        file_provides: Option<InputFile>,
+        group: Option<InputFile>,
+        modules: Option<InputFile>,
     ) -> Result<MaterializedRepository, PreparationError> {
         let prefix = format!("repo-{index}");
         let repomd = self.write_bytes(&format!("{prefix}-repomd"), metadata.repomd())?;
@@ -166,6 +193,9 @@ impl InputDraft {
             repomd,
             primary,
             filelists,
+            file_provides,
+            group,
+            modules,
             trust: InputRepositoryTrust {
                 policy: trust_policy,
                 sha256: repository
@@ -182,6 +212,22 @@ impl InputDraft {
             native_primary,
             native_filelists,
         })
+    }
+
+    fn write_optional_payload(
+        &mut self,
+        snapshot: &PlanningSnapshot,
+        payload: Option<&dnfast_planning::PlanningBytes>,
+        name: &str,
+    ) -> Result<Option<InputFile>, PreparationError> {
+        payload
+            .map(|payload| {
+                snapshot
+                    .materialize_payload(payload)
+                    .map_err(|error| PreparationError::Snapshot(error.to_string()))
+                    .and_then(|bytes| self.write_bytes(name, &bytes))
+            })
+            .transpose()
     }
 
     pub(crate) fn fetch_artifacts(

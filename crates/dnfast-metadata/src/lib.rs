@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod compression;
+mod comps;
 mod error;
 mod filelists;
 mod limits;
@@ -11,9 +12,11 @@ mod search;
 mod xml;
 
 pub use compression::{
-    decode_primary, decode_record, parse_filelists_record, validate_filelists_record,
-    validate_filelists_record_identities, validate_primary_record, verify_compressed,
+    decode_auxiliary, decode_primary, decode_record, parse_filelists_record,
+    validate_filelists_record, validate_filelists_record_identities, validate_primary_record,
+    verify_compressed, visit_filelists_record_identities,
 };
+pub use comps::{Comps, CompsEnvironment, CompsGroup, CompsPackage, CompsPackageType, parse_comps};
 pub use error::MetadataError;
 pub use filelists::{
     FileListPackage, parse_filelists, publish_validated, validate_filelists_generation,
@@ -26,7 +29,7 @@ pub use primary::{
 };
 pub use relations::{MAX_RELATIONS, MAX_RELATIONS_PER_PACKAGE, Relation, RelationFlags};
 pub use repomd::{
-    MAX_PRIMARY_COMPRESSED_BYTES, MAX_PRIMARY_OPEN_BYTES, MetadataRecord, PrimaryRecord,
-    RepomdRecords, parse_repomd, parse_repomd_records,
+    AuxiliaryRecord, MAX_PRIMARY_COMPRESSED_BYTES, MAX_PRIMARY_OPEN_BYTES, MetadataRecord,
+    PrimaryRecord, RepomdRecords, parse_repomd, parse_repomd_records,
 };
 pub use search::search;

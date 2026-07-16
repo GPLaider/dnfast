@@ -98,6 +98,20 @@ pub(crate) fn metadata_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (repomd, compressed, compressed_filelists)
 }
 
+fn metadata_with_group_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (repomd, primary, filelists) = metadata_fixture();
+    let comps = br#"<comps><group><id>tools</id><name>Tools</name><packagelist><packagereq type="mandatory">ripgrep</packagereq></packagelist></group></comps>"#;
+    let group = zstd::stream::encode_all(comps.as_slice(), 1).expect("compress comps");
+    let record = format!(
+        r#"<data type="group"><checksum type="sha256">{}</checksum><location href="repodata/comps.xml.zst"/><size>{}</size></data>"#,
+        hex::encode(Sha256::digest(&group)),
+        group.len()
+    );
+    let mut document = String::from_utf8(repomd).expect("repomd UTF-8");
+    document = document.replace("</repomd>", &format!("{record}</repomd>"));
+    (document.into_bytes(), primary, filelists, group)
+}
+
 pub(crate) fn metalink_fixture(repomd: &[u8]) -> Vec<u8> {
     let repomd_hash = hex::encode(Sha256::digest(repomd));
     format!(
@@ -173,6 +187,81 @@ fn unchanged_fresh_repomd_reuses_only_a_rehashed_complete_generation() {
             .unwrap()
             .digest(),
         reused.digest
+    );
+}
+
+#[test]
+fn group_payload_downloads_once_and_is_reused_with_an_unchanged_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path());
+    let (repomd, primary, filelists, group) = metadata_with_group_fixture();
+    let base = "https://groups.example/fedora";
+    let first = Refresher::new(
+        FakeTransport::new([
+            (format!("{base}/repodata/repomd.xml"), repomd.clone()),
+            (format!("{base}/repodata/primary.xml.zst"), primary),
+            (format!("{base}/repodata/filelists.xml.zst"), filelists),
+            (format!("{base}/repodata/comps.xml.zst"), group.clone()),
+        ]),
+        &cache,
+    )
+    .refresh("fedora", Source::BaseUrl(base.into()))
+    .expect("refresh with group");
+    let record = dnfast_metadata::parse_repomd_records(&repomd)
+        .expect("records")
+        .group
+        .expect("group record");
+    assert_eq!(
+        cache.open_auxiliary(&record).expect("cached group").bytes(),
+        group
+    );
+
+    let reused = Refresher::new(
+        FakeTransport::new([(format!("{base}/repodata/repomd.xml"), repomd)]),
+        &cache,
+    )
+    .refresh("fedora", Source::BaseUrl(base.into()))
+    .expect("group and generation reuse");
+    assert_eq!(reused, first);
+}
+
+#[test]
+fn group_download_or_checksum_failure_cannot_replace_the_current_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path());
+    let (old_repomd, old_primary, old_filelists) = metadata_fixture();
+    let base = "https://group-failure.example/fedora";
+    let old = Refresher::new(
+        FakeTransport::new([
+            (format!("{base}/repodata/repomd.xml"), old_repomd),
+            (format!("{base}/repodata/primary.xml.zst"), old_primary),
+            (format!("{base}/repodata/filelists.xml.zst"), old_filelists),
+        ]),
+        &cache,
+    )
+    .refresh("fedora", Source::BaseUrl(base.into()))
+    .expect("old generation");
+    let (repomd, primary, filelists, _) = metadata_with_group_fixture();
+    let failed = Refresher::new(
+        FakeTransport::new([
+            (format!("{base}/repodata/repomd.xml"), repomd),
+            (format!("{base}/repodata/primary.xml.zst"), primary),
+            (format!("{base}/repodata/filelists.xml.zst"), filelists),
+            (
+                format!("{base}/repodata/comps.xml.zst"),
+                b"checksum-mismatch".to_vec(),
+            ),
+        ]),
+        &cache,
+    )
+    .refresh("fedora", Source::BaseUrl(base.into()));
+    assert!(failed.is_err());
+    assert_eq!(
+        cache
+            .open_current_verified_complete_generation("fedora")
+            .expect("preserved generation")
+            .digest(),
+        old.digest
     );
 }
 

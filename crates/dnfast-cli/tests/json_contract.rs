@@ -5,9 +5,7 @@ use std::{
 };
 
 const UNSUPPORTED: &[&str] = &[
-    "group",
     "environment",
-    "module",
     "plugin",
     "copr",
     "system-upgrade",
@@ -100,7 +98,7 @@ fn json_global_flag_preserves_plan_v1_syntax_failure() {
 
 #[test]
 fn json_global_flag_preserves_unsupported_command_response() {
-    assert_json_flag_preserves_v1_response(&["group", "mutation"]);
+    assert_json_flag_preserves_v1_response(&["plugin", "mutation"]);
 }
 
 #[test]

@@ -110,7 +110,8 @@ fn validate_manifest(
     validate_retained_file(directory, &manifest.policy, owner)?;
     validate_repositories(directory, &manifest.repositories, owner)?;
     validate_selected_repository_bindings(&manifest.repositories, proposal)?;
-    if metadata_digest(&manifest.repositories)? != manifest.metadata_sha256
+    if metadata_digest(&manifest.repositories, manifest.schema_version >= 4)?
+        != manifest.metadata_sha256
         || manifest.metadata_sha256 != proposal.metadata_sha256().as_str()
     {
         return Err(inputs("metadata digest mismatch"));
@@ -159,8 +160,17 @@ fn validate_selected_repository_bindings(
 }
 
 fn validate_manifest_shape(manifest: &InputManifest) -> Result<(), ExecutorError> {
-    if manifest.schema_version != 3 || manifest.repositories.is_empty() {
+    if !matches!(manifest.schema_version, 3 | 4) || manifest.repositories.is_empty() {
         return Err(inputs("required input is absent"));
+    }
+    if manifest.schema_version == 3
+        && manifest.repositories.iter().any(|repository| {
+            repository.file_provides.is_some()
+                || repository.group.is_some()
+                || repository.modules.is_some()
+        })
+    {
+        return Err(inputs("version three input contains extended metadata"));
     }
     validate_repository_order(&manifest.repositories)?;
     if manifest
@@ -192,6 +202,15 @@ fn validate_repositories(
             &repository.filelists,
             &repository.trust.policy,
         ] {
+            validate_file(file)?;
+            validate_retained_file(directory, file, owner)?;
+        }
+        for file in repository
+            .file_provides
+            .iter()
+            .chain(repository.group.iter())
+            .chain(repository.modules.iter())
+        {
             validate_file(file)?;
             validate_retained_file(directory, file, owner)?;
         }
@@ -373,13 +392,8 @@ fn validate_descriptor_uniqueness(manifest: &InputManifest) -> Result<(), Execut
         .map(|file| &file.name)
         .collect::<BTreeSet<_>>();
     let expected = 1_usize
-        .checked_add(
-            manifest
-                .repositories
-                .len()
-                .checked_mul(4)
-                .ok_or_else(|| inputs("input count overflow"))?,
-        )
+        .checked_add(repository_files(&manifest.repositories).count())
+        .and_then(|count| count.checked_add(manifest.repositories.len()))
         .and_then(|count| {
             count.checked_add(
                 manifest
@@ -644,11 +658,12 @@ fn validate_repository_id(value: &str) -> Result<(), ExecutorError> {
 
 fn repository_files(repositories: &[InputRepository]) -> impl Iterator<Item = &InputFile> {
     repositories.iter().flat_map(|repository| {
-        [
-            &repository.repomd,
-            &repository.primary,
-            &repository.filelists,
-        ]
+        std::iter::once(&repository.repomd)
+            .chain(std::iter::once(&repository.primary))
+            .chain(std::iter::once(&repository.filelists))
+            .chain(repository.file_provides.iter())
+            .chain(repository.group.iter())
+            .chain(repository.modules.iter())
     })
 }
 
@@ -659,9 +674,16 @@ fn repository_trust_files(repositories: &[InputRepository]) -> impl Iterator<Ite
     })
 }
 
-fn metadata_digest(repositories: &[InputRepository]) -> Result<String, ExecutorError> {
+fn metadata_digest(
+    repositories: &[InputRepository],
+    extended: bool,
+) -> Result<String, ExecutorError> {
     let mut digest = Sha256::new();
-    digest.update(b"dnfast-root-metadata-v3");
+    digest.update(if extended {
+        b"dnfast-root-metadata-v4".as_slice()
+    } else {
+        b"dnfast-root-metadata-v3".as_slice()
+    });
     for repository in repositories {
         frame(&mut digest, &repository.id, repository.id.as_bytes())?;
         digest.update(repository.priority.to_be_bytes());
@@ -688,6 +710,19 @@ fn metadata_digest(repositories: &[InputRepository]) -> Result<String, ExecutorE
         ] {
             frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
             digest.update(file.size.to_be_bytes());
+        }
+        if extended {
+            for (role, file) in [
+                ("file-provides", repository.file_provides.as_ref()),
+                ("group", repository.group.as_ref()),
+                ("modules", repository.modules.as_ref()),
+            ] {
+                frame(&mut digest, role, role.as_bytes())?;
+                if let Some(file) = file {
+                    frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
+                    digest.update(file.size.to_be_bytes());
+                }
+            }
         }
     }
     Ok(format!("{:x}", digest.finalize()))
@@ -881,6 +916,9 @@ mod tests {
                 sha256: "d".repeat(64),
                 size: 1,
             },
+            file_provides: None,
+            group: None,
+            modules: None,
             trust: InputRepositoryTrust {
                 policy: InputFile {
                     name: format!("{id}-trust"),
@@ -927,6 +965,9 @@ mod tests {
                 sha256: "d".repeat(64),
                 size: 1,
             },
+            file_provides: None,
+            group: None,
+            modules: None,
             trust: InputRepositoryTrust {
                 policy: InputFile {
                     name: "fedora-trust".into(),
@@ -990,6 +1031,9 @@ mod tests {
                 sha256: "d".repeat(64),
                 size: 1,
             },
+            file_provides: None,
+            group: None,
+            modules: None,
             trust: InputRepositoryTrust {
                 policy: InputFile {
                     name: "fedora-trust".into(),
@@ -1086,6 +1130,9 @@ mod tests {
                 sha256: digest('d'),
                 size: 1,
             },
+            file_provides: None,
+            group: None,
+            modules: None,
             trust: InputRepositoryTrust {
                 policy: InputFile {
                     name: "fedora-trust".into(),

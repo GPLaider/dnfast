@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::PlanningError;
 
 const LEGACY_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
-const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+const EXTERNAL_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -56,6 +57,12 @@ pub struct PlanningRepository {
     pub repomd: PlanningBytes,
     pub primary: PlanningBytes,
     pub filelists: PlanningBytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_provides: Option<PlanningBytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<PlanningBytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modules: Option<PlanningBytes>,
     pub trust: RepoTrustPolicy,
     pub keys: Vec<PlanningKey>,
     pub repomd_authentication: RepomdAuthentication,
@@ -152,6 +159,10 @@ impl PlanningSnapshot {
         &self.refreshed_repository_ids
     }
 
+    pub fn materialize_payload(&self, payload: &PlanningBytes) -> Result<Vec<u8>, PlanningError> {
+        payload.decode_verified(self.storage())
+    }
+
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, PlanningError> {
         self.validate()?;
         let value = serde_json::to_value(self).map_err(json)?;
@@ -176,7 +187,7 @@ impl PlanningSnapshot {
             .map_err(domain)?;
         let inventory = self.payload.inventory.canonical_sha256().map_err(domain)?;
         let snapshot = self.digest()?;
-        let metadata = metadata_digest(&selected)?;
+        let metadata = metadata_digest(&selected, self.schema_version)?;
         let trust = trust_digest(&selected)?;
         let bindings = selected
             .into_iter()
@@ -229,7 +240,9 @@ impl PlanningSnapshot {
     fn validate(&self) -> Result<(), PlanningError> {
         if !matches!(
             self.schema_version,
-            LEGACY_SNAPSHOT_SCHEMA_VERSION | SNAPSHOT_SCHEMA_VERSION
+            LEGACY_SNAPSHOT_SCHEMA_VERSION
+                | EXTERNAL_SNAPSHOT_SCHEMA_VERSION
+                | SNAPSHOT_SCHEMA_VERSION
         ) {
             return Err(PlanningError::Input("unsupported snapshot schema".into()));
         }
@@ -430,11 +443,26 @@ fn validate_repository(
             "repository payload is not canonical".into(),
         ));
     }
+    if schema_version < SNAPSHOT_SCHEMA_VERSION
+        && (repository.file_provides.is_some()
+            || repository.group.is_some()
+            || repository.modules.is_some())
+    {
+        return Err(PlanningError::Input(
+            "legacy snapshot contains unbound extended metadata".into(),
+        ));
+    }
     for payload in [
         &repository.repomd,
         &repository.primary,
         &repository.filelists,
     ] {
+        payload.validate_shape(schema_version)?;
+    }
+    for payload in repository.group.iter().chain(repository.modules.iter()) {
+        payload.validate_shape(schema_version)?;
+    }
+    if let Some(payload) = &repository.file_provides {
         payload.validate_shape(schema_version)?;
     }
     if format!(
@@ -494,9 +522,16 @@ fn frame(digest: &mut Sha256, name: &str, bytes: &[u8]) -> Result<(), PlanningEr
     Ok(())
 }
 
-fn metadata_digest(repositories: &[&PlanningRepository]) -> Result<String, PlanningError> {
+fn metadata_digest(
+    repositories: &[&PlanningRepository],
+    schema_version: u32,
+) -> Result<String, PlanningError> {
     let mut digest = Sha256::new();
-    digest.update(b"dnfast-root-metadata-v3");
+    digest.update(if schema_version >= SNAPSHOT_SCHEMA_VERSION {
+        b"dnfast-root-metadata-v4".as_slice()
+    } else {
+        b"dnfast-root-metadata-v3".as_slice()
+    });
     for repository in repositories {
         frame(&mut digest, &repository.id, repository.id.as_bytes())?;
         digest.update(repository.priority.to_be_bytes());
@@ -520,6 +555,19 @@ fn metadata_digest(repositories: &[&PlanningRepository]) -> Result<String, Plann
         ] {
             frame(&mut digest, &bytes.sha256, bytes.sha256.as_bytes())?;
             digest.update(bytes.size.to_be_bytes());
+        }
+        if schema_version >= SNAPSHOT_SCHEMA_VERSION {
+            for (role, bytes) in [
+                ("file-provides", repository.file_provides.as_ref()),
+                ("group", repository.group.as_ref()),
+                ("modules", repository.modules.as_ref()),
+            ] {
+                frame(&mut digest, role, role.as_bytes())?;
+                if let Some(bytes) = bytes {
+                    frame(&mut digest, &bytes.sha256, bytes.sha256.as_bytes())?;
+                    digest.update(bytes.size.to_be_bytes());
+                }
+            }
         }
     }
     Ok(format!("{:x}", digest.finalize()))

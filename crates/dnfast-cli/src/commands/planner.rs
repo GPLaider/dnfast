@@ -386,6 +386,9 @@ mod tests {
             repomd: planning_bytes(&repomd),
             primary: planning_bytes(&primary),
             filelists: planning_bytes(&filelists),
+            file_provides: None,
+            group: None,
+            modules: None,
             trust,
             keys: vec![PlanningKey {
                 bundle_path: bundle_path.into(),

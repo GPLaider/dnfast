@@ -12,6 +12,10 @@ dnfast repo list
 sudo dnfast repo refresh --repo fedora
 sudo dnfast repo makecache --repo fedora
 sudo dnfast search bash
+dnfast group list
+dnfast group info development-tools
+sudo dnfast group install development-tools --assumeno
+dnfast module list
 sudo dnfast plan install bash --output /var/lib/dnfast/bash-plan.json
 sudo dnfast apply /var/lib/dnfast/bash-plan.json --assumeyes
 sudo dnfast install bash --assumeyes
@@ -39,8 +43,11 @@ benchmarking the resident path. `dnfast daemon status` reports protocol readines
 `dnfast daemon warm` loads the exact selected repository generation outside a timed mutation.
 
 The daemon caches only an exact canonical intent for the unchanged planning generation and RPMDB
-cookie. Package selectors containing an absolute path deliberately leave the primary-only
-resident pool and use the full filelists-bound fixed planner.
+cookie. Its libsolv pool stays primary-only. During refresh, verified filelists are streamed into
+a checksum-bound compact path-to-package index (256 logical buckets stored in 16 physical shards).
+An absolute-path selector reads only its one physical shard, maps the path to package ordinals,
+and adds one native `ONE_OF` selector to the resident solve. The solve never opens full filelists,
+and the plan preserves the user's original absolute-path intent.
 
 `repo makecache` obeys the trusted `metadata_expire` policy. Both `makecache` and explicit
 `refresh` still fetch current `repomd.xml`; reuse is allowed only when its exact digest matches the
@@ -48,8 +55,13 @@ published generation and every immutable metadata/index object has been rehashed
 `history list` and `history info` report dnfast's verified durable transaction journal; they do not
 import or claim compatibility with DNF5 history.
 
-Group, environment, module, plugin, COPR, system-upgrade, offline, autoremove, downgrade,
-reinstall, distro-sync, and advisory commands are not implemented and fail closed.
+Checksum-bound comps group/environment list, info, and install are implemented. Group install
+selects mandatory/default packages, conditionals whose requirements are selected or installed,
+and optional packages/groups only with `--with-optional`. Module commands expose an explicit
+fail-closed boundary: repositories without module metadata list no streams, while the presence of
+modulemd is rejected because this build does not yet interpret module stream policy safely.
+Plugin, COPR, system-upgrade, offline, group removal, autoremove, downgrade, reinstall,
+distro-sync, and advisory commands are not implemented and fail closed.
 `dnfast` does not claim DNF5 policy or state compatibility.
 
 ## Native build and test

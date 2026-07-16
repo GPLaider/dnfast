@@ -7,6 +7,58 @@ use crate::{
 };
 use dnfast_core::PackageSpec;
 
+#[derive(Clone, Copy)]
+enum PackageEvidenceRef<'a> {
+    Complete(&'a dnfast_metadata::CompletePackage),
+    Compact(&'a crate::NativePackageEvidence),
+}
+
+#[derive(Clone, Copy)]
+enum RelationEvidenceRef<'a> {
+    Complete(&'a [dnfast_metadata::Relation]),
+    Compact(&'a [String]),
+}
+
+impl<'a> PackageEvidenceRef<'a> {
+    fn nevra(self) -> String {
+        match self {
+            Self::Complete(package) => complete_nevra(package),
+            Self::Compact(package) => format!(
+                "{}-{}:{}-{}.{}",
+                package.name, package.epoch, package.version, package.release, package.arch
+            ),
+        }
+    }
+
+    fn requires(self) -> RelationEvidenceRef<'a> {
+        match self {
+            Self::Complete(package) => RelationEvidenceRef::Complete(&package.requires),
+            Self::Compact(package) => RelationEvidenceRef::Compact(&package.requires),
+        }
+    }
+
+    fn recommends(self) -> RelationEvidenceRef<'a> {
+        match self {
+            Self::Complete(package) => RelationEvidenceRef::Complete(&package.recommends),
+            Self::Compact(package) => RelationEvidenceRef::Compact(&package.recommends),
+        }
+    }
+
+    fn supplements(self) -> RelationEvidenceRef<'a> {
+        match self {
+            Self::Complete(package) => RelationEvidenceRef::Complete(&package.supplements),
+            Self::Compact(package) => RelationEvidenceRef::Compact(&package.supplements),
+        }
+    }
+
+    fn enhances(self) -> RelationEvidenceRef<'a> {
+        match self {
+            Self::Complete(package) => RelationEvidenceRef::Complete(&package.enhances),
+            Self::Compact(package) => RelationEvidenceRef::Compact(&package.enhances),
+        }
+    }
+}
+
 type ResolvedIdentity = (
     ResolvedOperation,
     String,
@@ -59,6 +111,32 @@ impl NativeSolveOutput {
         metadata: &[(&str, &dnfast_metadata::CompletePackage)],
         inventory: &dnfast_core::InstalledInventory,
     ) -> Result<Self, PlanError> {
+        let metadata = metadata
+            .iter()
+            .map(|(repository, package)| (*repository, PackageEvidenceRef::Complete(package)))
+            .collect::<Vec<_>>();
+        Self::from_native_evidence(result, source_transcript_sha256, &metadata, inventory)
+    }
+
+    pub fn from_native_compact(
+        result: dnfast_native::SolveResult,
+        source_transcript_sha256: String,
+        metadata: &[(&str, &crate::NativePackageEvidence)],
+        inventory: &dnfast_core::InstalledInventory,
+    ) -> Result<Self, PlanError> {
+        let metadata = metadata
+            .iter()
+            .map(|(repository, package)| (*repository, PackageEvidenceRef::Compact(package)))
+            .collect::<Vec<_>>();
+        Self::from_native_evidence(result, source_transcript_sha256, &metadata, inventory)
+    }
+
+    fn from_native_evidence(
+        result: dnfast_native::SolveResult,
+        source_transcript_sha256: String,
+        metadata: &[(&str, PackageEvidenceRef<'_>)],
+        inventory: &dnfast_core::InstalledInventory,
+    ) -> Result<Self, PlanError> {
         if result.actions.len() != result.repositories.len()
             || result.actions.len() != result.kinds.len()
             || result.actions.len() != result.obsoletes.len()
@@ -78,7 +156,7 @@ impl NativeSolveOutput {
             metadata_index
                 .entry(*repository)
                 .or_default()
-                .insert(complete_nevra(package), *package);
+                .insert(package.nevra(), *package);
         }
         let raw = result
             .actions
@@ -189,6 +267,34 @@ impl NativeSolveOutput {
         requested: &[&str],
         candidates: &[CandidatePackage],
         metadata: &[(&str, &dnfast_metadata::CompletePackage)],
+        inventory: &dnfast_core::InstalledInventory,
+    ) -> Result<Vec<ResolvedAction>, PlanError> {
+        let metadata = metadata
+            .iter()
+            .map(|(repository, package)| (*repository, PackageEvidenceRef::Complete(package)))
+            .collect::<Vec<_>>();
+        self.into_resolved_evidence(requested, candidates, &metadata, inventory)
+    }
+
+    pub fn into_resolved_compact(
+        self,
+        requested: &[&str],
+        candidates: &[CandidatePackage],
+        metadata: &[(&str, &crate::NativePackageEvidence)],
+        inventory: &dnfast_core::InstalledInventory,
+    ) -> Result<Vec<ResolvedAction>, PlanError> {
+        let metadata = metadata
+            .iter()
+            .map(|(repository, package)| (*repository, PackageEvidenceRef::Compact(package)))
+            .collect::<Vec<_>>();
+        self.into_resolved_evidence(requested, candidates, &metadata, inventory)
+    }
+
+    fn into_resolved_evidence(
+        self,
+        requested: &[&str],
+        candidates: &[CandidatePackage],
+        metadata: &[(&str, PackageEvidenceRef<'_>)],
         inventory: &dnfast_core::InstalledInventory,
     ) -> Result<Vec<ResolvedAction>, PlanError> {
         if self.source_transcript_sha256.len() != 64
@@ -314,7 +420,7 @@ impl NativeSolveOutput {
     fn validate_decisions(
         &self,
         actions: &BTreeSet<(&str, &str)>,
-        metadata: &[(&str, &dnfast_metadata::CompletePackage)],
+        metadata: &[(&str, PackageEvidenceRef<'_>)],
         inventory: &dnfast_core::InstalledInventory,
     ) -> Result<(), PlanError> {
         let mut metadata_index = HashMap::<&str, HashMap<String, _>>::new();
@@ -322,7 +428,7 @@ impl NativeSolveOutput {
             metadata_index
                 .entry(*repository)
                 .or_default()
-                .insert(complete_nevra(package), *package);
+                .insert(package.nevra(), *package);
         }
         for decision in &self.decisions {
             if !actions.contains(&(
@@ -383,41 +489,106 @@ impl NativeSolveOutput {
 }
 
 fn decision_requirement(
-    requiring: &dnfast_metadata::CompletePackage,
-    provider: Option<&dnfast_metadata::CompletePackage>,
+    requiring: PackageEvidenceRef<'_>,
+    provider: Option<PackageEvidenceRef<'_>>,
     weak: bool,
     relation: &str,
 ) -> Result<dnfast_metadata::Relation, PlanError> {
     let direct = if weak {
-        &requiring.recommends
+        requiring.recommends()
     } else {
-        &requiring.requires
+        requiring.requires()
     };
-    let mut direct_matches = direct.iter().filter(|item| relation_text(item) == relation);
-    if let Some(found) = direct_matches.next() {
-        if direct_matches.next().is_some() {
-            return Err(PlanError::Invalid("native relation is ambiguous in rpm-md"));
-        }
-        return Ok(found.clone());
+    if let Some(found) = matching_relation(direct, relation)? {
+        return Ok(found);
     }
     if weak {
         if let Some(provider) = provider {
-            let mut reverse_matches = provider
-                .supplements
-                .iter()
-                .chain(&provider.enhances)
-                .filter(|item| relation_text(item) == relation);
-            if let Some(found) = reverse_matches.next() {
-                if reverse_matches.next().is_some() {
+            let supplement = matching_relation(provider.supplements(), relation)?;
+            let enhance = matching_relation(provider.enhances(), relation)?;
+            match (supplement, enhance) {
+                (Some(found), None) | (None, Some(found)) => return Ok(found),
+                (Some(_), Some(_)) => {
                     return Err(PlanError::Invalid(
                         "native reverse relation is ambiguous in rpm-md",
                     ));
                 }
-                return Ok(found.clone());
+                (None, None) => {}
             }
         }
     }
     Err(PlanError::Invalid("native relation absent from rpm-md"))
+}
+
+fn matching_relation(
+    evidence: RelationEvidenceRef<'_>,
+    relation: &str,
+) -> Result<Option<dnfast_metadata::Relation>, PlanError> {
+    let mut found = None;
+    match evidence {
+        RelationEvidenceRef::Complete(items) => {
+            for item in items.iter().filter(|item| relation_text(item) == relation) {
+                if found.replace(item.clone()).is_some() {
+                    return Err(PlanError::Invalid("native relation is ambiguous in rpm-md"));
+                }
+            }
+        }
+        RelationEvidenceRef::Compact(items) => {
+            for item in items.iter().filter(|item| item.as_str() == relation) {
+                if found.replace(parse_compact_relation(item)?).is_some() {
+                    return Err(PlanError::Invalid("native relation is ambiguous in rpm-md"));
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn parse_compact_relation(value: &str) -> Result<dnfast_metadata::Relation, PlanError> {
+    let operators = [
+        (" <= ", dnfast_metadata::RelationFlags::LessEqual),
+        (" >= ", dnfast_metadata::RelationFlags::GreaterEqual),
+        (" = ", dnfast_metadata::RelationFlags::Equal),
+        (" < ", dnfast_metadata::RelationFlags::Less),
+        (" > ", dnfast_metadata::RelationFlags::Greater),
+    ];
+    let Some((name, evr, flags)) = operators.iter().find_map(|(separator, flags)| {
+        value
+            .split_once(separator)
+            .map(|(name, evr)| (name, evr, *flags))
+    }) else {
+        return if value.is_empty() {
+            Err(PlanError::Invalid("empty compact rpm-md relation"))
+        } else {
+            Ok(dnfast_metadata::Relation {
+                name: value.into(),
+                flags: None,
+                epoch: None,
+                version: None,
+                release: None,
+                pre: false,
+            })
+        };
+    };
+    if name.is_empty() {
+        return Err(PlanError::Invalid("empty compact rpm-md relation name"));
+    }
+    let (epoch, version_release) = evr
+        .split_once(':')
+        .map_or((None, evr), |(epoch, rest)| (Some(epoch.into()), rest));
+    let (version, release) = version_release
+        .rsplit_once('-')
+        .map_or((version_release, None), |(version, release)| {
+            (version, Some(release.into()))
+        });
+    Ok(dnfast_metadata::Relation {
+        name: name.into(),
+        flags: Some(flags),
+        epoch,
+        version: Some(version.into()),
+        release,
+        pre: false,
+    })
 }
 
 fn action_identity(
@@ -641,10 +812,25 @@ fn nevra_name(value: &str) -> Result<String, PlanError> {
 
 #[cfg(test)]
 mod tests {
-    use super::arch;
+    use super::{arch, parse_compact_relation, relation_text};
 
     #[test]
     fn x86_64_native_solver_architecture_is_not_aarch64() {
         assert_eq!(arch(dnfast_core::Architecture::X86_64), "x86_64");
+    }
+
+    #[test]
+    fn compact_rpm_md_relations_round_trip_native_text() {
+        for value in [
+            "libc.so.6()(64bit)",
+            "rpmlib(CompressedFileNames) <= 3.0.4-1",
+            "example = 2:1.4.0-3.fc44",
+            "feature(foo) >= 9",
+        ] {
+            let parsed = parse_compact_relation(value).expect("valid compact relation");
+            assert_eq!(relation_text(&parsed), value);
+        }
+        assert!(parse_compact_relation("").is_err());
+        assert!(parse_compact_relation(" = 1").is_err());
     }
 }

@@ -17,6 +17,71 @@ pub struct CandidatePackage {
     pub modular: bool,
 }
 
+/// The minimal rpm-md evidence retained beside a resident libsolv pool.
+///
+/// libsolv owns the complete dependency graph after repository loading.  The
+/// Rust adapter keeps this independent subset so every causal decision can
+/// still be checked against the checksum-bound rpm-md generation without
+/// retaining descriptions, provides, conflicts, file lists, and other fields
+/// that are not used by decision validation.
+#[derive(Debug)]
+pub struct NativePackageEvidence {
+    pub(crate) name: String,
+    pub(crate) arch: String,
+    pub(crate) epoch: String,
+    pub(crate) version: String,
+    pub(crate) release: String,
+    pub(crate) requires: Vec<String>,
+    pub(crate) recommends: Vec<String>,
+    pub(crate) supplements: Vec<String>,
+    pub(crate) enhances: Vec<String>,
+}
+
+impl NativePackageEvidence {
+    pub fn from_complete(package: dnfast_metadata::CompletePackage) -> Self {
+        Self {
+            name: package.name,
+            arch: package.arch,
+            epoch: package.epoch,
+            version: package.version,
+            release: package.release,
+            requires: package.requires.iter().map(compact_relation).collect(),
+            recommends: package.recommends.iter().map(compact_relation).collect(),
+            supplements: package.supplements.iter().map(compact_relation).collect(),
+            enhances: package.enhances.iter().map(compact_relation).collect(),
+        }
+    }
+}
+
+fn compact_relation(item: &dnfast_metadata::Relation) -> String {
+    let Some(flags) = item.flags else {
+        return item.name.clone();
+    };
+    let operator = match flags {
+        dnfast_metadata::RelationFlags::Equal => "=",
+        dnfast_metadata::RelationFlags::Less => "<",
+        dnfast_metadata::RelationFlags::LessEqual => "<=",
+        dnfast_metadata::RelationFlags::Greater => ">",
+        dnfast_metadata::RelationFlags::GreaterEqual => ">=",
+    };
+    let epoch = item
+        .epoch
+        .as_deref()
+        .filter(|value| *value != "0")
+        .map(|value| format!("{value}:"))
+        .unwrap_or_default();
+    let release = item
+        .release
+        .as_deref()
+        .map(|value| format!("-{value}"))
+        .unwrap_or_default();
+    format!(
+        "{} {operator} {epoch}{}{release}",
+        item.name,
+        item.version.as_deref().unwrap_or_default()
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ResolvedOperation {
     Install,

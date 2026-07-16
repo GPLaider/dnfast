@@ -19,7 +19,7 @@ mod root_state;
 #[cfg(test)]
 mod tests;
 
-use prepared_generation::{InputDraft, metadata_digest, trust_digest};
+use prepared_generation::{InputDraft, metadata_digest_v4, trust_digest};
 use root_state::{
     current_snapshot, revalidate_snapshot_and_inventory, selected_ids, selected_repositories,
 };
@@ -188,8 +188,13 @@ fn prepare_into_draft(
         let materialized = draft.write_repository(snapshot, repository, index)?;
         let mut repomd = draft.open(&materialized.input.repomd)?;
         let mut primary = draft.open(&materialized.input.primary)?;
-        let parsed =
-            parse_candidates(&materialized.input, &mut repomd, &mut primary).map_err(inputs)?;
+        let parsed = parse_candidates(
+            &materialized.input,
+            &mut repomd,
+            &mut primary,
+            policy.base_arch(),
+        )
+        .map_err(inputs)?;
         candidates.extend(parsed.0);
         metadata.extend(parsed.1);
         if let Some((context, _)) = &mut context {
@@ -261,9 +266,9 @@ fn prepare_into_draft(
     let policy_file =
         draft.write_bytes("policy.json", &policy.to_canonical_json().map_err(domain)?)?;
     let manifest = InputManifest {
-        schema_version: 3,
+        schema_version: 4,
         policy: policy_file,
-        metadata_sha256: metadata_digest(&repository_inputs)?,
+        metadata_sha256: metadata_digest_v4(&repository_inputs)?,
         trust_sha256: trust_digest(&repository_inputs)?,
         repositories: repository_inputs,
         artifacts,

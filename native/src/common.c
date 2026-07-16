@@ -14,6 +14,9 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #ifdef DNFAST_NATIVE_REAL
 _Static_assert(LIBSOLV_VERSION_MAJOR == 0 && LIBSOLV_VERSION_MINOR == 7 &&
@@ -42,6 +45,12 @@ static char *dnfast_copy(const char *value) {
         memcpy(copy, value == NULL ? "" : value, length + 1);
     }
     return copy;
+}
+
+void dnfast_release_unused_memory(void) {
+#ifdef __GLIBC__
+    (void)malloc_trim(0);
+#endif
 }
 
 dnfast_status dnfast_set_error(dnfast_error *error, dnfast_status status,
@@ -125,7 +134,9 @@ dnfast_status dnfast_load_libraries(dnfast_library libraries[4],
         {0, "transaction_obs_pkg"},
         {0, "solver_get_decisionlevel"}, {0, "solvable_lookup_deparray"},
         {0, "pool_dep2str"}, {0, "pool_addrelproviders"}, {0, "pool_id2str"},
-        {0, "pool_createwhatprovides"}, {0, "pool_setarch"},
+        {0, "pool_addfileprovides"}, {0, "pool_createwhatprovides"},
+        {0, "pool_queuetowhatprovides"},
+        {0, "pool_setarch"},
         {0, "pool_solvable2str"},
         {0, "pool_set_rootdir"}, {0, "pool_set_installed"},
         {0, "repo_create"}, {0, "repo_free"},

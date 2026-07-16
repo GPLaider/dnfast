@@ -15,6 +15,50 @@ use crate::{
 };
 use crate::{MAX_PRIMARY_OPEN_BYTES, MetadataError, MetadataRecord, PrimaryRecord};
 
+pub fn decode_auxiliary(
+    bytes: &[u8],
+    record: &crate::AuxiliaryRecord,
+    maximum_open_bytes: u64,
+) -> Result<Vec<u8>, MetadataError> {
+    if bytes.len() as u64 != record.size {
+        return Err(MetadataError::SizeMismatch {
+            expected: record.size,
+            actual: bytes.len() as u64,
+        });
+    }
+    if hex::encode(Sha256::digest(bytes)) != record.checksum {
+        return Err(MetadataError::ChecksumMismatch);
+    }
+    let read_limit = maximum_open_bytes
+        .checked_add(1)
+        .ok_or_else(|| MetadataError::InvalidNumber(maximum_open_bytes.to_string()))?;
+    let mut output = Vec::new();
+    match encoding(bytes) {
+        MetadataEncoding::Zstd => {
+            zstd::stream::read::Decoder::new(bytes)
+                .map_err(|error| MetadataError::Io(error.to_string()))?
+                .take(read_limit)
+                .read_to_end(&mut output)
+                .map_err(|error| MetadataError::Io(error.to_string()))?;
+        }
+        MetadataEncoding::Gzip => {
+            GzDecoder::new(bytes)
+                .take(read_limit)
+                .read_to_end(&mut output)
+                .map_err(|error| MetadataError::Io(error.to_string()))?;
+        }
+        MetadataEncoding::Xml => output.extend_from_slice(bytes),
+    }
+    if output.len() as u64 > maximum_open_bytes {
+        return Err(MetadataError::LimitExceeded {
+            kind: "opened auxiliary metadata",
+            maximum: maximum_open_bytes,
+            actual: output.len() as u64,
+        });
+    }
+    Ok(output)
+}
+
 pub fn verify_compressed(bytes: &[u8], record: &PrimaryRecord) -> Result<(), MetadataError> {
     if bytes.len() as u64 != record.size {
         return Err(MetadataError::SizeMismatch {
@@ -115,6 +159,19 @@ pub fn validate_filelists_record_identities<R: Read>(
     primary: &[PrimaryPackageIdentity],
 ) -> Result<(), MetadataError> {
     validate_filelists_xml_identities(verified_filelists_reader(input, record)?, primary)
+}
+
+pub fn visit_filelists_record_identities<R: Read>(
+    input: R,
+    record: &MetadataRecord,
+    primary: &[PrimaryPackageIdentity],
+    mut visitor: impl FnMut(&str, &str) -> Result<(), MetadataError>,
+) -> Result<(), MetadataError> {
+    crate::filelists::visit_filelists_xml_identities(
+        verified_filelists_reader(input, record)?,
+        primary,
+        &mut visitor,
+    )
 }
 
 fn verified_filelists_reader<'a, R: Read + 'a>(

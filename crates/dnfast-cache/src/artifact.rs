@@ -77,7 +77,17 @@ impl ArtifactSpec {
         if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ArtifactError::Policy("unsupported SHA-256 digest".into()));
         }
-        let url = selected
+        // `Url::join` treats a base without a trailing slash as a file and
+        // replaces its final path segment. Selected rpm-md origins are bound
+        // as `<repository>/repodata/repomd.xml`, so the derived repository
+        // base intentionally has no trailing slash. Make the directory
+        // semantics explicit before resolving a package location.
+        let mut directory = selected.clone();
+        if !directory.path().ends_with('/') {
+            let path = format!("{}/", directory.path());
+            directory.set_path(&path);
+        }
+        let url = directory
             .join(location)
             .map_err(|error| ArtifactError::Policy(error.to_string()))?;
         if origin(&url) != origin(&selected) {

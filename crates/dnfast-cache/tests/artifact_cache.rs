@@ -7,7 +7,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     io::{Cursor, Read, Seek},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -17,6 +17,21 @@ struct BytesTransport<'a> {
     bytes: &'a [u8],
     calls: AtomicUsize,
     status: u16,
+}
+
+struct RecordingTransport<'a> {
+    bytes: &'a [u8],
+    url: Mutex<Option<String>>,
+}
+
+impl ArtifactTransport for RecordingTransport<'_> {
+    fn open(&self, url: &str) -> Result<ArtifactResponse, ArtifactError> {
+        *self.url.lock().unwrap() = Some(url.into());
+        Ok(ArtifactResponse {
+            status: 200,
+            body: Box::new(Cursor::new(self.bytes.to_vec())),
+        })
+    }
 }
 impl ArtifactTransport for BytesTransport<'_> {
     fn open(&self, _url: &str) -> Result<ArtifactResponse, ArtifactError> {
@@ -289,6 +304,31 @@ fn rejects_cross_origin_and_unsafe_locations() {
     assert!(
         ArtifactSpec::from_selected_mirror("https://mirror.example/repo/", "p.rpm", digest, 1)
             .is_ok()
+    );
+}
+
+#[test]
+fn selected_mirror_without_trailing_slash_retains_final_directory() {
+    // Given
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = b"rpm";
+    let spec = ArtifactSpec::from_selected_mirror(
+        "https://mirror.example/repo/os",
+        "Packages/p.rpm",
+        Digest::Sha256(digest(bytes)),
+        bytes.len() as u64,
+    )
+    .unwrap();
+    let transport = RecordingTransport {
+        bytes,
+        url: Mutex::new(None),
+    };
+    // When
+    fetch_one(&ArtifactCache::new(temp.path()), &spec, &transport).unwrap();
+    // Then
+    assert_eq!(
+        transport.url.lock().unwrap().as_deref(),
+        Some("https://mirror.example/repo/os/Packages/p.rpm")
     );
 }
 

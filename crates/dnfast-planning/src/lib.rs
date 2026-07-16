@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 #![deny(warnings)]
 
+mod auxiliary;
 mod error;
+mod file_provides;
 mod fs;
 mod model;
 mod native_xml;
@@ -141,6 +143,9 @@ mod tests {
                 repomd: bytes(&repomd),
                 primary: bytes(&primary),
                 filelists: bytes(&filelists),
+                file_provides: None,
+                group: None,
+                modules: None,
                 trust,
                 keys: vec![PlanningKey {
                     bundle_path: bundle_path.into(),
@@ -165,6 +170,70 @@ mod tests {
             }],
         };
         let snapshot = PlanningSnapshot::new(7, payload).expect("snapshot");
+        let mut schema4_value: serde_json::Value =
+            serde_json::from_slice(&snapshot.canonical_bytes().expect("schema 5 bytes"))
+                .expect("snapshot JSON");
+        schema4_value["schema_version"] = 4.into();
+        let schema4 = PlanningSnapshot::from_canonical_bytes(
+            &serde_json::to_vec(&schema4_value).expect("schema 4 bytes"),
+        )
+        .expect("schema 4 compatibility");
+        schema4_value["schema_version"] = 3.into();
+        let schema3 = PlanningSnapshot::from_canonical_bytes(
+            &serde_json::to_vec(&schema4_value).expect("schema 3 bytes"),
+        )
+        .expect("schema 3 compatibility");
+        assert_eq!(
+            schema3
+                .integrity_for_repositories(&[])
+                .expect("schema 3 integrity")
+                .metadata_sha256(),
+            schema4
+                .integrity_for_repositories(&[])
+                .expect("schema 4 integrity")
+                .metadata_sha256()
+        );
+        schema4_value["schema_version"] = 4.into();
+        schema4_value["payload"]["allowed_repositories"][0]["group"] =
+            serde_json::to_value(bytes(b"unbound legacy group")).expect("group descriptor");
+        assert!(
+            PlanningSnapshot::from_canonical_bytes(
+                &serde_json::to_vec(&schema4_value).expect("extended schema 4 bytes")
+            )
+            .is_err()
+        );
+
+        let mut group_payload = snapshot.payload().clone();
+        group_payload.allowed_repositories[0].group = Some(bytes(b"group payload"));
+        let group_snapshot = PlanningSnapshot::new(7, group_payload).expect("group snapshot");
+        assert_ne!(
+            snapshot
+                .integrity_for_repositories(&[])
+                .expect("without group")
+                .metadata_sha256(),
+            group_snapshot
+                .integrity_for_repositories(&[])
+                .expect("with group")
+                .metadata_sha256()
+        );
+        let mut tampered_group_payload = group_snapshot.payload().clone();
+        tampered_group_payload.allowed_repositories[0]
+            .group
+            .as_mut()
+            .expect("group descriptor")
+            .sha256 = "f".repeat(64);
+        let tampered_group =
+            PlanningSnapshot::new(7, tampered_group_payload).expect("bound tamper descriptor");
+        assert!(
+            tampered_group
+                .materialize_payload(
+                    tampered_group.payload().allowed_repositories[0]
+                        .group
+                        .as_ref()
+                        .expect("tampered group")
+                )
+                .is_err()
+        );
         let mut unsigned_required_payload = snapshot.payload().clone();
         unsigned_required_payload.configuration[0].repo_gpgcheck = true;
         assert!(PlanningSnapshot::new(7, unsigned_required_payload.clone()).is_err());

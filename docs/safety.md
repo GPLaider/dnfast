@@ -4,8 +4,11 @@
 
 Read-only `repo list`, `search`, `doctor`, and `plan` do not change RPMDB state. `plan` may run as
 an unprivileged user when it can read the root-published snapshots and write the requested output
-path. `repo refresh`, `apply`, `install`, `remove`, and `upgrade` require root because they publish
-system state or can change packages. Unsupported commands fail closed with exit code 2.
+path. Comps `group list` and `group info` are also read-only. `repo refresh`, `apply`, `install`,
+`remove`, `upgrade`, and `group install` require root because they publish system state or can
+change packages. Modulemd interpretation is not implemented: absence is reported exactly and
+present module metadata fails closed before module state can change. Unsupported commands fail
+closed.
 
 A valid plan is a solved proposal, not proof that a later transaction must succeed. It is bound to
 the exact repository snapshots, root-published policy, RPMDB inventory, action graph, artifacts,
@@ -38,11 +41,13 @@ Implementation ceilings are 2 MiB for Metalink, 16 MiB for repomd, 512 MiB for c
 metadata, 1 GiB for opened metadata, 32 Metalink resources, and 2,000,000 packages. Arithmetic is
 overflow checked and declared oversize input fails before download or allocation.
 
-Schema-v4 planning snapshots refer to content-addressed payloads instead of embedding base64.
+Schema-v5 planning snapshots refer to content-addressed payloads instead of embedding base64 and
+bind optional comps/module payloads plus the compact file-provides index into each repository.
 Materialization is permitted only for a snapshot read from its trusted, root-owned planning store;
 each blob is opened beneath that store without following an attacker-selected path and its exact
 size and SHA-256 are checked. The executor stages both compressed evidence and decoded native XML
-from that one validated result. Legacy schema-v3 embedded payloads remain read-only compatible.
+from that one validated result. Legacy schema-v3/v4 snapshots remain compatible only within their
+original, narrower authenticated field set; extended fields on an older schema are rejected.
 
 ## Configuration, package, and key trust
 
@@ -63,6 +68,13 @@ keyring, and dnfast checks package NEVRA, architecture, vendor, and authorized s
 the artifact to the transaction. Merely naming a downloaded key in repository configuration never
 authorizes it.
 
+The five-minute limit applies to prepared plans and tokens. A repository snapshot's
+`valid_at_unix` records when its immutable trust evidence was published; it is not itself a
+five-minute cache expiry. Older staged certificates are accepted for execution only after the
+root-owned system configuration, key bundle, immutable cache objects, planning pointer, and RPMDB
+binding have all been revalidated against that snapshot. A timestamp more than five minutes in
+the future is always rejected.
+
 ## Execution and recovery
 
 The resident socket directory is root-owned mode 0700, the socket is mode 0600, frames are bounded,
@@ -76,9 +88,12 @@ not fall back to another execution path.
 The resident solve cache is an optimization of that same proof, not a second authority. A hit
 requires the identical canonical intent, repository selection, planning generation, and RPMDB
 cookie and produces a newly sequence-bound prepared token. The pool omits filelists to reduce the
-normal working set; an absolute-path selector gets an explicit non-authorizing fallback response
-and is solved by the snapshot-bound full planner. Integrity or protocol errors never trigger this
-fallback.
+normal working set. Refresh streams verified filelists into a snapshot-bound compact index with
+256 logical buckets stored in 16 physical shards. An absolute-path selector opens and rehashes one
+physical shard, maps the path to package ordinals, and submits one native `ONE_OF` selection to the
+resident primary-only pool. A missing path, empty candidate set, malformed index, or digest
+mismatch fails closed; full filelists are never opened during solve. Integrity or protocol errors
+never trigger a compatibility fallback.
 
 The compatibility fallback can launch only `/usr/libexec/dnfast-executor` with a retained plan
 descriptor and a fixed argument shape. Both paths require root, reject ambient path substitution,

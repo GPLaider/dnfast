@@ -127,6 +127,25 @@ dnfast_status dnfast_solver_add_repo_primary(dnfast_context *context,
     return add_repo_kind(context, input, 0, error);
 }
 
+dnfast_status dnfast_solver_prepare(dnfast_context *context,
+                                    dnfast_error *error) {
+    dnfast_status status = owner_check(context, error);
+    if (status != DNFAST_STATUS_OK) return status;
+    status = dnfast_callback_check(&context->callbacks, error);
+    if (status != DNFAST_STATUS_OK) return status;
+#ifdef DNFAST_NATIVE_REAL
+    if (context->pool->whatprovides == NULL) {
+        pool_addfileprovides(context->pool);
+        pool_createwhatprovides(context->pool);
+    }
+    return DNFAST_STATUS_OK;
+#else
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "solv", "pool_createwhatprovides",
+                            "real native build disabled");
+#endif
+}
+
 #ifdef DNFAST_NATIVE_REAL
 static dnfast_status copy_problems(dnfast_context *context, dnfast_error *error) {
     Id count = solver_problem_count(context->solver);
@@ -319,6 +338,8 @@ static dnfast_status copy_selector_provenance(dnfast_context *context,
 
 static dnfast_status solve_operation(dnfast_context *context,
                                      const dnfast_solve_request *request,
+                                     const dnfast_selector_providers *mapped,
+                                     size_t mapped_count,
                                      uint8_t operation,
                                      dnfast_error *error) {
     dnfast_status status = owner_check(context, error);
@@ -327,7 +348,8 @@ static dnfast_status solve_operation(dnfast_context *context,
     if (status != DNFAST_STATUS_OK) return status;
     if (request == NULL || request->abi_version != DNFAST_NATIVE_ABI_VERSION || operation > 2 ||
         (request->name_count == 0 && operation != 2) ||
-        (request->name_count != 0 && request->names == NULL))
+        (request->name_count != 0 && request->names == NULL) ||
+        (mapped_count != 0 && mapped == NULL))
         return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
                                 "solver", NULL, "invalid solve request");
     dnfast_solver_clear(context);
@@ -336,7 +358,10 @@ static dnfast_status solve_operation(dnfast_context *context,
     Queue *selectors;
     uint8_t *selector_relation_kinds;
     queue_init(&job);
-    pool_createwhatprovides(context->pool);
+    if (context->pool->whatprovides == NULL) {
+        pool_addfileprovides(context->pool);
+        pool_createwhatprovides(context->pool);
+    }
     selectors = request->name_count == 0 ? NULL : calloc(request->name_count, sizeof(Queue));
     selector_relation_kinds = request->name_count == 0 ? NULL : calloc(request->name_count, sizeof(uint8_t));
     if (request->name_count != 0 && (selectors == NULL || selector_relation_kinds == NULL)) {
@@ -351,6 +376,132 @@ static dnfast_status solve_operation(dnfast_context *context,
                     (request->best ? SOLVER_FORCEBEST : 0), 0);
     for (size_t name_index = 0; name_index < request->name_count; ++name_index) {
         int start = job.count;
+        const dnfast_selector_providers *mapping = NULL;
+        for (size_t mapped_index = 0; mapped_index < mapped_count; ++mapped_index) {
+            if (mapped[mapped_index].selector_index == name_index) {
+                if (mapping != NULL) {
+                    status = dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                              "solver", NULL,
+                                              "duplicate mapped selector");
+                    goto cleanup;
+                }
+                mapping = &mapped[mapped_index];
+            } else if (mapped[mapped_index].selector_index >= request->name_count) {
+                status = dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                          "solver", NULL,
+                                          "mapped selector index is out of range");
+                goto cleanup;
+            }
+        }
+        if (mapping != NULL) {
+            Queue providers;
+            queue_init(&providers);
+            if (request->names[name_index] == NULL ||
+                request->names[name_index][0] != '/' ||
+                mapping->provider_count == 0 || mapping->providers == NULL) {
+                queue_free(&providers);
+                status = dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                          "solver", NULL,
+                                          "invalid mapped absolute selector");
+                goto cleanup;
+            }
+            for (size_t provider_index = 0;
+                 provider_index < mapping->provider_count; ++provider_index) {
+                const dnfast_solvable_reference *reference =
+                    &mapping->providers[provider_index];
+                Repo *repo = NULL;
+                Id solvable_id = 0;
+                uint32_t ordinal = 0;
+                if (reference->repository_id == NULL ||
+                    reference->repository_id[0] == '\0' ||
+                    reference->expected_identity == NULL ||
+                    reference->expected_identity[0] == '\0') {
+                    queue_free(&providers);
+                    status = dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                              "solver", NULL,
+                                              "invalid mapped provider reference");
+                    goto cleanup;
+                }
+                for (int repo_index = 1; repo_index < context->pool->nrepos;
+                     ++repo_index) {
+                    Repo *candidate = context->pool->repos[repo_index];
+                    if (candidate != NULL && candidate->name != NULL &&
+                        strcmp(candidate->name, reference->repository_id) == 0) {
+                        if (repo != NULL) {
+                            queue_free(&providers);
+                            status = dnfast_set_error(error,
+                                DNFAST_STATUS_NATIVE_FAILURE, "libsolv", "repo",
+                                "mapped provider repository is ambiguous");
+                            goto cleanup;
+                        }
+                        repo = candidate;
+                    }
+                }
+                if (repo == NULL) {
+                    queue_free(&providers);
+                    status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                              "libsolv", "repo",
+                                              "mapped provider repository is absent");
+                    goto cleanup;
+                }
+                for (Id candidate = repo->start; candidate < repo->end; ++candidate) {
+                    Solvable *solvable = pool_id2solvable(context->pool, candidate);
+                    if (solvable->repo != repo) continue;
+                    if (ordinal == reference->package_ordinal) {
+                        solvable_id = candidate;
+                        break;
+                    }
+                    ++ordinal;
+                }
+                if (solvable_id == 0) {
+                    queue_free(&providers);
+                    status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                              "libsolv", "repo",
+                                              "mapped provider ordinal is absent");
+                    goto cleanup;
+                }
+                char *identity = dnfast_solvable_identity(
+                    context->pool, pool_id2solvable(context->pool, solvable_id));
+                if (identity == NULL ||
+                    strcmp(identity, reference->expected_identity) != 0) {
+                    free(identity);
+                    queue_free(&providers);
+                    status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                              "libsolv", "solvable",
+                                              "mapped provider identity differs");
+                    goto cleanup;
+                }
+                free(identity);
+                for (int seen = 0; seen < providers.count; ++seen) {
+                    if (providers.elements[seen] == solvable_id) {
+                        queue_free(&providers);
+                        status = dnfast_set_error(error,
+                            DNFAST_STATUS_INVALID_ARGUMENT, "solver", NULL,
+                            "duplicate mapped provider");
+                        goto cleanup;
+                    }
+                }
+                queue_push(&providers, solvable_id);
+            }
+            Id how = SOLVER_SOLVABLE;
+            Id what = providers.elements[0];
+            if (providers.count > 1) {
+                what = pool_queuetowhatprovides(context->pool, &providers);
+                how = SOLVER_SOLVABLE_ONE_OF;
+            }
+            queue_push2(&selectors[name_index], how, what);
+            queue_push2(&job, how, what);
+            queue_free(&providers);
+            selector_relation_kinds[name_index] = 0;
+            if (operation == 0)
+                job.elements[start] |= SOLVER_INSTALL |
+                                       (request->best ? SOLVER_FORCEBEST : 0);
+            else if (operation == 1)
+                job.elements[start] |= SOLVER_ERASE;
+            else
+                job.elements[start] |= SOLVER_UPDATE | SOLVER_FORCEBEST;
+            continue;
+        }
         int selector_flags = SELECTION_NAME | SELECTION_PROVIDES | SELECTION_REL;
         /* Filelist matching scans the repository's very large file index. It
          * is semantically relevant only to absolute path selectors; ordinary
@@ -435,14 +586,25 @@ cleanup:
 dnfast_status dnfast_solver_solve_install(dnfast_context *context,
                                           const dnfast_solve_request *request,
                                           dnfast_error *error) {
-    return solve_operation(context, request, 0, error);
+    return solve_operation(context, request, NULL, 0, 0, error);
 }
 
 dnfast_status dnfast_solver_solve_operation(dnfast_context *context,
                                             const dnfast_solve_request *request,
                                             uint8_t operation,
                                             dnfast_error *error) {
-    return solve_operation(context, request, operation, error);
+    return solve_operation(context, request, NULL, 0, operation, error);
+}
+
+dnfast_status dnfast_solver_solve_mapped_operation(
+    dnfast_context *context,
+    const dnfast_solve_request *request,
+    const dnfast_selector_providers *selectors,
+    size_t selector_count,
+    uint8_t operation,
+    dnfast_error *error) {
+    return solve_operation(context, request, selectors, selector_count,
+                           operation, error);
 }
 
 size_t dnfast_solver_action_count(const dnfast_context *context) {

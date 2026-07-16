@@ -50,7 +50,7 @@ fn run_inner(
         .repositories
         .iter()
         .map(|repository| {
-            dnfast_native::KeyringInstalled::from_verified_staged_bundle(
+            dnfast_native::KeyringInstalled::from_revalidated_staged_bundle(
                 &repository.trust,
                 &repository.repository.id,
                 &repository.keys,
@@ -134,8 +134,8 @@ fn run_inner(
             )
         })
         .collect::<Vec<_>>();
-    let keyring =
-        dnfast_native::KeyringInstalled::from_verified_staged_bundles(&bundles).map_err(native)?;
+    let keyring = dnfast_native::KeyringInstalled::from_revalidated_staged_bundles(&bundles)
+        .map_err(native)?;
     trace_phase(trace, started, "combined-keyring");
     let mut executor = match rpmdb_cookie {
         Some(cookie) => dnfast_native::ExecutorInventory::begin_at_root_with_cookie(

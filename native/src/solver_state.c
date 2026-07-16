@@ -44,3 +44,7 @@ void dnfast_solver_clear(dnfast_context *context) {
     context->decision_capacity = 0;
     free_texts(&context->problems, &context->problem_count);
 }
+
+void dnfast_solver_release_result(dnfast_context *context) {
+    dnfast_solver_clear(context);
+}

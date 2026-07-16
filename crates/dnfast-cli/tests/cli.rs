@@ -41,6 +41,10 @@ fn generation(package: &Package) -> (Vec<u8>, Vec<u8>) {
 
 #[test]
 fn plan_never_claims_resolution_when_the_root_published_snapshot_is_absent() {
+    if dnfast_planning::PlanningSnapshot::open_system().is_ok() {
+        eprintln!("skipped: the host has a root-published planning snapshot");
+        return;
+    }
     let output = dnfast(&[
         "plan",
         "install",

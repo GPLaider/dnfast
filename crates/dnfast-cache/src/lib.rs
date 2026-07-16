@@ -3,6 +3,7 @@
 mod artifact;
 mod artifact_lock;
 mod artifact_store;
+mod auxiliary;
 mod fs_safety;
 mod loading;
 mod model;

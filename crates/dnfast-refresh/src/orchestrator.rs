@@ -7,7 +7,7 @@ use crate::{
     url_policy::{validate_https, validate_https_endpoint},
 };
 use dnfast_cache::{Cache, RepomdAuthentication, SelectedOrigin};
-use dnfast_metadata::parse_repomd_records;
+use dnfast_metadata::{AuxiliaryRecord, parse_repomd_records};
 use std::sync::Mutex;
 
 // Downloads from independent repositories can overlap, but validating several
@@ -146,6 +146,8 @@ impl<'a, T: Transport + Sync> Refresher<'a, T> {
             )
             .map_err(|error| RefreshError::Cache(error.to_string()))?
         {
+            self.ensure_auxiliary(&origin, records.group.as_ref())?;
+            self.ensure_auxiliary(&origin, records.modules.as_ref())?;
             trace_memory(&format!("refresh:{repository}:generation-reused"));
             return Ok(RefreshOutcome {
                 digest: snapshot.digest,
@@ -177,6 +179,8 @@ impl<'a, T: Transport + Sync> Refresher<'a, T> {
                 self.transport.get(&filelists_url, records.filelists.size)?,
             )
         };
+        self.ensure_auxiliary(&origin, records.group.as_ref())?;
+        self.ensure_auxiliary(&origin, records.modules.as_ref())?;
         trace_memory(&format!("refresh:{repository}:artifacts-received"));
         let _publication_permit = METADATA_PUBLICATION_PERMIT
             .lock()
@@ -196,6 +200,27 @@ impl<'a, T: Transport + Sync> Refresher<'a, T> {
             digest: snapshot.digest,
             packages: snapshot.packages.len(),
         })
+    }
+
+    fn ensure_auxiliary(
+        &self,
+        origin: &SelectedOrigin,
+        record: Option<&AuxiliaryRecord>,
+    ) -> Result<(), RefreshError> {
+        let Some(record) = record else { return Ok(()) };
+        match self.cache.open_auxiliary(record) {
+            Ok(_) => return Ok(()),
+            Err(dnfast_cache::CacheError::MissingSnapshot(_)) => {}
+            Err(error) => return Err(RefreshError::Cache(error.to_string())),
+        }
+        let url = origin
+            .artifact_url(&record.href)
+            .map_err(|error| RefreshError::Policy(error.to_string()))?;
+        let bytes = self.transport.get(&url, record.size)?;
+        self.cache
+            .publish_auxiliary(record, &bytes)
+            .map_err(|error| RefreshError::Cache(error.to_string()))?;
+        Ok(())
     }
 }
 

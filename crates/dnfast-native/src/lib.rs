@@ -16,6 +16,10 @@ pub use transaction::{
 };
 pub use trust::{ExpectedPackage, TrustError, VerifiedArtifact, VerifiedStagedKey};
 
+pub fn release_unused_memory() {
+    dnfast_native_sys::release_unused_memory();
+}
+
 #[cfg(feature = "test-fixtures")]
 pub fn fixture_reset_inventory_counts() {
     dnfast_native_sys::fixture_reset_inventory_counts();
@@ -72,6 +76,19 @@ pub struct SolveDecision {
     pub relation: String,
     pub weak: bool,
     pub provider_installed: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FileProvider {
+    pub repository_id: String,
+    pub package_ordinal: u32,
+    pub expected_identity: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MappedSelector {
+    pub selector_index: usize,
+    pub providers: Vec<FileProvider>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -167,6 +184,10 @@ impl NativeContext {
         self.inner.add_rpmdb(root).map_err(NativeError::from)
     }
 
+    pub fn prepare_solver(&mut self) -> Result<(), NativeError> {
+        self.inner.prepare_solver().map_err(NativeError::from)
+    }
+
     pub fn read_installed_inventory(
         &mut self,
     ) -> Result<dnfast_core::InstalledInventory, InventoryError> {
@@ -218,6 +239,23 @@ impl NativeContext {
             weak,
             best,
             dnfast_native_sys::SolveOperation::Install,
+            &[],
+        )
+    }
+
+    pub fn solve_install_many_mapped(
+        &mut self,
+        names: &[&str],
+        weak: bool,
+        best: bool,
+        mappings: &[MappedSelector],
+    ) -> Result<SolveResult, NativeError> {
+        self.solve_operation(
+            names,
+            weak,
+            best,
+            dnfast_native_sys::SolveOperation::Install,
+            mappings,
         )
     }
 
@@ -227,6 +265,7 @@ impl NativeContext {
             false,
             false,
             dnfast_native_sys::SolveOperation::Erase,
+            &[],
         )
     }
 
@@ -240,6 +279,7 @@ impl NativeContext {
             false,
             best,
             dnfast_native_sys::SolveOperation::Upgrade,
+            &[],
         )
     }
 
@@ -249,9 +289,25 @@ impl NativeContext {
         weak: bool,
         best: bool,
         operation: dnfast_native_sys::SolveOperation,
+        mappings: &[MappedSelector],
     ) -> Result<SolveResult, NativeError> {
+        let mappings = mappings
+            .iter()
+            .map(|mapping| dnfast_native_sys::SelectorProviders {
+                selector_index: mapping.selector_index,
+                providers: mapping
+                    .providers
+                    .iter()
+                    .map(|provider| dnfast_native_sys::SolvableReference {
+                        repository_id: provider.repository_id.clone(),
+                        package_ordinal: provider.package_ordinal,
+                        expected_identity: provider.expected_identity.clone(),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
         self.inner
-            .solve_with_operation(names, weak, best, operation)
+            .solve_with_provider_mappings(names, weak, best, operation, &mappings)
             .map(|result| SolveResult {
                 actions: result.actions,
                 repositories: result.repositories,

@@ -21,9 +21,18 @@ pub struct MetadataRecord {
 pub type PrimaryRecord = MetadataRecord;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuxiliaryRecord {
+    pub href: String,
+    pub checksum: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepomdRecords {
     pub primary: MetadataRecord,
     pub filelists: MetadataRecord,
+    pub group: Option<AuxiliaryRecord>,
+    pub modules: Option<AuxiliaryRecord>,
 }
 
 pub fn parse_repomd(input: &[u8]) -> Result<PrimaryRecord, MetadataError> {
@@ -37,13 +46,20 @@ pub fn parse_repomd_records(input: &[u8]) -> Result<RepomdRecords, MetadataError
     let primary = parsed.primary.ok_or(MetadataError::MissingPrimary)?;
     let filelists = parsed.filelists.ok_or(MetadataError::MissingFilelists)?;
     checked_total_open([primary.open_size, filelists.open_size])?;
-    Ok(RepomdRecords { primary, filelists })
+    Ok(RepomdRecords {
+        primary,
+        filelists,
+        group: parsed.group,
+        modules: parsed.modules,
+    })
 }
 
 #[derive(Default)]
 struct Document {
     primary: Option<MetadataRecord>,
     filelists: Option<MetadataRecord>,
+    group: Option<AuxiliaryRecord>,
+    modules: Option<AuxiliaryRecord>,
     root_seen: bool,
     root_closed: bool,
     declaration_seen: bool,
@@ -242,6 +258,21 @@ fn finish_record(
     if kind == "filelists" && !collect_filelists {
         return Ok(());
     }
+    if matches!(kind.as_str(), "group" | "modules") {
+        if !collect_filelists {
+            return Ok(());
+        }
+        let record = build_auxiliary(builder, 512 * 1024 * 1024)?;
+        let slot = if kind == "group" {
+            &mut document.group
+        } else {
+            &mut document.modules
+        };
+        if slot.replace(record).is_some() {
+            return Err(MetadataError::DuplicateRecord(kind));
+        }
+        return Ok(());
+    }
     let limits = match kind.as_str() {
         "primary" => Some((MAX_PRIMARY_COMPRESSED_BYTES, MAX_PRIMARY_OPEN_BYTES)),
         "filelists" => Some((MAX_FILELISTS_COMPRESSED_BYTES, MAX_FILELISTS_OPEN_BYTES)),
@@ -260,6 +291,30 @@ fn finish_record(
         return Err(MetadataError::DuplicateRecord(kind));
     }
     Ok(())
+}
+
+fn build_auxiliary(
+    builder: Builder,
+    compressed_limit: u64,
+) -> Result<AuxiliaryRecord, MetadataError> {
+    let href = builder.href.ok_or(MetadataError::MissingPrimary)?;
+    validate_location(&href)?;
+    let checksum = valid_checksum(builder.checksum.ok_or(MetadataError::MissingPrimary)?)?;
+    let size = bounded(
+        builder.size.ok_or(MetadataError::MissingPrimary)?,
+        compressed_limit,
+    )?;
+    if size == 0 {
+        return Err(MetadataError::SizeMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    Ok(AuxiliaryRecord {
+        href,
+        checksum,
+        size,
+    })
 }
 
 fn build(
@@ -326,4 +381,72 @@ fn validate_location(href: &str) -> Result<(), MetadataError> {
 }
 fn resolved_is_valid(namespace: &ResolveResult<'_>) -> bool {
     matches!(namespace, ResolveResult::Bound(actual) if actual.as_ref() == b"http://linux.duke.edu/metadata/repo")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(kind: &str, checksum: char, href: &str, size: u64, opened: bool) -> String {
+        let open = if opened {
+            format!(
+                "<open-checksum type=\"sha256\">{}</open-checksum><open-size>{size}</open-size>",
+                checksum.to_string().repeat(64)
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "<data type=\"{kind}\"><checksum type=\"sha256\">{}</checksum>{open}<location href=\"{href}\"/><size>{size}</size></data>",
+            checksum.to_string().repeat(64)
+        )
+    }
+
+    fn document(extra: &str) -> Vec<u8> {
+        format!(
+            "<repomd xmlns=\"http://linux.duke.edu/metadata/repo\">{}{}{extra}</repomd>",
+            record("primary", 'a', "repodata/primary.xml.zst", 10, true),
+            record("filelists", 'b', "repodata/filelists.xml.zst", 20, true),
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn optional_group_and_modules_records_are_exact_checksum_bound_records() {
+        let extra = format!(
+            "{}{}{}",
+            record("group", 'c', "repodata/comps.xml.zst", 30, false),
+            record("group_zck", 'd', "repodata/comps.xml.zck", 40, false),
+            record("modules", 'e', "repodata/modules.yaml.zst", 50, false),
+        );
+        let parsed = parse_repomd_records(&document(&extra)).expect("optional records");
+        assert_eq!(parsed.group.expect("group").checksum, "c".repeat(64));
+        assert_eq!(parsed.modules.expect("modules").size, 50);
+    }
+
+    #[test]
+    fn optional_records_reject_duplicates_unsafe_locations_and_zero_sizes() {
+        let group = record("group", 'c', "repodata/comps.xml.zst", 30, false);
+        assert!(parse_repomd_records(&document(&format!("{group}{group}"))).is_err());
+        assert!(
+            parse_repomd_records(&document(&record(
+                "group",
+                'c',
+                "../comps.xml.zst",
+                30,
+                false
+            )))
+            .is_err()
+        );
+        assert!(
+            parse_repomd_records(&document(&record(
+                "modules",
+                'e',
+                "repodata/modules.yaml.zst",
+                0,
+                false
+            )))
+            .is_err()
+        );
+    }
 }

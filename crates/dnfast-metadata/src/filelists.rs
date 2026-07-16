@@ -129,8 +129,10 @@ struct Builder {
     file_count: u64,
 }
 
+type FileVisitor<'a> = dyn FnMut(&str, &str) -> Result<(), MetadataError> + 'a;
+
 #[derive(Default)]
-struct State {
+struct State<'a> {
     current: Option<Builder>,
     file_text: Option<String>,
     packages: Vec<FileListPackage>,
@@ -140,17 +142,18 @@ struct State {
     declaration_seen: bool,
     paths: u64,
     retain_files: bool,
+    visitor: Option<&'a mut FileVisitor<'a>>,
 }
 
 pub fn parse_filelists<R: BufRead>(input: R) -> Result<Vec<FileListPackage>, MetadataError> {
-    parse_filelists_with_mode(input, true)
+    parse_filelists_with_mode(input, true, None)
 }
 
 pub fn validate_filelists_xml<R: BufRead>(
     input: R,
     primary: &[CompletePackage],
 ) -> Result<(), MetadataError> {
-    let filelists = parse_filelists_with_mode(input, false)?;
+    let filelists = parse_filelists_with_mode(input, false, None)?;
     validate_filelists_generation(primary, &filelists)
 }
 
@@ -158,13 +161,23 @@ pub fn validate_filelists_xml_identities<R: BufRead>(
     input: R,
     primary: &[PrimaryPackageIdentity],
 ) -> Result<(), MetadataError> {
-    let filelists = parse_filelists_with_mode(input, false)?;
+    let filelists = parse_filelists_with_mode(input, false, None)?;
     validate_filelists_identities(primary, &filelists)
 }
 
-fn parse_filelists_with_mode<R: BufRead>(
+pub(crate) fn visit_filelists_xml_identities<R: BufRead>(
+    input: R,
+    primary: &[PrimaryPackageIdentity],
+    visitor: &mut dyn FnMut(&str, &str) -> Result<(), MetadataError>,
+) -> Result<(), MetadataError> {
+    let filelists = parse_filelists_with_mode(input, false, Some(visitor))?;
+    validate_filelists_identities(primary, &filelists)
+}
+
+fn parse_filelists_with_mode<'a, R: BufRead>(
     input: R,
     retain_files: bool,
+    visitor: Option<&'a mut FileVisitor<'a>>,
 ) -> Result<Vec<FileListPackage>, MetadataError> {
     let mut reader = NsReader::from_reader(input);
     // Preserve text around entity-reference events until the complete path is
@@ -174,6 +187,7 @@ fn parse_filelists_with_mode<R: BufRead>(
     let mut buffer = Vec::new();
     let mut state = State {
         retain_files,
+        visitor,
         ..State::default()
     };
     loop {
@@ -219,7 +233,7 @@ fn parse_filelists_with_mode<R: BufRead>(
     state.finish()
 }
 
-impl State {
+impl State<'_> {
     fn start(
         &mut self,
         decoder: quick_xml::encoding::Decoder,
@@ -322,6 +336,9 @@ impl State {
             "files per package",
         )?;
         self.paths = checked_increment(self.paths, MAX_FILE_PATHS, "file paths")?;
+        if let Some(visitor) = self.visitor.as_mut() {
+            visitor(&package.package_id, &value)?;
+        }
         if self.retain_files {
             package.files.push(value);
         }

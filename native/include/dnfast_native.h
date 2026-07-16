@@ -82,6 +82,18 @@ typedef struct dnfast_solve_request {
     uint8_t best;
 } dnfast_solve_request;
 
+typedef struct dnfast_solvable_reference {
+    const char *repository_id;
+    uint32_t package_ordinal;
+    const char *expected_identity;
+} dnfast_solvable_reference;
+
+typedef struct dnfast_selector_providers {
+    size_t selector_index;
+    const dnfast_solvable_reference *providers;
+    size_t provider_count;
+} dnfast_selector_providers;
+
 typedef struct dnfast_inventory_record {
     const char *name;
     const char *version;
@@ -108,6 +120,7 @@ typedef struct dnfast_inventory_record {
  *   complete before the context allocation is attempted.
  */
 dnfast_limits dnfast_limits_default(void);
+void dnfast_release_unused_memory(void);
 dnfast_status dnfast_context_open(const dnfast_limits *limits,
                                   const dnfast_callbacks *callbacks,
                                   dnfast_context **out_context,
@@ -125,6 +138,9 @@ dnfast_status dnfast_solver_add_repo_primary(dnfast_context *context,
 dnfast_status dnfast_solver_add_rpmdb(dnfast_context *context,
                                       const char *root,
                                       dnfast_error *out_error);
+dnfast_status dnfast_solver_prepare(dnfast_context *context,
+                                    dnfast_error *out_error);
+void dnfast_solver_release_result(dnfast_context *context);
 dnfast_status dnfast_inventory_read(dnfast_context *context,
                                     const char *root,
                                     dnfast_error *out_error);
@@ -255,6 +271,13 @@ dnfast_status dnfast_solver_solve_operation(dnfast_context *context,
                                             const dnfast_solve_request *request,
                                             uint8_t operation,
                                             dnfast_error *out_error);
+dnfast_status dnfast_solver_solve_mapped_operation(
+    dnfast_context *context,
+    const dnfast_solve_request *request,
+    const dnfast_selector_providers *selectors,
+    size_t selector_count,
+    uint8_t operation,
+    dnfast_error *out_error);
 size_t dnfast_solver_action_count(const dnfast_context *context);
 const char *dnfast_solver_action(const dnfast_context *context, size_t index);
 const char *dnfast_solver_action_repo(const dnfast_context *context, size_t index);

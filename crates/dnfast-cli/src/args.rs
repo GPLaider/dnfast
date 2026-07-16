@@ -85,6 +85,79 @@ pub(crate) enum Commands {
         cache_dir: Option<PathBuf>,
         query: String,
     },
+    #[command(about = "Inspect comps groups/environments or install their package set")]
+    Group {
+        #[command(subcommand)]
+        command: GroupCommand,
+    },
+    #[command(about = "Inspect or change modular repository state")]
+    Module {
+        #[command(subcommand)]
+        command: ModuleCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum GroupCommand {
+    #[command(about = "List checksum-bound groups and environments")]
+    List {
+        #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+        repositories: Vec<String>,
+    },
+    #[command(about = "Show one checksum-bound group or environment")]
+    Info {
+        #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+        repositories: Vec<String>,
+        id: String,
+    },
+    #[command(about = "Install mandatory/default packages from groups or environments")]
+    Install(GroupInstallArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct GroupInstallArgs {
+    #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+    pub(crate) repositories: Vec<String>,
+    #[arg(long, conflicts_with = "assumeno")]
+    pub(crate) assumeyes: bool,
+    #[arg(long, conflicts_with = "assumeyes")]
+    pub(crate) assumeno: bool,
+    #[arg(
+        long,
+        help = "Also install optional group packages and optional environment groups"
+    )]
+    pub(crate) with_optional: bool,
+    #[arg(required = true)]
+    pub(crate) groups: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ModuleCommand {
+    #[command(about = "List module streams in root-published repository metadata")]
+    List {
+        #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+        repositories: Vec<String>,
+    },
+    #[command(about = "Show one module stream")]
+    Info {
+        #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+        repositories: Vec<String>,
+        spec: String,
+    },
+    #[command(about = "Enable a module stream")]
+    Enable(ModuleMutationArgs),
+    #[command(about = "Reset module stream state")]
+    Reset(ModuleMutationArgs),
+    #[command(about = "Disable a module stream")]
+    Disable(ModuleMutationArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ModuleMutationArgs {
+    #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+    pub(crate) repositories: Vec<String>,
+    #[arg(required = true)]
+    pub(crate) specs: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

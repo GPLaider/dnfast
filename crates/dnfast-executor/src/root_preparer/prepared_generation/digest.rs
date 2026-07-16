@@ -4,11 +4,29 @@ use crate::input_model::{InputArtifact, InputFile, InputRepository};
 
 use super::super::PreparationError;
 
+#[cfg(test)]
 pub(crate) fn metadata_digest(
     repositories: &[InputRepository],
 ) -> Result<String, PreparationError> {
+    metadata_digest_version(repositories, false)
+}
+
+pub(crate) fn metadata_digest_v4(
+    repositories: &[InputRepository],
+) -> Result<String, PreparationError> {
+    metadata_digest_version(repositories, true)
+}
+
+fn metadata_digest_version(
+    repositories: &[InputRepository],
+    extended: bool,
+) -> Result<String, PreparationError> {
     let mut digest = Sha256::new();
-    digest.update(b"dnfast-root-metadata-v3");
+    digest.update(if extended {
+        b"dnfast-root-metadata-v4".as_slice()
+    } else {
+        b"dnfast-root-metadata-v3".as_slice()
+    });
     for repository in repositories {
         frame(&mut digest, &repository.id, repository.id.as_bytes())?;
         digest.update(repository.priority.to_be_bytes());
@@ -35,6 +53,19 @@ pub(crate) fn metadata_digest(
         ] {
             frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
             digest.update(file.size.to_be_bytes());
+        }
+        if extended {
+            for (role, file) in [
+                ("file-provides", repository.file_provides.as_ref()),
+                ("group", repository.group.as_ref()),
+                ("modules", repository.modules.as_ref()),
+            ] {
+                frame(&mut digest, role, role.as_bytes())?;
+                if let Some(file) = file {
+                    frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
+                    digest.update(file.size.to_be_bytes());
+                }
+            }
         }
     }
     Ok(format!("{:x}", digest.finalize()))

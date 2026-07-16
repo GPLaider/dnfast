@@ -71,11 +71,33 @@ impl KeyringInstalled {
             .iter()
             .map(|key| key.certificate.as_slice())
             .collect::<Vec<_>>();
-        let native = dnfast_native_sys::Keyring::open(&certificates).map_err(NativeError::from)?;
-        Ok(Self {
-            native,
-            allowed_primary_fingerprints: policy.allowed_primary_fingerprints().to_vec(),
-        })
+        open_staged_keyring(certificates, policy.allowed_primary_fingerprints().to_vec())
+    }
+
+    /// Opens staged certificates after the caller has revalidated the
+    /// root-owned repository configuration, key bundle, cache generation and
+    /// current planning pointer against the bound snapshot.
+    ///
+    /// `RepoTrustPolicy::valid_at_unix` records when that immutable snapshot
+    /// was published. It is not a five-minute expiry for an otherwise-current
+    /// repository generation. A timestamp too far in the future remains
+    /// invalid, while an older timestamp is safe only at this stronger caller
+    /// boundary.
+    pub fn from_revalidated_staged_bundle(
+        policy: &RepoTrustPolicy,
+        repository: &str,
+        keys: &[VerifiedStagedKey],
+    ) -> Result<Self, TrustError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| TrustError::Bundle(error.to_string()))?
+            .as_secs();
+        validate_revalidated_staged_bundle(policy, repository, keys, now)?;
+        let certificates = keys
+            .iter()
+            .map(|key| key.certificate.as_slice())
+            .collect::<Vec<_>>();
+        open_staged_keyring(certificates, policy.allowed_primary_fingerprints().to_vec())
     }
 
     pub fn from_verified_staged_bundles(
@@ -92,14 +114,24 @@ impl KeyringInstalled {
             certificates.extend(keys.iter().map(|key| key.certificate.as_slice()));
             allowed_primary_fingerprints.extend_from_slice(policy.allowed_primary_fingerprints());
         }
-        if certificates.is_empty() {
-            return Err(TrustError::Bundle("no staged repository keys".into()));
+        open_staged_keyring(certificates, allowed_primary_fingerprints)
+    }
+
+    pub fn from_revalidated_staged_bundles(
+        bundles: &[(&RepoTrustPolicy, &str, &[VerifiedStagedKey])],
+    ) -> Result<Self, TrustError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| TrustError::Bundle(error.to_string()))?
+            .as_secs();
+        let mut certificates = Vec::new();
+        let mut allowed_primary_fingerprints = Vec::new();
+        for (policy, repository, keys) in bundles {
+            validate_revalidated_staged_bundle(policy, repository, keys, now)?;
+            certificates.extend(keys.iter().map(|key| key.certificate.as_slice()));
+            allowed_primary_fingerprints.extend_from_slice(policy.allowed_primary_fingerprints());
         }
-        let native = dnfast_native_sys::Keyring::open(&certificates).map_err(NativeError::from)?;
-        Ok(Self {
-            native,
-            allowed_primary_fingerprints,
-        })
+        open_staged_keyring(certificates, allowed_primary_fingerprints)
     }
 
     pub fn from_repository(
@@ -130,11 +162,7 @@ impl KeyringInstalled {
             .iter()
             .map(Vec::as_slice)
             .collect::<Vec<_>>();
-        let native = dnfast_native_sys::Keyring::open(&certificates).map_err(NativeError::from)?;
-        Ok(Self {
-            native,
-            allowed_primary_fingerprints: policy.allowed_primary_fingerprints().to_vec(),
-        })
+        open_staged_keyring(certificates, policy.allowed_primary_fingerprints().to_vec())
     }
 
     pub fn verify_artifact(
@@ -198,19 +226,57 @@ impl KeyringInstalled {
     }
 }
 
+fn open_staged_keyring(
+    mut certificates: Vec<&[u8]>,
+    mut allowed_primary_fingerprints: Vec<String>,
+) -> Result<KeyringInstalled, TrustError> {
+    certificates.sort_unstable();
+    certificates.dedup();
+    allowed_primary_fingerprints.sort_unstable();
+    allowed_primary_fingerprints.dedup();
+    if certificates.is_empty() {
+        return Err(TrustError::Bundle("no staged repository keys".into()));
+    }
+    let native = dnfast_native_sys::Keyring::open(&certificates).map_err(NativeError::from)?;
+    Ok(KeyringInstalled {
+        native,
+        allowed_primary_fingerprints,
+    })
+}
+
 fn validate_staged_bundle(
     policy: &RepoTrustPolicy,
     repository: &str,
     keys: &[VerifiedStagedKey],
     now: u64,
 ) -> Result<(), TrustError> {
+    if now.abs_diff(policy.valid_at_unix()) > 300 {
+        return Err(TrustError::VerificationTimeMismatch);
+    }
+    validate_staged_bundle_at_bound_time(policy, repository, keys)
+}
+
+fn validate_revalidated_staged_bundle(
+    policy: &RepoTrustPolicy,
+    repository: &str,
+    keys: &[VerifiedStagedKey],
+    now: u64,
+) -> Result<(), TrustError> {
+    if policy.valid_at_unix() > now.saturating_add(300) {
+        return Err(TrustError::VerificationTimeMismatch);
+    }
+    validate_staged_bundle_at_bound_time(policy, repository, keys)
+}
+
+fn validate_staged_bundle_at_bound_time(
+    policy: &RepoTrustPolicy,
+    repository: &str,
+    keys: &[VerifiedStagedKey],
+) -> Result<(), TrustError> {
     if repository != policy.repo_id() {
         return Err(TrustError::Bundle(
             "repository id differs from trust policy".into(),
         ));
-    }
-    if now.abs_diff(policy.valid_at_unix()) > 300 {
-        return Err(TrustError::VerificationTimeMismatch);
     }
     let mut digest = Sha256::new();
     digest.update(b"dnfast-key-bundle-v1");

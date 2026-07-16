@@ -80,7 +80,7 @@ pub(crate) fn stage(
         let mut primary =
             staging.write_bytes(&format!("{prefix}-native-primary.xml"), &primary_xml)?;
         staging.write_bytes(&format!("{prefix}-native-filelists.xml"), &filelists_xml)?;
-        let parsed = parse_candidates(repository, &mut repomd, &mut primary)?;
+        let parsed = parse_candidates(repository, &mut repomd, &mut primary, policy.base_arch())?;
         candidates.extend(parsed.0);
         metadata.extend(parsed.1);
         let trust = parse_trust(directory, &repository.trust.policy)?;
@@ -283,6 +283,7 @@ pub(crate) fn parse_candidates(
     repository: &InputRepository,
     repomd: &mut File,
     primary: &mut File,
+    base_architecture: Architecture,
 ) -> Result<ParsedCandidates, ExecutorError> {
     let mut repomd_bytes = Vec::new();
     repomd.read_to_end(&mut repomd_bytes).map_err(io)?;
@@ -301,44 +302,52 @@ pub(crate) fn parse_candidates(
         .cloned()
         .map(|item| (repository.id.clone(), item))
         .collect();
-    let candidates = packages
-        .into_iter()
-        .map(|item| {
-            let arch = parse_architecture(&item.arch)?;
-            let epoch = item
-                .epoch
-                .parse()
-                .map_err(|_| ExecutorError::Inputs("invalid metadata epoch".into()))?;
-            Ok(CandidatePackage {
-                name: item.name,
-                evra: Evra::new(epoch, item.version, item.release, arch),
-                vendor: if item.vendor.is_empty() {
-                    "unknown".into()
-                } else {
-                    item.vendor
-                },
-                repo_id: repository.id.clone(),
-                priority: u32::try_from(repository.priority)
-                    .map_err(|_| ExecutorError::Inputs("negative repository priority".into()))?,
-                cost: u32::try_from(repository.cost)
-                    .map_err(|_| ExecutorError::Inputs("negative repository cost".into()))?,
-                package_size: item.package_size,
-                installed_size: item.installed_size,
-                checksum_sha256: item.checksum,
-                location: item.location,
-                excluded: false,
-                modular: false,
-            })
-        })
-        .collect::<Result<Vec<_>, ExecutorError>>()?;
+    let mut candidates = Vec::new();
+    for item in packages {
+        let Some(arch) = parse_architecture(&item.arch, base_architecture)? else {
+            continue;
+        };
+        let epoch = item
+            .epoch
+            .parse()
+            .map_err(|_| ExecutorError::Inputs("invalid metadata epoch".into()))?;
+        candidates.push(CandidatePackage {
+            name: item.name,
+            evra: Evra::new(epoch, item.version, item.release, arch),
+            vendor: if item.vendor.is_empty() {
+                "unknown".into()
+            } else {
+                item.vendor
+            },
+            repo_id: repository.id.clone(),
+            priority: u32::try_from(repository.priority)
+                .map_err(|_| ExecutorError::Inputs("negative repository priority".into()))?,
+            cost: u32::try_from(repository.cost)
+                .map_err(|_| ExecutorError::Inputs("negative repository cost".into()))?,
+            package_size: item.package_size,
+            installed_size: item.installed_size,
+            checksum_sha256: item.checksum,
+            location: item.location,
+            excluded: false,
+            modular: false,
+        });
+    }
     Ok((candidates, metadata))
 }
 
-fn parse_architecture(value: &str) -> Result<Architecture, ExecutorError> {
+fn parse_architecture(
+    value: &str,
+    base: Architecture,
+) -> Result<Option<Architecture>, ExecutorError> {
     match value {
-        "aarch64" => Ok(Architecture::Aarch64),
-        "x86_64" => Ok(Architecture::X86_64),
-        "noarch" => Ok(Architecture::Noarch),
+        "aarch64" => Ok(Some(Architecture::Aarch64)),
+        "x86_64" => Ok(Some(Architecture::X86_64)),
+        "noarch" => Ok(Some(Architecture::Noarch)),
+        // Fedora's x86_64 repository intentionally contains i686 multilib
+        // packages. The canonical policy has allow_multilib=false, so retain
+        // them as signed metadata evidence but exclude them from executable
+        // candidate construction exactly as the public planner does.
+        "i686" if base == Architecture::X86_64 => Ok(None),
         _ => Err(ExecutorError::Inputs(
             "unsupported metadata architecture".into(),
         )),
@@ -453,6 +462,9 @@ mod tests {
                 repomd: descriptor("repomd"),
                 primary: descriptor("primary"),
                 filelists: descriptor("filelists"),
+                file_provides: None,
+                group: None,
+                modules: None,
                 trust: InputRepositoryTrust {
                     policy: descriptor("trust"),
                     sha256: "c".repeat(64),
@@ -475,7 +487,7 @@ mod tests {
         let (primary_xml, filelists_xml) =
             materialize_native_metadata(&mut repomd, &mut primary, &mut filelists)
                 .expect("materialize native XML");
-        let parsed = parse_candidates(&repository, &mut repomd, &mut primary)
+        let parsed = parse_candidates(&repository, &mut repomd, &mut primary, Architecture::X86_64)
             .expect("parse candidate records after materialization");
         let native = native_repository(
             &repository,
@@ -557,7 +569,14 @@ mod tests {
 
     #[test]
     fn x86_64_metadata_architecture_is_parsed_without_host_fallback() {
-        assert_eq!(parse_architecture("x86_64").unwrap(), Architecture::X86_64);
-        assert!(parse_architecture("i686").is_err());
+        assert_eq!(
+            parse_architecture("x86_64", Architecture::X86_64).unwrap(),
+            Some(Architecture::X86_64)
+        );
+        assert_eq!(
+            parse_architecture("i686", Architecture::X86_64).unwrap(),
+            None
+        );
+        assert!(parse_architecture("i686", Architecture::Aarch64).is_err());
     }
 }

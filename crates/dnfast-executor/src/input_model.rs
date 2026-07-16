@@ -22,6 +22,12 @@ pub(crate) struct InputRepository {
     pub(crate) repomd: InputFile,
     pub(crate) primary: InputFile,
     pub(crate) filelists: InputFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) file_provides: Option<InputFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) group: Option<InputFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) modules: Option<InputFile>,
     pub(crate) trust: InputRepositoryTrust,
 }
 

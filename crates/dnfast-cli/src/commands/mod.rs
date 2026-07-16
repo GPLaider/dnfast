@@ -1,3 +1,4 @@
+mod group;
 mod history;
 mod output;
 mod planner;
@@ -15,7 +16,10 @@ use dnfast_core::{Action, PackageSpec, TransactionIntent};
 use dnfast_metadata::search;
 
 use crate::{
-    args::{Commands, DaemonCommand, HistoryCommand, MutationArgs, PlanAction, RepoCommand},
+    args::{
+        Commands, DaemonCommand, GroupCommand, HistoryCommand, ModuleCommand, MutationArgs,
+        PlanAction, RepoCommand,
+    },
     environment::{cache_directory, library_present},
     rendering::escaped_field,
     response::{Action as ResponseAction, Response},
@@ -98,6 +102,18 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
             cache_dir,
             query,
         } => run_search(repositories, cache_dir, query),
+        Commands::Group { command } => match command {
+            GroupCommand::List { repositories } => group::list(repositories),
+            GroupCommand::Info { repositories, id } => group::info(repositories, &id),
+            GroupCommand::Install(arguments) => group::install(arguments),
+        },
+        Commands::Module { command } => match command {
+            ModuleCommand::List { repositories } => group::module_list(repositories),
+            ModuleCommand::Info { repositories, spec } => group::module_info(repositories, &spec),
+            ModuleCommand::Enable(arguments) => group::module_mutation("enable", arguments),
+            ModuleCommand::Reset(arguments) => group::module_mutation("reset", arguments),
+            ModuleCommand::Disable(arguments) => group::module_mutation("disable", arguments),
+        },
     }
 }
 
@@ -113,6 +129,8 @@ pub(crate) fn name(command: &Commands) -> &'static str {
         Commands::History { .. } => "history",
         Commands::Doctor => "doctor",
         Commands::Search { .. } => "search",
+        Commands::Group { .. } => "group",
+        Commands::Module { .. } => "module",
     }
 }
 

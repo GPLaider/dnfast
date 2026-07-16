@@ -74,6 +74,20 @@ struct RawSolveRequest {
 }
 
 #[repr(C)]
+struct RawSolvableReference {
+    repository_id: *const c_char,
+    package_ordinal: u32,
+    expected_identity: *const c_char,
+}
+
+#[repr(C)]
+struct RawSelectorProviders {
+    selector_index: usize,
+    providers: *const RawSolvableReference,
+    provider_count: usize,
+}
+
+#[repr(C)]
 pub(crate) struct RawError {
     status: i32,
     component: *mut c_char,
@@ -83,6 +97,7 @@ pub(crate) struct RawError {
 
 unsafe extern "C" {
     fn dnfast_limits_default() -> RawLimits;
+    fn dnfast_release_unused_memory();
     fn dnfast_context_open(
         limits: *const RawLimits,
         callbacks: *const RawCallbacks,
@@ -106,9 +121,19 @@ unsafe extern "C" {
         root: *const c_char,
         error: *mut RawError,
     ) -> i32;
+    fn dnfast_solver_prepare(context: *mut RawContext, error: *mut RawError) -> i32;
+    fn dnfast_solver_release_result(context: *mut RawContext);
     fn dnfast_solver_solve_operation(
         context: *mut RawContext,
         request: *const RawSolveRequest,
+        operation: u8,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_solve_mapped_operation(
+        context: *mut RawContext,
+        request: *const RawSolveRequest,
+        selectors: *const RawSelectorProviders,
+        selector_count: usize,
         operation: u8,
         error: *mut RawError,
     ) -> i32;
@@ -135,6 +160,12 @@ unsafe extern "C" {
     fn dnfast_solver_problem(context: *const RawContext, index: usize) -> *const c_char;
     fn dnfast_context_free(context: *mut RawContext);
     fn dnfast_error_free(error: *mut RawError);
+}
+
+pub fn release_unused_memory() {
+    // SAFETY: the native function has no arguments and only asks the process
+    // allocator to return currently unused pages to the operating system.
+    unsafe { dnfast_release_unused_memory() };
 }
 
 pub struct Context {
@@ -319,6 +350,18 @@ impl Context {
         }
     }
 
+    pub fn prepare_solver(&mut self) -> Result<(), NativeError> {
+        let mut error = empty_error();
+        // SAFETY: [Category 8 — FFI boundary UB] the native context is live and
+        // uniquely borrowed for the synchronous index-finalization call.
+        let status = unsafe { dnfast_solver_prepare(self.raw.as_ptr(), &mut error) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status_error(status, &mut error))
+        }
+    }
+
     pub fn solve_install(
         &mut self,
         name: &str,
@@ -344,6 +387,17 @@ impl Context {
         best: bool,
         operation: SolveOperation,
     ) -> Result<SolveOutput, NativeError> {
+        self.solve_with_provider_mappings(names, weak, best, operation, &[])
+    }
+
+    pub fn solve_with_provider_mappings(
+        &mut self,
+        names: &[&str],
+        weak: bool,
+        best: bool,
+        operation: SolveOperation,
+        mappings: &[SelectorProviders],
+    ) -> Result<SolveOutput, NativeError> {
         if names.is_empty() && operation != SolveOperation::Upgrade {
             return Err(NativeError {
                 status: 1,
@@ -365,6 +419,48 @@ impl Context {
             best: u8::from(best),
         };
         let mut error = empty_error();
+        let mapping_strings = mappings
+            .iter()
+            .map(|mapping| {
+                mapping
+                    .providers
+                    .iter()
+                    .map(|provider| {
+                        Ok((
+                            c_string(&provider.repository_id)?,
+                            c_string(&provider.expected_identity)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, NativeError>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let raw_providers = mappings
+            .iter()
+            .zip(&mapping_strings)
+            .map(|(mapping, strings)| {
+                mapping
+                    .providers
+                    .iter()
+                    .zip(strings)
+                    .map(
+                        |(provider, (repository_id, expected_identity))| RawSolvableReference {
+                            repository_id: repository_id.as_ptr(),
+                            package_ordinal: provider.package_ordinal,
+                            expected_identity: expected_identity.as_ptr(),
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let raw_mappings = mappings
+            .iter()
+            .zip(&raw_providers)
+            .map(|(mapping, providers)| RawSelectorProviders {
+                selector_index: mapping.selector_index,
+                providers: providers.as_ptr(),
+                provider_count: providers.len(),
+            })
+            .collect::<Vec<_>>();
         let operation = match operation {
             SolveOperation::Install => 0,
             SolveOperation::Erase => 1,
@@ -373,22 +469,41 @@ impl Context {
         // SAFETY: [Category 8 — FFI boundary UB] request is valid for this
         // synchronous call and native result storage remains context-owned.
         let status = unsafe {
-            dnfast_solver_solve_operation(self.raw.as_ptr(), &request, operation, &mut error)
+            if raw_mappings.is_empty() {
+                dnfast_solver_solve_operation(self.raw.as_ptr(), &request, operation, &mut error)
+            } else {
+                dnfast_solver_solve_mapped_operation(
+                    self.raw.as_ptr(),
+                    &request,
+                    raw_mappings.as_ptr(),
+                    raw_mappings.len(),
+                    operation,
+                    &mut error,
+                )
+            }
         };
         if status != 0 {
             return Err(status_error(status, &mut error));
         }
-        Ok(SolveOutput {
-            actions: copy_items(self.raw, 0)?,
-            repositories: copy_items(self.raw, 1)?,
-            kinds: copy_items(self.raw, 2)?,
-            obsoletes: copy_obsoletes(self.raw),
-            requested_specs: copy_requested_specs(self.raw)?,
-            requested_relation_kinds: copy_requested_relation_kinds(self.raw)?,
-            satisfied_specs: copy_satisfied_specs(self.raw)?,
-            problems: copy_items(self.raw, 3)?,
-            decisions: copy_decisions(self.raw)?,
-        })
+        let output = (|| {
+            Ok(SolveOutput {
+                actions: copy_items(self.raw, 0)?,
+                repositories: copy_items(self.raw, 1)?,
+                kinds: copy_items(self.raw, 2)?,
+                obsoletes: copy_obsoletes(self.raw),
+                requested_specs: copy_requested_specs(self.raw)?,
+                requested_relation_kinds: copy_requested_relation_kinds(self.raw)?,
+                satisfied_specs: copy_satisfied_specs(self.raw)?,
+                problems: copy_items(self.raw, 3)?,
+                decisions: copy_decisions(self.raw)?,
+            })
+        })();
+        // SAFETY: every context-owned result has been copied into Rust-owned
+        // storage (or copying failed); the uniquely borrowed context stays
+        // live and on its owner thread. The repository pool remains resident.
+        unsafe { dnfast_solver_release_result(self.raw.as_ptr()) };
+        release_unused_memory();
+        output
     }
 }
 
@@ -417,6 +532,19 @@ pub struct RepoInput {
     pub filelists_path: String,
     pub priority: i32,
     pub cost: i32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SolvableReference {
+    pub repository_id: String,
+    pub package_ordinal: u32,
+    pub expected_identity: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SelectorProviders {
+    pub selector_index: usize,
+    pub providers: Vec<SolvableReference>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -97,7 +97,9 @@ static int add_identity(dnfast_keyring *ring, rpmPubkey primary,
     for (size_t index = 0; index < 40; ++index)
         item->primary[index] = (char)toupper((unsigned char)primary_fp[index]);
     item->primary[40] = '\0';
-    memcpy(item->signing, signing_fp, 41);
+    for (size_t index = 0; index < 40; ++index)
+        item->signing[index] = (char)toupper((unsigned char)signing_fp[index]);
+    item->signing[40] = '\0';
     return 0;
 }
 
