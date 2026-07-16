@@ -96,6 +96,11 @@ unsafe extern "C" {
         input: *const RawRepoInput,
         error: *mut RawError,
     ) -> i32;
+    fn dnfast_solver_add_repo_primary(
+        context: *mut RawContext,
+        input: *const RawRepoInput,
+        error: *mut RawError,
+    ) -> i32;
     fn dnfast_solver_add_rpmdb(
         context: *mut RawContext,
         root: *const c_char,
@@ -118,6 +123,8 @@ unsafe extern "C" {
     ) -> *const c_char;
     fn dnfast_solver_action_requested_relation_kind(context: *const RawContext, index: usize)
     -> u8;
+    fn dnfast_solver_satisfied_spec_count(context: *const RawContext) -> usize;
+    fn dnfast_solver_satisfied_spec(context: *const RawContext, index: usize) -> *const c_char;
     fn dnfast_solver_decision_count(context: *const RawContext) -> usize;
     fn dnfast_solver_decision_requiring(context: *const RawContext, index: usize) -> *const c_char;
     fn dnfast_solver_decision_provider(context: *const RawContext, index: usize) -> *const c_char;
@@ -250,14 +257,23 @@ impl Context {
     }
 
     pub fn add_repo(&mut self, repo: &RepoInput) -> Result<(), NativeError> {
-        self.add_repo_kind(repo, false)
+        self.add_repo_kind(repo, false, true)
+    }
+
+    pub fn add_repo_primary(&mut self, repo: &RepoInput) -> Result<(), NativeError> {
+        self.add_repo_kind(repo, false, false)
     }
 
     pub fn add_installed_repo(&mut self, repo: &RepoInput) -> Result<(), NativeError> {
-        self.add_repo_kind(repo, true)
+        self.add_repo_kind(repo, true, true)
     }
 
-    fn add_repo_kind(&mut self, repo: &RepoInput, installed: bool) -> Result<(), NativeError> {
+    fn add_repo_kind(
+        &mut self,
+        repo: &RepoInput,
+        installed: bool,
+        include_filelists: bool,
+    ) -> Result<(), NativeError> {
         let id = c_string(&repo.id)?;
         let repomd = c_string(&repo.repomd_path)?;
         let primary = c_string(&repo.primary_path)?;
@@ -275,7 +291,13 @@ impl Context {
         let mut error = empty_error();
         // SAFETY: [Category 8 — FFI boundary UB] strings and input remain live for
         // the synchronous call; the native context is uniquely borrowed.
-        let status = unsafe { dnfast_solver_add_repo(self.raw.as_ptr(), &input, &mut error) };
+        let status = unsafe {
+            if include_filelists {
+                dnfast_solver_add_repo(self.raw.as_ptr(), &input, &mut error)
+            } else {
+                dnfast_solver_add_repo_primary(self.raw.as_ptr(), &input, &mut error)
+            }
+        };
         if status == 0 {
             Ok(())
         } else {
@@ -363,6 +385,7 @@ impl Context {
             obsoletes: copy_obsoletes(self.raw),
             requested_specs: copy_requested_specs(self.raw)?,
             requested_relation_kinds: copy_requested_relation_kinds(self.raw)?,
+            satisfied_specs: copy_satisfied_specs(self.raw)?,
             problems: copy_items(self.raw, 3)?,
             decisions: copy_decisions(self.raw)?,
         })
@@ -380,7 +403,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_packages: 2_000_000,
-            max_relations_per_package: 4_096,
+            max_relations_per_package: 16_384,
             max_metadata_bytes: 17_179_869_184,
         }
     }
@@ -404,6 +427,7 @@ pub struct SolveOutput {
     pub obsoletes: Vec<Option<String>>,
     pub requested_specs: Vec<Option<String>>,
     pub requested_relation_kinds: Vec<bool>,
+    pub satisfied_specs: Vec<String>,
     pub problems: Vec<String>,
     pub decisions: Vec<DecisionOutput>,
 }
@@ -534,6 +558,24 @@ fn copy_requested_relation_kinds(raw: NonNull<RawContext>) -> Result<Vec<bool>, 
                     message: "native requested selector kind is invalid".into(),
                 }),
             }
+        })
+        .collect()
+}
+
+fn copy_satisfied_specs(raw: NonNull<RawContext>) -> Result<Vec<String>, NativeError> {
+    // SAFETY: [Category 8 — FFI boundary UB] raw owns stable no-op selector
+    // strings until the next solve or context destruction.
+    let count = unsafe { dnfast_solver_satisfied_spec_count(raw.as_ptr()) };
+    (0..count)
+        .map(|index| {
+            // SAFETY: index is bounded by the native satisfied selector count.
+            let pointer = unsafe { dnfast_solver_satisfied_spec(raw.as_ptr(), index) };
+            copy_requested_spec(pointer)?.ok_or_else(|| NativeError {
+                status: 7,
+                component: "dnfast".into(),
+                symbol: "satisfied_spec".into(),
+                message: "native satisfied selector was null".into(),
+            })
         })
         .collect()
 }

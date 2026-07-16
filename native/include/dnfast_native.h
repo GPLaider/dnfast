@@ -119,6 +119,9 @@ const char *dnfast_context_pool_architecture(const dnfast_context *context);
 dnfast_status dnfast_solver_add_repo(dnfast_context *context,
                                      const dnfast_repo_input *input,
                                      dnfast_error *out_error);
+dnfast_status dnfast_solver_add_repo_primary(dnfast_context *context,
+                                             const dnfast_repo_input *input,
+                                             dnfast_error *out_error);
 dnfast_status dnfast_solver_add_rpmdb(dnfast_context *context,
                                       const char *root,
                                       dnfast_error *out_error);
@@ -261,6 +264,9 @@ const char *dnfast_solver_action_requested_spec(const dnfast_context *context,
                                                 size_t index);
 uint8_t dnfast_solver_action_requested_relation_kind(const dnfast_context *context,
                                                      size_t index);
+size_t dnfast_solver_satisfied_spec_count(const dnfast_context *context);
+const char *dnfast_solver_satisfied_spec(const dnfast_context *context,
+                                         size_t index);
 size_t dnfast_solver_decision_count(const dnfast_context *context);
 const char *dnfast_solver_decision_requiring(const dnfast_context *context, size_t index);
 const char *dnfast_solver_decision_provider(const dnfast_context *context, size_t index);

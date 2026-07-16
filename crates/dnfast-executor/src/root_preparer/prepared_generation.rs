@@ -12,7 +12,9 @@ use dnfast_cache::{
     ArtifactCache, ArtifactError, ArtifactSpec, ArtifactTransport, Digest, TransactionRequest,
 };
 use dnfast_core::CanonicalDocument;
-use dnfast_planning::{PlanningRepository, SYSTEM_CACHE_PATH};
+use dnfast_planning::{
+    NativeRepositoryXml, PlanningRepository, PlanningSnapshot, SYSTEM_CACHE_PATH,
+};
 use rustix::{
     fs::{AtFlags, Mode, OFlags, ResolveFlags, fsync, mkdirat, openat, openat2, unlinkat},
     io::Errno,
@@ -95,26 +97,45 @@ impl InputDraft {
 
     pub(crate) fn write_repository(
         &mut self,
+        snapshot: &PlanningSnapshot,
         repository: &PlanningRepository,
         index: usize,
     ) -> Result<MaterializedRepository, PreparationError> {
+        let metadata = snapshot
+            .materialize_native_xml(repository)
+            .map_err(|error| PreparationError::Snapshot(error.to_string()))?;
+        self.write_materialized_repository(repository, index, &metadata)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_legacy_repository(
+        &mut self,
+        repository: &PlanningRepository,
+        index: usize,
+    ) -> Result<MaterializedRepository, PreparationError> {
+        let metadata = repository
+            .materialize_native_xml()
+            .map_err(|error| PreparationError::Snapshot(error.to_string()))?;
+        self.write_materialized_repository(repository, index, &metadata)
+    }
+
+    fn write_materialized_repository(
+        &mut self,
+        repository: &PlanningRepository,
+        index: usize,
+        metadata: &NativeRepositoryXml,
+    ) -> Result<MaterializedRepository, PreparationError> {
         let prefix = format!("repo-{index}");
-        let repomd_bytes = payload_bytes("repomd", &repository.repomd)?;
-        let primary_bytes = payload_bytes("primary", &repository.primary)?;
-        let filelists_bytes = payload_bytes("filelists", &repository.filelists)?;
-        let records = dnfast_metadata::parse_repomd_records(&repomd_bytes)
-            .map_err(|error| materialization("repomd", error))?;
-        let native_primary = dnfast_metadata::decode_primary(&primary_bytes, &records.primary)
-            .map_err(|error| materialization("primary", error))?;
-        let native_filelists = dnfast_metadata::decode_record(&filelists_bytes, &records.filelists)
-            .map_err(|error| materialization("filelists", error))?;
-        let repomd = self.write_bytes(&format!("{prefix}-repomd"), &repomd_bytes)?;
-        let primary = self.write_bytes(&format!("{prefix}-primary"), &primary_bytes)?;
-        let filelists = self.write_bytes(&format!("{prefix}-filelists"), &filelists_bytes)?;
+        let repomd = self.write_bytes(&format!("{prefix}-repomd"), metadata.repomd())?;
+        let primary = self.write_bytes(&format!("{prefix}-primary"), metadata.primary_payload())?;
+        let filelists =
+            self.write_bytes(&format!("{prefix}-filelists"), metadata.filelists_payload())?;
         let native_primary =
-            self.write_bytes(&format!("{prefix}-native-primary.xml"), &native_primary)?;
-        let native_filelists =
-            self.write_bytes(&format!("{prefix}-native-filelists.xml"), &native_filelists)?;
+            self.write_bytes(&format!("{prefix}-native-primary.xml"), metadata.primary())?;
+        let native_filelists = self.write_bytes(
+            &format!("{prefix}-native-filelists.xml"),
+            metadata.filelists(),
+        )?;
         let trust_bytes = repository.trust.to_canonical_json().map_err(domain)?;
         let trust_policy = self.write_bytes(&format!("{prefix}-trust.json"), &trust_bytes)?;
         let keys = repository
@@ -346,6 +367,7 @@ impl InputDraft {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn payload_bytes(
     role: &'static str,
     payload: &dnfast_planning::PlanningBytes,
@@ -385,9 +407,6 @@ pub(crate) fn inputs(error: ExecutorError) -> PreparationError {
 }
 pub(crate) fn io(error: std::io::Error) -> PreparationError {
     PreparationError::Publish(error.to_string())
-}
-fn materialization(role: &'static str, error: dnfast_metadata::MetadataError) -> PreparationError {
-    PreparationError::Snapshot(format!("{role} rpm-md materialization failed: {error}"))
 }
 pub(crate) fn errno(error: Errno) -> PreparationError {
     PreparationError::Publish(error.to_string())

@@ -12,6 +12,8 @@ use dnfast_solver::{CandidatePackage, CanonicalSolverPlan, NativeSolveOutput, Pl
 use super::AppFailure;
 
 const PLAN_LIFETIME_SECONDS: u64 = 300;
+type MaterializedPaths = (String, String, String);
+type MaterializedRepository = (MaterializedPaths, Vec<dnfast_metadata::CompletePackage>);
 
 pub(super) fn solve(
     intent: TransactionIntent,
@@ -46,7 +48,7 @@ pub(super) fn solve(
     let mut candidates = Vec::new();
     let mut metadata = Vec::new();
     for (index, repository) in repositories.iter().enumerate() {
-        let paths = materialize(workspace.path(), index, repository)?;
+        let (paths, solver_inputs) = materialize(&snapshot, workspace.path(), index, repository)?;
         context
             .add_repository(Repository {
                 id: repository.id.clone(),
@@ -59,10 +61,13 @@ pub(super) fn solve(
                     .map_err(|error| AppFailure::new(1, error.to_string()))?,
             })
             .map_err(native_failure)?;
-        candidates.extend(candidates_for(repository)?);
+        candidates.extend(candidates_for(
+            repository,
+            &solver_inputs,
+            snapshot.payload().policy.solver.base_arch(),
+        )?);
         metadata.extend(
-            repository
-                .solver_inputs
+            solver_inputs
                 .iter()
                 .cloned()
                 .map(|package| (repository.id.clone(), package)),
@@ -96,6 +101,7 @@ pub(super) fn solve(
         &inventory,
     )
     .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    let satisfied_specs = transcript.satisfied_specs().to_vec();
     let resolved = transcript
         .into_resolved(&names, &candidates, &metadata_refs, &inventory)
         .map_err(|error| AppFailure::new(1, error.to_string()))?;
@@ -111,7 +117,7 @@ pub(super) fn solve(
         candidates: &candidates,
         expires_at_unix: now.saturating_add(PLAN_LIFETIME_SECONDS),
     }
-    .build(&resolved)
+    .build_with_satisfied(&resolved, &satisfied_specs)
     .map_err(|error| AppFailure::new(1, error.to_string()))
 }
 
@@ -134,14 +140,23 @@ fn selected_repositories<'a>(
 }
 
 fn materialize(
+    snapshot: &PlanningSnapshot,
     root: &Path,
     index: usize,
     repository: &PlanningRepository,
-) -> Result<(String, String, String), AppFailure> {
-    let prefix = format!("repository-{index}");
-    let metadata = repository
-        .materialize_native_xml()
+) -> Result<MaterializedRepository, AppFailure> {
+    let metadata = snapshot
+        .materialize_native_xml(repository)
         .map_err(snapshot_failure)?;
+    write_materialized(root, index, metadata)
+}
+
+fn write_materialized(
+    root: &Path,
+    index: usize,
+    metadata: dnfast_planning::NativeRepositoryXml,
+) -> Result<MaterializedRepository, AppFailure> {
+    let prefix = format!("repository-{index}");
     let repomd = write(root, &format!("{prefix}-repomd.xml"), metadata.repomd())?;
     let primary = write(root, &format!("{prefix}-primary.xml"), metadata.primary())?;
     let filelists = write(
@@ -149,7 +164,22 @@ fn materialize(
         &format!("{prefix}-filelists.xml"),
         metadata.filelists(),
     )?;
-    Ok((display(&repomd)?, display(&primary)?, display(&filelists)?))
+    Ok((
+        (display(&repomd)?, display(&primary)?, display(&filelists)?),
+        metadata.solver_inputs().to_vec(),
+    ))
+}
+
+#[cfg(test)]
+fn materialize_inline(
+    root: &Path,
+    index: usize,
+    repository: &PlanningRepository,
+) -> Result<MaterializedRepository, AppFailure> {
+    let metadata = repository
+        .materialize_native_xml()
+        .map_err(snapshot_failure)?;
+    write_materialized(root, index, metadata)
 }
 
 fn write(root: &Path, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf, AppFailure> {
@@ -158,51 +188,64 @@ fn write(root: &Path, name: &str, bytes: &[u8]) -> Result<std::path::PathBuf, Ap
     Ok(path)
 }
 
-fn candidates_for(repository: &PlanningRepository) -> Result<Vec<CandidatePackage>, AppFailure> {
-    repository
-        .solver_inputs
-        .iter()
-        .map(|item| {
-            let architecture = match item.arch.as_str() {
-                "aarch64" => Architecture::Aarch64,
-                "x86_64" => Architecture::X86_64,
-                "noarch" => Architecture::Noarch,
-                _ => {
-                    return Err(AppFailure::new(
-                        1,
-                        "root-published metadata has an unsupported architecture",
-                    ));
-                }
-            };
-            let epoch = item
-                .epoch
-                .parse()
-                .map_err(|_| AppFailure::new(1, "root-published metadata has an invalid epoch"))?;
-            Ok(CandidatePackage {
-                name: item.name.clone(),
-                evra: Evra::new(
-                    epoch,
-                    item.version.clone(),
-                    item.release.clone(),
-                    architecture,
-                ),
-                vendor: if item.vendor.is_empty() {
-                    "unknown".into()
-                } else {
-                    item.vendor.clone()
-                },
-                repo_id: repository.id.clone(),
-                priority: repository.priority,
-                cost: repository.cost,
-                package_size: item.package_size,
-                installed_size: item.installed_size,
-                checksum_sha256: item.checksum.clone(),
-                location: item.location.clone(),
-                excluded: false,
-                modular: false,
-            })
-        })
-        .collect()
+fn candidates_for(
+    repository: &PlanningRepository,
+    solver_inputs: &[dnfast_metadata::CompletePackage],
+    base_architecture: Architecture,
+) -> Result<Vec<CandidatePackage>, AppFailure> {
+    let mut candidates = Vec::new();
+    for item in solver_inputs {
+        let Some(architecture) = candidate_architecture(&item.arch, base_architecture)? else {
+            continue;
+        };
+        let epoch = item
+            .epoch
+            .parse()
+            .map_err(|_| AppFailure::new(1, "root-published metadata has an invalid epoch"))?;
+        candidates.push(CandidatePackage {
+            name: item.name.clone(),
+            evra: Evra::new(
+                epoch,
+                item.version.clone(),
+                item.release.clone(),
+                architecture,
+            ),
+            vendor: if item.vendor.is_empty() {
+                "unknown".into()
+            } else {
+                item.vendor.clone()
+            },
+            repo_id: repository.id.clone(),
+            priority: repository.priority,
+            cost: repository.cost,
+            package_size: item.package_size,
+            installed_size: item.installed_size,
+            checksum_sha256: item.checksum.clone(),
+            location: item.location.clone(),
+            excluded: false,
+            modular: false,
+        });
+    }
+    Ok(candidates)
+}
+
+fn candidate_architecture(
+    value: &str,
+    base: Architecture,
+) -> Result<Option<Architecture>, AppFailure> {
+    match value {
+        "aarch64" => Ok(Some(Architecture::Aarch64)),
+        "x86_64" => Ok(Some(Architecture::X86_64)),
+        "noarch" => Ok(Some(Architecture::Noarch)),
+        // Fedora's x86_64 repositories include i686 packages.  The canonical
+        // policy currently has allow_multilib=false, so they are valid pool
+        // input but cannot become executable plan candidates.
+        "i686" if base == Architecture::X86_64 => Ok(None),
+        _ => Err(AppFailure::new(
+            1,
+            "root-published metadata has an unsupported architecture",
+        )),
+    }
 }
 
 fn display(path: &Path) -> Result<String, AppFailure> {
@@ -230,7 +273,16 @@ mod tests {
     use dnfast_planning::{PlanningBytes, PlanningKey, PlanningOrigin, PlanningRepository};
     use sha2::{Digest, Sha256};
 
-    use super::materialize;
+    use super::{candidate_architecture, materialize_inline};
+
+    #[test]
+    fn x86_repository_i686_records_are_filtered_when_multilib_is_disabled() {
+        assert_eq!(
+            candidate_architecture("i686", dnfast_core::Architecture::X86_64).unwrap(),
+            None
+        );
+        assert!(candidate_architecture("i686", dnfast_core::Architecture::Aarch64).is_err());
+    }
 
     #[test]
     fn public_planner_materializes_zstd_metadata_as_xml_for_native_solver() {
@@ -240,8 +292,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("temporary materialization workspace");
 
         // When: the public planner creates the exact paths it passes to the native solver.
-        let (_, primary, filelists) =
-            materialize(workspace.path(), 0, &repository).expect("planner materialization");
+        let ((_, primary, filelists), solver_inputs) =
+            materialize_inline(workspace.path(), 0, &repository).expect("planner materialization");
 
         // Then: both native-input paths contain parseable XML, not compressed snapshot bytes.
         let primary = fs::read(primary).expect("materialized primary");
@@ -251,12 +303,9 @@ mod tests {
         assert!(!filelists.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
         assert_eq!(
             dnfast_metadata::parse_primary_records(primary.as_slice()).expect("native primary XML"),
-            repository.solver_inputs,
+            solver_inputs,
         );
-        assert_eq!(
-            dnfast_metadata::parse_filelists(filelists.as_slice()).expect("native filelists XML"),
-            repository.filelist_inputs,
-        );
+        dnfast_metadata::parse_filelists(filelists.as_slice()).expect("native filelists XML");
     }
 
     #[test]
@@ -267,7 +316,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("temporary materialization workspace");
 
         // When: the public planner prepares native solver metadata.
-        let result = materialize(workspace.path(), 0, &repository);
+        let result = materialize_inline(workspace.path(), 0, &repository);
 
         // Then: it names the primary role and writes no derived native inputs.
         let error = match result {
@@ -294,15 +343,14 @@ mod tests {
         let primary = fs::read(metadata.join("primary.xml.zst")).expect("primary");
         let filelists = fs::read(metadata.join("filelists.xml.zst")).expect("filelists");
         let records = dnfast_metadata::parse_repomd_records(&repomd).expect("repomd records");
-        let solver_inputs = dnfast_metadata::parse_primary_records(
+        dnfast_metadata::parse_primary_records(
             dnfast_metadata::decode_record(primary.as_slice(), &records.primary)
                 .expect("primary XML")
                 .as_slice(),
         )
         .expect("primary records");
-        let filelist_inputs =
-            dnfast_metadata::parse_filelists_record(filelists.as_slice(), &records.filelists)
-                .expect("filelists records");
+        dnfast_metadata::parse_filelists_record(filelists.as_slice(), &records.filelists)
+            .expect("filelists records");
         let certificate = b"planner-key";
         let bundle_path = "/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-aarch64";
         let mut bundle = Sha256::new();
@@ -338,8 +386,6 @@ mod tests {
             repomd: planning_bytes(&repomd),
             primary: planning_bytes(&primary),
             filelists: planning_bytes(&filelists),
-            solver_inputs,
-            filelist_inputs,
             trust,
             keys: vec![PlanningKey {
                 bundle_path: bundle_path.into(),

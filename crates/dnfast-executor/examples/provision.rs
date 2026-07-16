@@ -237,6 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trust_sha256 = trust_digest(&repositories)?;
     let native_output =
         NativeSolveOutput::from_native(result, metadata_sha256.clone(), &metadata, &inventory)?;
+    let satisfied_specs = native_output.satisfied_specs().to_vec();
     let intent = TransactionIntent::from_package_names(action, &[&name])?;
     let snapshot = format!(
         "{:x}",
@@ -291,7 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         candidates: &planning_candidates,
         expires_at_unix: now.saturating_add(expires_after),
     }
-    .build(&resolved)?;
+    .build_with_satisfied(&resolved, &satisfied_specs)?;
     let input_root = PathBuf::from("/var/lib/dnfast/inputs").join(plan.digest()?.as_str());
     fs::create_dir_all(&input_root)?;
     private_dir(&input_root)?;

@@ -22,6 +22,7 @@ dnfast-planning = { path = "../dnfast-planning" }
 dnfast-refresh = { path = "../dnfast-refresh" }
 dnfast-repo = { path = "../dnfast-repo" }
 dnfast-solver = { path = "../dnfast-solver" }
+dnfast-state = { path = "../dnfast-state" }
 hex = "0.4"
 rustix = { version = "1.1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }

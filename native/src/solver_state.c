@@ -32,6 +32,7 @@ void dnfast_solver_clear(dnfast_context *context) {
     free(context->action_requested_relation_kinds);
     context->action_requested_relation_kinds = NULL;
     free_texts(&context->actions, &context->action_count);
+    free_texts(&context->satisfied_specs, &context->satisfied_spec_count);
     for (size_t index = 0; index < context->decision_count; ++index) {
         free(context->decision_provider[index]); free(context->decision_relation[index]);
     }
@@ -40,5 +41,6 @@ void dnfast_solver_clear(dnfast_context *context) {
     free(context->decision_relation); context->decision_relation = NULL;
     free(context->decision_kind); context->decision_kind = NULL;
     free(context->decision_installed); context->decision_installed = NULL;
+    context->decision_capacity = 0;
     free_texts(&context->problems, &context->problem_count);
 }

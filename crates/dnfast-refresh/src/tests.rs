@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Condvar, Mutex},
+    time::Duration,
+};
 
 use dnfast_cache::Cache;
 use sha2::{Digest, Sha256};
@@ -26,6 +30,46 @@ impl Transport for FakeTransport {
             .get(url)
             .cloned()
             .ok_or_else(|| RefreshError::Transport(format!("missing fake response: {url}")))?;
+        if bytes.len() as u64 > maximum_bytes {
+            return Err(RefreshError::Transport("response exceeds limit".into()));
+        }
+        Ok(bytes)
+    }
+}
+
+struct ConcurrentMetadataTransport {
+    responses: HashMap<String, Vec<u8>>,
+    arrived_metadata: Mutex<usize>,
+    both_arrived: Condvar,
+}
+
+impl Transport for ConcurrentMetadataTransport {
+    fn get(&self, url: &str, maximum_bytes: u64) -> Result<Vec<u8>, RefreshError> {
+        let metadata = url.ends_with("primary.xml.zst") || url.ends_with("filelists.xml.zst");
+        if metadata {
+            let mut arrived = self.arrived_metadata.lock().unwrap();
+            *arrived += 1;
+            if *arrived == 2 {
+                self.both_arrived.notify_all();
+            } else {
+                let (observed, timeout) = self
+                    .both_arrived
+                    .wait_timeout_while(arrived, Duration::from_secs(5), |count| *count < 2)
+                    .unwrap();
+                arrived = observed;
+                if timeout.timed_out() && *arrived < 2 {
+                    return Err(RefreshError::Transport(
+                        "primary and filelists were fetched sequentially".into(),
+                    ));
+                }
+            }
+        }
+        let result = self
+            .responses
+            .get(url)
+            .cloned()
+            .ok_or_else(|| RefreshError::Transport(format!("missing fake response: {url}")));
+        let bytes = result?;
         if bytes.len() as u64 > maximum_bytes {
             return Err(RefreshError::Transport("response exceeds limit".into()));
         }
@@ -86,6 +130,111 @@ fn refreshes_verified_baseurl_into_cache() {
 }
 
 #[test]
+fn unchanged_fresh_repomd_reuses_only_a_rehashed_complete_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path());
+    let (repomd, primary, filelists) = metadata_fixture();
+    let base = "https://reuse.example/fedora";
+    Refresher::new(
+        FakeTransport::new([
+            (format!("{base}/repodata/repomd.xml"), repomd.clone()),
+            (format!("{base}/repodata/primary.xml.zst"), primary),
+            (format!("{base}/repodata/filelists.xml.zst"), filelists),
+        ]),
+        &cache,
+    )
+    .refresh("fedora", Source::BaseUrl(base.into()))
+    .expect("initial complete refresh");
+
+    // Only the freshly fetched repomd is available. A second metadata download
+    // would fail this transport, so success proves content-addressed reuse.
+    let reused = Refresher::new(
+        FakeTransport::new([(format!("{base}/repodata/repomd.xml"), repomd.clone())]),
+        &cache,
+    )
+    .refresh("fedora", Source::BaseUrl(base.into()))
+    .expect("unchanged verified generation reuse");
+    assert_eq!(reused.digest, hex::encode(Sha256::digest(&repomd)));
+    assert_eq!(reused.packages, 1);
+
+    // Semantically equivalent but byte-distinct repomd is a new generation and
+    // must not use the old cache capability without downloading its records.
+    let mut changed = repomd.clone();
+    changed.extend_from_slice(b"\n");
+    let rejected = Refresher::new(
+        FakeTransport::new([(format!("{base}/repodata/repomd.xml"), changed)]),
+        &cache,
+    )
+    .refresh("fedora", Source::BaseUrl(base.into()));
+    assert!(rejected.is_err());
+    assert_eq!(
+        cache
+            .open_current_verified_complete_generation("fedora")
+            .unwrap()
+            .digest(),
+        reused.digest
+    );
+}
+
+#[test]
+fn primary_and_filelists_downloads_overlap_without_weakening_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path());
+    let (repomd, primary, filelists) = metadata_fixture();
+    let base = "https://parallel.example/fedora";
+    let transport = ConcurrentMetadataTransport {
+        responses: [
+            (format!("{base}/repodata/repomd.xml"), repomd),
+            (format!("{base}/repodata/primary.xml.zst"), primary),
+            (format!("{base}/repodata/filelists.xml.zst"), filelists),
+        ]
+        .into_iter()
+        .collect(),
+        arrived_metadata: Mutex::new(0),
+        both_arrived: Condvar::new(),
+    };
+    let outcome = Refresher::new(transport, &cache)
+        .refresh("fedora", Source::BaseUrl(base.into()))
+        .expect("parallel verified refresh");
+    assert_eq!(outcome.packages, 1);
+}
+
+#[test]
+fn metalink_single_connection_policy_uses_one_mirror_sequentially() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path());
+    let (repomd, primary, filelists) = metadata_fixture();
+    let repomd_hash = hex::encode(Sha256::digest(&repomd));
+    let metalink = format!(
+        r#"<metalink xmlns="http://www.metalinker.org/"><files><file name="repomd.xml"><verification><hash type="sha256">{repomd_hash}</hash></verification><size>{}</size><resources maxconnections="1"><url preference="100">https://one.example/repo/repodata/repomd.xml</url><url preference="90">https://two.example/repo/repodata/repomd.xml</url></resources></file></files></metalink>"#,
+        repomd.len()
+    )
+    .into_bytes();
+    let transport = FakeTransport::new([
+        ("https://meta.example/list".into(), metalink),
+        (
+            "https://one.example/repo/repodata/repomd.xml".into(),
+            repomd,
+        ),
+        (
+            "https://one.example/repo/repodata/primary.xml.zst".into(),
+            primary,
+        ),
+        (
+            "https://one.example/repo/repodata/filelists.xml.zst".into(),
+            filelists,
+        ),
+    ]);
+    let outcome = Refresher::new(transport, &cache)
+        .refresh(
+            "fedora",
+            Source::Metalink("https://meta.example/list".into()),
+        )
+        .expect("single-connection mirror is used sequentially");
+    assert_eq!(outcome.packages, 1);
+}
+
+#[test]
 fn metalink_falls_back_after_corrupt_mirror() {
     let directory = tempfile::tempdir().unwrap();
     let cache = Cache::new(directory.path());
@@ -116,6 +265,41 @@ fn metalink_falls_back_after_corrupt_mirror() {
 }
 
 #[test]
+fn metalink_accepts_bounded_declared_repomd_alternate() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path());
+    let (repomd, primary, filelists) = metadata_fixture();
+    let future = b"not-yet-mirrored-repomd";
+    let future_hash = hex::encode(Sha256::digest(future));
+    let alternate_hash = hex::encode(Sha256::digest(&repomd));
+    let metalink = format!(
+        r#"<metalink xmlns="http://www.metalinker.org/" xmlns:mm0="http://fedorahosted.org/mirrormanager"><files><file name="repomd.xml"><size>{}</size><verification><hash type="sha256">{future_hash}</hash></verification><mm0:alternates><mm0:alternate><size>{}</size><verification><hash type="sha256">{alternate_hash}</hash></verification></mm0:alternate></mm0:alternates><resources><url preference="100">https://good.example/repodata/repomd.xml</url></resources></file></files></metalink>"#,
+        future.len(),
+        repomd.len(),
+    )
+    .into_bytes();
+    let transport = FakeTransport::new([
+        ("https://meta.example/list".into(), metalink),
+        ("https://good.example/repodata/repomd.xml".into(), repomd),
+        (
+            "https://good.example/repodata/primary.xml.zst".into(),
+            primary,
+        ),
+        (
+            "https://good.example/repodata/filelists.xml.zst".into(),
+            filelists,
+        ),
+    ]);
+    let outcome = Refresher::new(transport, &cache)
+        .refresh(
+            "updates",
+            Source::Metalink("https://meta.example/list".into()),
+        )
+        .expect("declared alternate is still checksum and size bound");
+    assert_eq!(outcome.packages, 1);
+}
+
+#[test]
 fn rejects_non_https_source() {
     let directory = tempfile::tempdir().unwrap();
     let cache = Cache::new(directory.path());
@@ -126,6 +310,28 @@ fn rejects_non_https_source() {
         )
         .unwrap_err();
     assert!(matches!(error, RefreshError::Policy(_)));
+}
+
+#[test]
+fn fedora_metalink_endpoint_allows_query_but_mirror_resources_do_not() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path());
+    let endpoint = "https://mirrors.fedoraproject.org/metalink?repo=fedora-44&arch=x86_64";
+    let error = Refresher::new(
+        FakeTransport::new([(endpoint.into(), b"not-a-metalink".to_vec())]),
+        &cache,
+    )
+    .refresh("fedora", Source::Metalink(endpoint.into()))
+    .expect_err("the endpoint reaches parsing instead of URL-policy rejection");
+    assert!(matches!(error, RefreshError::Metalink(_)));
+    assert!(super::url_policy::validate_https("https://mirror.example/repo?token=x").is_err());
+}
+
+#[test]
+fn origin_only_baseurl_accepts_the_equivalent_optional_root_slash() {
+    assert!(super::url_policy::validate_https("https://localhost:18443").is_ok());
+    assert!(super::url_policy::validate_https("https://localhost:18443/").is_ok());
+    assert!(super::url_policy::validate_https("https://localhost:18443?token=x").is_err());
 }
 
 #[test]

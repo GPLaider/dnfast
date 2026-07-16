@@ -3,7 +3,8 @@ use std::{fs, io::Write};
 use dnfast_metadata::{
     CompletePackage, FileListPackage, Package, decode_primary, decode_record,
     parse_filelists_record, parse_primary, parse_primary_records, parse_repomd,
-    parse_repomd_records, validate_filelists_generation,
+    parse_repomd_records, validate_filelists_generation, validate_filelists_record_identities,
+    validate_primary_record,
 };
 
 use crate::{
@@ -16,6 +17,44 @@ use crate::{
 };
 
 impl Cache {
+    /// Reuses an immutable complete generation only when a freshly obtained
+    /// repomd document has exactly the current content digest. The raw metadata
+    /// objects and search index are rehashed before the pointer authentication
+    /// evidence is republished; new or changed repomd always returns `None` and
+    /// requires a full download and validation.
+    pub fn reuse_current_verified_complete(
+        &self,
+        repository: &str,
+        repomd: &[u8],
+        selected_origin: &str,
+        repomd_authentication: RepomdAuthentication,
+    ) -> Result<Option<Snapshot>, CacheError> {
+        repomd_authentication.validate()?;
+        SelectedOrigin::parse(selected_origin)
+            .map_err(|error| CacheError::Corrupt(error.to_string()))?;
+        let pointer = match self.current_pointer(repository) {
+            Ok(pointer) => pointer,
+            Err(CacheError::MissingSnapshot(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let digest = sha256(repomd);
+        if pointer.digest != digest {
+            return Ok(None);
+        }
+        let generation = self.open_verified_complete_generation(&digest)?;
+        let (stored_repository, packages) = self.open_search_index(&digest)?;
+        if generation.repository() != repository
+            || stored_repository != repository
+            || generation.repomd().bytes() != repomd
+        {
+            return Err(CacheError::Corrupt(
+                "current complete generation identity mismatch".into(),
+            ));
+        }
+        self.publish_repository_pointer(repository, &digest, &repomd_authentication)?;
+        Ok(Some(Snapshot { digest, packages }))
+    }
+
     pub fn publish(
         &self,
         repository: &str,
@@ -25,7 +64,7 @@ impl Cache {
         let record = parse_repomd(repomd).map_err(metadata_error)?;
         let open = decode_primary(primary, &record).map_err(metadata_error)?;
         let packages = parse_primary(open.as_slice()).map_err(metadata_error)?;
-        let digest = self.publish_generation(Publication {
+        let snapshot = self.publish_generation(Publication {
             repository,
             repomd,
             primary,
@@ -37,7 +76,10 @@ impl Cache {
             repomd_authentication: &RepomdAuthentication::TransportOnly,
             integrity: SnapshotIntegrity::SearchOnly,
         })?;
-        Ok(Snapshot { digest, packages })
+        Ok(Snapshot {
+            digest: snapshot.digest,
+            packages: snapshot.packages,
+        })
     }
 
     pub fn publish_complete(
@@ -90,7 +132,7 @@ impl Cache {
             parse_filelists_record(filelists, &records.filelists).map_err(metadata_error)?;
         validate_filelists_generation(&solver_inputs, &filelist_inputs).map_err(metadata_error)?;
         let packages = solver_inputs.iter().map(search_package).collect::<Vec<_>>();
-        let digest = self.publish_generation(Publication {
+        self.publish_generation(Publication {
             repository,
             repomd,
             primary,
@@ -101,26 +143,101 @@ impl Cache {
             integrity: SnapshotIntegrity::CompleteMetadata,
             source_origin: source_origin.as_ref().map(SelectedOrigin::repomd_url),
             repomd_authentication: &repomd_authentication,
-        })?;
-        self.open_by_digest(&digest)
+        })
     }
 
-    fn publish_generation(&self, input: Publication<'_>) -> Result<String, CacheError> {
+    pub fn publish_verified_complete_fast(
+        &self,
+        repository: &str,
+        repomd: &[u8],
+        primary: &[u8],
+        filelists: &[u8],
+        source_origin: Option<&str>,
+        repomd_authentication: RepomdAuthentication,
+    ) -> Result<Snapshot, CacheError> {
+        trace_memory(&format!("cache:{repository}:begin"));
+        repomd_authentication.validate()?;
+        let source_origin = source_origin
+            .map(SelectedOrigin::parse)
+            .transpose()
+            .map_err(|error| CacheError::Corrupt(error.to_string()))?;
+        let records = parse_repomd_records(repomd).map_err(metadata_error)?;
+        let validated =
+            validate_primary_record(primary, &records.primary).map_err(metadata_error)?;
+        trace_memory(&format!("cache:{repository}:primary-validated"));
+        validate_filelists_record_identities(filelists, &records.filelists, &validated.identities)
+            .map_err(metadata_error)?;
+        trace_memory(&format!("cache:{repository}:filelists-validated"));
+        let packages = validated.packages;
+        let snapshot = self.publish_generation(Publication {
+            repository,
+            repomd,
+            primary,
+            packages: &packages,
+            solver_inputs: None,
+            filelists_bytes: Some(filelists),
+            filelists: None,
+            integrity: SnapshotIntegrity::CompleteMetadata,
+            source_origin: source_origin.as_ref().map(SelectedOrigin::repomd_url),
+            repomd_authentication: &repomd_authentication,
+        })?;
+        trace_memory(&format!("cache:{repository}:published"));
+        Ok(Snapshot {
+            digest: snapshot.digest,
+            packages: snapshot.packages,
+        })
+    }
+
+    fn publish_generation(&self, input: Publication<'_>) -> Result<CompleteSnapshot, CacheError> {
         let digest = sha256(input.repomd);
         let objects = self.root.join("objects/sha256");
         let object = objects.join(&digest);
         create_private_tree(&self.root, &objects)?;
-        if !object.exists() {
-            self.write_object(&objects, &object, &input)?;
-        }
-        let loaded = self.open_by_digest(&digest)?;
+        let published_here = if object.exists() {
+            false
+        } else {
+            self.write_object(&objects, &object, &input)?
+        };
+        let loaded = if published_here {
+            snapshot_from_input(&digest, &input)?
+        } else if input.integrity == SnapshotIntegrity::CompleteMetadata
+            && input.solver_inputs.is_none()
+            && input.filelists.is_none()
+        {
+            // The fast publisher has already streamed and validated the exact
+            // input generation. Reopening an existing object through
+            // `open_by_digest` would decompress and retain the complete primary
+            // and filelists graphs a second time. Verify the immutable raw
+            // generation plus its search index instead, then reuse the already
+            // validated in-memory search records.
+            let generation = self.open_verified_complete_generation(&digest)?;
+            let (stored_repository, stored_packages) = self.open_search_index(&digest)?;
+            if generation.repository() != input.repository
+                || stored_repository != input.repository
+                || stored_packages != input.packages
+            {
+                return Err(CacheError::Corrupt(
+                    "existing object identity or search index mismatch".into(),
+                ));
+            }
+            let mut snapshot = snapshot_from_input(&digest, &input)?;
+            // An immutable generation keeps the origin that was authenticated
+            // when the object first won publication. The same checksum-bound
+            // repomd may be served by another Metalink mirror later; changing
+            // the stored origin without creating a new object would make the
+            // returned capability disagree with the object on disk.
+            snapshot.source_origin = Some(generation.origin().clone());
+            snapshot
+        } else {
+            self.open_by_digest(&digest)?
+        };
         if loaded.repository != input.repository || loaded.integrity != input.integrity {
             return Err(CacheError::Corrupt(
                 "existing object identity mismatch".into(),
             ));
         }
         self.publish_repository_pointer(input.repository, &digest, input.repomd_authentication)?;
-        Ok(digest)
+        Ok(loaded)
     }
 
     fn write_object(
@@ -128,7 +245,7 @@ impl Cache {
         objects: &std::path::Path,
         object: &std::path::Path,
         input: &Publication<'_>,
-    ) -> Result<(), CacheError> {
+    ) -> Result<bool, CacheError> {
         let staging = tempfile::Builder::new()
             .prefix(".staging-")
             .tempdir_in(objects)
@@ -136,7 +253,7 @@ impl Cache {
         let search_json = json(input.packages)?;
         let repository = write_verified(staging.path(), "repo-id", input.repository.as_bytes())?;
         let mut manifest = Manifest {
-            version: 2,
+            version: 3,
             repomd: write_verified(staging.path(), "repomd.xml", input.repomd)?,
             primary: write_verified(staging.path(), "primary", input.primary)?,
             search_index: write_verified(staging.path(), "packages.json", &search_json)?,
@@ -147,20 +264,8 @@ impl Cache {
             solver_inputs: None,
             source_origin: None,
         };
-        if let (Some(bytes), Some(solver), Some(files)) =
-            (input.filelists_bytes, input.solver_inputs, input.filelists)
-        {
+        if let Some(bytes) = input.filelists_bytes {
             manifest.filelists = Some(write_verified(staging.path(), "filelists", bytes)?);
-            manifest.solver_inputs = Some(write_verified(
-                staging.path(),
-                "solver-inputs.json",
-                &json(solver)?,
-            )?);
-            manifest.filelists_index = Some(write_verified(
-                staging.path(),
-                "filelists-index.json",
-                &json(files)?,
-            )?);
         }
         if let Some(origin) = input.source_origin {
             manifest.source_origin = Some(write_verified(
@@ -175,11 +280,10 @@ impl Cache {
         match fs::rename(staging.path(), object) {
             Ok(()) => {
                 std::mem::forget(staging);
-                sync_directory(objects)
+                sync_directory(objects)?;
+                Ok(true)
             }
-            Err(_error) if object.exists() => {
-                self.open_by_digest(&sha256(input.repomd)).map(|_| ())
-            }
+            Err(_error) if object.exists() => Ok(false),
             Err(error) => Err(io_error(error)),
         }
     }
@@ -217,6 +321,38 @@ impl Cache {
             .map_err(|error| io_error(error.error))?;
         sync_directory(&directory)
     }
+}
+
+fn snapshot_from_input(
+    digest: &str,
+    input: &Publication<'_>,
+) -> Result<CompleteSnapshot, CacheError> {
+    Ok(CompleteSnapshot {
+        digest: digest.into(),
+        repository: input.repository.into(),
+        integrity: input.integrity,
+        packages: input.packages.to_vec(),
+        solver_inputs: input.solver_inputs.unwrap_or_default().to_vec(),
+        filelists: input.filelists.unwrap_or_default().to_vec(),
+        source_origin: input
+            .source_origin
+            .map(SelectedOrigin::parse)
+            .transpose()
+            .map_err(|error| CacheError::Corrupt(error.to_string()))?,
+    })
+}
+
+fn trace_memory(phase: &str) {
+    if std::env::var_os("DNFAST_REFRESH_TRACE").is_none() {
+        return;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let fields = status
+        .lines()
+        .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("dnfast-refresh-trace phase={phase} {fields}");
 }
 
 struct Publication<'a> {

@@ -10,12 +10,15 @@ The implemented command surface is deliberately smaller than DNF5:
 dnfast doctor
 dnfast repo list
 sudo dnfast repo refresh --repo fedora
+sudo dnfast repo makecache --repo fedora
 sudo dnfast search bash
 sudo dnfast plan install bash --output /var/lib/dnfast/bash-plan.json
 sudo dnfast apply /var/lib/dnfast/bash-plan.json --assumeyes
 sudo dnfast install bash --assumeyes
 sudo dnfast remove bash --assumeyes
 sudo dnfast upgrade --assumeyes
+sudo dnfast history list
+sudo dnfast history info 018f1f2e-7b3c-7abc-8def-0123456789ab
 sudo dnfast daemon status
 sudo dnfast daemon warm --repo fedora
 ```
@@ -35,8 +38,18 @@ Install `dnfastd` at `/usr/libexec/dnfastd`, install
 benchmarking the resident path. `dnfast daemon status` reports protocol readiness, while
 `dnfast daemon warm` loads the exact selected repository generation outside a timed mutation.
 
+The daemon caches only an exact canonical intent for the unchanged planning generation and RPMDB
+cookie. Package selectors containing an absolute path deliberately leave the primary-only
+resident pool and use the full filelists-bound fixed planner.
+
+`repo makecache` obeys the trusted `metadata_expire` policy. Both `makecache` and explicit
+`refresh` still fetch current `repomd.xml`; reuse is allowed only when its exact digest matches the
+published generation and every immutable metadata/index object has been rehashed successfully.
+`history list` and `history info` report dnfast's verified durable transaction journal; they do not
+import or claim compatibility with DNF5 history.
+
 Group, environment, module, plugin, COPR, system-upgrade, offline, autoremove, downgrade,
-reinstall, distro-sync, advisory, and history commands are not implemented and fail closed.
+reinstall, distro-sync, and advisory commands are not implemented and fail closed.
 `dnfast` does not claim DNF5 policy or state compatibility.
 
 ## Native build and test

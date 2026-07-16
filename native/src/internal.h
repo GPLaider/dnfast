@@ -52,12 +52,15 @@ struct dnfast_context {
     char **action_requested_specs;
     uint8_t *action_requested_relation_kinds;
     size_t action_count;
+    char **satisfied_specs;
+    size_t satisfied_spec_count;
     char **decision_requiring;
     char **decision_provider;
     char **decision_relation;
     uint8_t *decision_kind;
     uint8_t *decision_installed;
     size_t decision_count;
+    size_t decision_capacity;
     char **problems;
     size_t problem_count;
     dnfast_inventory_record *inventory;
@@ -141,16 +144,19 @@ FD_t dnfast_transaction_truncated_duplicate(const dnfast_transaction_item *item)
 #endif
 dnfast_status dnfast_metadata_open(const dnfast_repo_input *input,
                                    FILE *streams[3], struct stat identity[3],
+                                   size_t stream_count,
                                    dnfast_error *error);
 void dnfast_metadata_close(FILE *streams[3]);
 dnfast_status dnfast_limits_before_repo(dnfast_context *context,
                                         const int metadata_fds[3],
+                                        size_t metadata_count,
                                         dnfast_error *error);
 dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
                                           struct s_Repo *repo,
                                           const dnfast_repo_input *input,
                                           FILE *streams[3],
                                           const struct stat identity[3],
+                                          size_t metadata_count,
                                           dnfast_error *error);
 
 #endif

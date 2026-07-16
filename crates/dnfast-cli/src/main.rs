@@ -26,7 +26,6 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "reinstall",
     "distro-sync",
     "advisory",
-    "history",
 ];
 
 fn main() -> ExitCode {
@@ -139,6 +138,7 @@ fn command_from_arguments(arguments: impl IntoIterator<Item = String>) -> Option
         "upgrade" => Some("upgrade"),
         "daemon" => Some("daemon"),
         "repo" => Some("repo"),
+        "history" => Some("history"),
         "search" => Some("search"),
         "doctor" => Some("doctor"),
         _ => Some("cli"),
@@ -166,10 +166,10 @@ mod tests {
     #[test]
     fn unsupported_command_is_detected_before_clap() {
         // Given an unsupported mutation command.
-        let arguments = ["history".to_owned(), "undo".to_owned()];
+        let arguments = ["module".to_owned(), "enable".to_owned()];
         // When the pre-dispatch boundary examines the command.
         let detected = unsupported_top_level_command(arguments);
         // Then it is classified before any configuration or solver is reachable.
-        assert_eq!(detected, Some("history"));
+        assert_eq!(detected, Some("module"));
     }
 }

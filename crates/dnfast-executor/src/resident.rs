@@ -38,6 +38,8 @@ const RUNTIME_PATH: [&str; 2] = ["run", "dnfast"];
 const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 const PLAN_LIFETIME_SECONDS: u64 = 300;
 const PROTOCOL_SCHEMA: &str = "dnfast.daemon.v1";
+type MaterializedPaths = (String, String, String);
+type MaterializedRepository = (MaterializedPaths, Vec<dnfast_metadata::CompletePackage>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonApproval {
@@ -165,6 +167,10 @@ enum ServerMessage {
         schema: String,
         message: String,
     },
+    Fallback {
+        schema: String,
+        reason: String,
+    },
 }
 
 pub fn daemon_status() -> Result<bool, DaemonError> {
@@ -182,6 +188,7 @@ pub fn daemon_status() -> Result<bool, DaemonError> {
     match read_frame::<ServerMessage>(&mut stream)? {
         ServerMessage::Pong { schema } if schema == PROTOCOL_SCHEMA => Ok(true),
         ServerMessage::Failed { message, .. } => Err(DaemonError::Protocol(message)),
+        ServerMessage::Fallback { .. } => Err(DaemonError::Unavailable),
         _ => Err(DaemonError::Protocol("unexpected ping response".into())),
     }
 }
@@ -201,6 +208,7 @@ pub fn warm_daemon(repositories: &[String]) -> Result<String, DaemonError> {
             rpmdb_cookie_sha256,
         } if schema == PROTOCOL_SCHEMA => Ok(rpmdb_cookie_sha256),
         ServerMessage::Failed { message, .. } => Err(DaemonError::Protocol(message)),
+        ServerMessage::Fallback { .. } => Err(DaemonError::Unavailable),
         _ => Err(DaemonError::Protocol("unexpected warm response".into())),
     }
 }
@@ -239,6 +247,7 @@ pub fn plan_via_daemon(
             Ok(DaemonPlan { plan })
         }
         ServerMessage::Failed { message, .. } => Err(DaemonError::Protocol(message)),
+        ServerMessage::Fallback { .. } => Err(DaemonError::Unavailable),
         _ => Err(DaemonError::Protocol(
             "unexpected resident plan response".into(),
         )),
@@ -270,6 +279,7 @@ pub fn transact_via_daemon(
             actions,
         } if schema == PROTOCOL_SCHEMA => (token, command, plan_digest, actions),
         ServerMessage::Failed { message, .. } => return Err(DaemonError::Protocol(message)),
+        ServerMessage::Fallback { .. } => return Err(DaemonError::Unavailable),
         _ => return Err(DaemonError::Protocol("unexpected prepare response".into())),
     };
     let approved = match approval {
@@ -439,6 +449,15 @@ fn handle_connection(state: &mut DaemonState, stream: &mut UnixStream) -> Result
         } => {
             require_schema(&schema)?;
             canonical_repository_ids(&repositories)?;
+            if requires_filelists(&packages) {
+                return write_frame(
+                    stream,
+                    &ServerMessage::Fallback {
+                        schema: PROTOCOL_SCHEMA.into(),
+                        reason: "absolute path selectors require the full filelists planner".into(),
+                    },
+                );
+            }
             let solved = state
                 .planner
                 .solve(parse_action(&action)?, packages, &repositories)?;
@@ -461,6 +480,15 @@ fn handle_connection(state: &mut DaemonState, stream: &mut UnixStream) -> Result
         } => {
             require_schema(&schema)?;
             canonical_repository_ids(&repositories)?;
+            if requires_filelists(&packages) {
+                return write_frame(
+                    stream,
+                    &ServerMessage::Fallback {
+                        schema: PROTOCOL_SCHEMA.into(),
+                        reason: "absolute path selectors require the full filelists planner".into(),
+                    },
+                );
+            }
             let action = parse_action(&action)?;
             let solved = state.planner.solve(action, packages, &repositories)?;
             state.prepare_and_execute(stream, solved)
@@ -634,6 +662,13 @@ struct ResidentPool {
     rpmdb_cookie: String,
     candidates: Vec<CandidatePackage>,
     metadata: Vec<(String, dnfast_metadata::CompletePackage)>,
+    last_solve: Option<CachedResidentSolve>,
+}
+
+struct CachedResidentSolve {
+    action: Action,
+    packages: Vec<String>,
+    plan: CanonicalSolverPlan,
 }
 
 struct SolvedPlan {
@@ -669,6 +704,8 @@ impl ResidentPlanner {
         packages: Vec<String>,
         repositories: &[String],
     ) -> Result<SolvedPlan, DaemonError> {
+        let trace = std::env::var_os("DNFASTD_TRACE").is_some();
+        let started = Instant::now();
         let packages = packages
             .into_iter()
             .map(PackageSpec::parse)
@@ -676,12 +713,38 @@ impl ResidentPlanner {
             .map_err(planning)?;
         let intent = TransactionIntent::new(action, packages).map_err(planning)?;
         self.ensure(repositories)?;
+        trace_phase(trace, started, "resident-ensure");
         let cached = self.cached.as_mut().expect("resident pool");
         let names = intent
             .packages()
             .iter()
             .map(|package| package.as_str())
             .collect::<Vec<_>>();
+        let now = now_unix()?;
+        if let Some(plan) = cached
+            .last_solve
+            .as_ref()
+            .filter(|entry| {
+                entry.action == action
+                    && entry
+                        .packages
+                        .iter()
+                        .map(String::as_str)
+                        .eq(names.iter().copied())
+                    && entry.plan.proposal().expires_at_unix() > now
+            })
+            .map(|entry| entry.plan.clone())
+        {
+            trace_phase(trace, started, "resident-solve-cache-hit");
+            return Ok(SolvedPlan {
+                plan,
+                integrity: cached.integrity.clone(),
+                policy: cached.policy.clone(),
+                repositories: cached.repositories.clone(),
+                inventory: cached.inventory.clone(),
+                rpmdb_cookie: cached.rpmdb_cookie.clone(),
+            });
+        }
         let policy = cached.policy.clone();
         let result = match action {
             Action::Install => {
@@ -693,6 +756,14 @@ impl ResidentPlanner {
             Action::Remove => cached.context.solve_erase_many(&names),
         }
         .map_err(planning)?;
+        trace_phase(trace, started, "resident-native-solve");
+        if trace {
+            eprintln!(
+                "dnfastd_trace native_actions={} native_decisions={}",
+                result.actions.len(),
+                result.decisions.len()
+            );
+        }
         let metadata = cached
             .metadata
             .iter()
@@ -705,10 +776,12 @@ impl ResidentPlanner {
             &cached.inventory,
         )
         .map_err(planning)?;
+        trace_phase(trace, started, "resident-native-adapter");
+        let satisfied_specs = transcript.satisfied_specs().to_vec();
         let resolved = transcript
             .into_resolved(&names, &cached.candidates, &metadata, &cached.inventory)
             .map_err(planning)?;
-        let now = now_unix()?;
+        trace_phase(trace, started, "resident-resolved");
         let plan = PlanBuilder {
             intent: &intent,
             snapshots: &cached.integrity,
@@ -717,8 +790,14 @@ impl ResidentPlanner {
             candidates: &cached.candidates,
             expires_at_unix: now.saturating_add(PLAN_LIFETIME_SECONDS),
         }
-        .build(&resolved)
+        .build_with_satisfied(&resolved, &satisfied_specs)
         .map_err(planning)?;
+        trace_phase(trace, started, "resident-plan-built");
+        cached.last_solve = Some(CachedResidentSolve {
+            action,
+            packages: names.iter().map(|name| (*name).to_owned()).collect(),
+            plan: plan.clone(),
+        });
         Ok(SolvedPlan {
             plan,
             integrity: cached.integrity.clone(),
@@ -736,21 +815,12 @@ impl ResidentPlanner {
                 && cached.integrity.planning_snapshot_sha256().as_str() == current_digest
         });
         if same_generation {
-            let architecture = self
-                .cached
-                .as_ref()
-                .expect("resident pool")
-                .policy
-                .base_arch();
-            let mut probe = NativeContext::open(architecture, || false).map_err(planning)?;
-            let current = probe
+            let cached = self.cached.as_mut().expect("resident pool");
+            let current = cached
+                .context
                 .read_installed_inventory_snapshot()
                 .map_err(planning)?;
-            if self
-                .cached
-                .as_ref()
-                .is_some_and(|cached| cached.rpmdb_cookie == current.rpmdb_cookie)
-            {
+            if cached.rpmdb_cookie == current.rpmdb_cookie {
                 return Ok(());
             }
         }
@@ -828,6 +898,7 @@ impl ResidentPlanner {
         .map_err(planning)?;
         cached.inventory = inventory;
         cached.rpmdb_cookie.clone_from(&current.rpmdb_cookie);
+        cached.last_solve = None;
         self.verified_rpmdb_cookie = Some(current.rpmdb_cookie);
         Ok(())
     }
@@ -877,9 +948,9 @@ fn build_pool(
     let mut candidates = Vec::new();
     let mut metadata = Vec::new();
     for (index, repository) in selected.iter().enumerate() {
-        let paths = materialize(workspace.path(), index, repository)?;
+        let (paths, solver_inputs) = materialize(&snapshot, workspace.path(), index, repository)?;
         context
-            .add_repository(Repository {
+            .add_repository_primary(Repository {
                 id: repository.id.clone(),
                 repomd_path: paths.0,
                 primary_path: paths.1,
@@ -888,10 +959,13 @@ fn build_pool(
                 cost: i32::try_from(repository.cost).map_err(planning)?,
             })
             .map_err(planning)?;
-        candidates.extend(candidates_for(repository)?);
+        candidates.extend(candidates_for(
+            repository,
+            &solver_inputs,
+            policy.base_arch(),
+        )?);
         metadata.extend(
-            repository
-                .solver_inputs
+            solver_inputs
                 .iter()
                 .cloned()
                 .map(|package| (repository.id.clone(), package)),
@@ -909,6 +983,7 @@ fn build_pool(
             rpmdb_cookie,
             candidates,
             metadata,
+            last_solve: None,
         },
         verified_cookie,
     ))
@@ -1092,12 +1167,15 @@ fn selected_repositories<'a>(
 }
 
 fn materialize(
+    snapshot: &PlanningSnapshot,
     root: &Path,
     index: usize,
     repository: &PlanningRepository,
-) -> Result<(String, String, String), DaemonError> {
+) -> Result<MaterializedRepository, DaemonError> {
     let prefix = format!("repository-{index}");
-    let metadata = repository.materialize_native_xml().map_err(planning)?;
+    let metadata = snapshot
+        .materialize_native_primary(repository)
+        .map_err(planning)?;
     let repomd = write_temp(root, &format!("{prefix}-repomd.xml"), metadata.repomd())?;
     let primary = write_temp(root, &format!("{prefix}-primary.xml"), metadata.primary())?;
     let filelists = write_temp(
@@ -1105,7 +1183,10 @@ fn materialize(
         &format!("{prefix}-filelists.xml"),
         metadata.filelists(),
     )?;
-    Ok((display(&repomd)?, display(&primary)?, display(&filelists)?))
+    Ok((
+        (display(&repomd)?, display(&primary)?, display(&filelists)?),
+        metadata.solver_inputs().to_vec(),
+    ))
 }
 
 fn write_temp(root: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, DaemonError> {
@@ -1120,50 +1201,53 @@ fn display(path: &Path) -> Result<String, DaemonError> {
         .ok_or_else(|| DaemonError::Planning("temporary metadata path is not UTF-8".into()))
 }
 
-fn candidates_for(repository: &PlanningRepository) -> Result<Vec<CandidatePackage>, DaemonError> {
-    repository
-        .solver_inputs
-        .iter()
-        .map(|item| {
-            let architecture = match item.arch.as_str() {
-                "aarch64" => Architecture::Aarch64,
-                "x86_64" => Architecture::X86_64,
-                "noarch" => Architecture::Noarch,
-                _ => {
-                    return Err(DaemonError::Planning(
-                        "root-published metadata has an unsupported architecture".into(),
-                    ));
-                }
-            };
-            let epoch = item
-                .epoch
-                .parse()
-                .map_err(|_| DaemonError::Planning("invalid metadata epoch".into()))?;
-            Ok(CandidatePackage {
-                name: item.name.clone(),
-                evra: Evra::new(
-                    epoch,
-                    item.version.clone(),
-                    item.release.clone(),
-                    architecture,
-                ),
-                vendor: if item.vendor.is_empty() {
-                    "unknown".into()
-                } else {
-                    item.vendor.clone()
-                },
-                repo_id: repository.id.clone(),
-                priority: repository.priority,
-                cost: repository.cost,
-                package_size: item.package_size,
-                installed_size: item.installed_size,
-                checksum_sha256: item.checksum.clone(),
-                location: item.location.clone(),
-                excluded: false,
-                modular: false,
-            })
-        })
-        .collect()
+fn candidates_for(
+    repository: &PlanningRepository,
+    solver_inputs: &[dnfast_metadata::CompletePackage],
+    base_architecture: Architecture,
+) -> Result<Vec<CandidatePackage>, DaemonError> {
+    let mut candidates = Vec::new();
+    for item in solver_inputs {
+        let architecture = match item.arch.as_str() {
+            "aarch64" => Architecture::Aarch64,
+            "x86_64" => Architecture::X86_64,
+            "noarch" => Architecture::Noarch,
+            "i686" if base_architecture == Architecture::X86_64 => continue,
+            _ => {
+                return Err(DaemonError::Planning(
+                    "root-published metadata has an unsupported architecture".into(),
+                ));
+            }
+        };
+        let epoch = item
+            .epoch
+            .parse()
+            .map_err(|_| DaemonError::Planning("invalid metadata epoch".into()))?;
+        candidates.push(CandidatePackage {
+            name: item.name.clone(),
+            evra: Evra::new(
+                epoch,
+                item.version.clone(),
+                item.release.clone(),
+                architecture,
+            ),
+            vendor: if item.vendor.is_empty() {
+                "unknown".into()
+            } else {
+                item.vendor.clone()
+            },
+            repo_id: repository.id.clone(),
+            priority: repository.priority,
+            cost: repository.cost,
+            package_size: item.package_size,
+            installed_size: item.installed_size,
+            checksum_sha256: item.checksum.clone(),
+            location: item.location.clone(),
+            excluded: false,
+            modular: false,
+        });
+    }
+    Ok(candidates)
 }
 
 fn solve_token(
@@ -1249,6 +1333,10 @@ fn canonical_repository_ids(repositories: &[String]) -> Result<(), DaemonError> 
     } else {
         Ok(())
     }
+}
+
+fn requires_filelists(packages: &[String]) -> bool {
+    packages.iter().any(|package| package.starts_with('/'))
 }
 
 fn require_schema(schema: &str) -> Result<(), DaemonError> {
@@ -1366,5 +1454,18 @@ mod tests {
         assert!(canonical_repository_ids(&["updates".into(), "fedora".into()]).is_err());
         assert!(canonical_repository_ids(&["fedora".into(), "fedora".into()]).is_err());
         assert!(canonical_repository_ids(&["../fedora".into()]).is_err());
+    }
+
+    #[test]
+    fn only_absolute_path_intents_require_the_full_filelists_fallback() {
+        assert!(requires_filelists(&["/usr/bin/example".into()]));
+        assert!(requires_filelists(&[
+            "ordinary-package".into(),
+            "/opt/example".into()
+        ]));
+        assert!(!requires_filelists(&[
+            "ordinary-package".into(),
+            "capability(foo) >= 1".into()
+        ]));
     }
 }

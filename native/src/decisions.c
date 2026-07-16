@@ -41,13 +41,35 @@ static int selected_provider(dnfast_context *context, Id dependency, Id *provide
     return found == 0 ? 0 : 1;
 }
 
+static int reserve_decisions(dnfast_context *context, size_t count) {
+    if (count <= context->decision_capacity) return 1;
+    size_t capacity = context->decision_capacity == 0 ? 64 : context->decision_capacity;
+    while (capacity < count) {
+        if (capacity > SIZE_MAX / 2) return 0;
+        capacity *= 2;
+    }
+    void *grown = realloc(context->decision_requiring, capacity * sizeof(char *));
+    if (grown == NULL) return 0;
+    context->decision_requiring = grown;
+    grown = realloc(context->decision_provider, capacity * sizeof(char *));
+    if (grown == NULL) return 0;
+    context->decision_provider = grown;
+    grown = realloc(context->decision_relation, capacity * sizeof(char *));
+    if (grown == NULL) return 0;
+    context->decision_relation = grown;
+    grown = realloc(context->decision_kind, capacity);
+    if (grown == NULL) return 0;
+    context->decision_kind = grown;
+    grown = realloc(context->decision_installed, capacity);
+    if (grown == NULL) return 0;
+    context->decision_installed = grown;
+    context->decision_capacity = capacity;
+    return 1;
+}
+
 static int append(dnfast_context *context, Solvable *requiring, Id dependency, Id provider, uint8_t kind) {
     size_t index = context->decision_count, count = index + 1;
-    void *grown = realloc(context->decision_requiring, count * sizeof(char *)); if (grown == NULL) return 0; context->decision_requiring = grown;
-    grown = realloc(context->decision_provider, count * sizeof(char *)); if (grown == NULL) return 0; context->decision_provider = grown;
-    grown = realloc(context->decision_relation, count * sizeof(char *)); if (grown == NULL) return 0; context->decision_relation = grown;
-    grown = realloc(context->decision_kind, count); if (grown == NULL) return 0; context->decision_kind = grown;
-    grown = realloc(context->decision_installed, count); if (grown == NULL) return 0; context->decision_installed = grown;
+    if (!reserve_decisions(context, count)) return 0;
     context->decision_requiring[index] = NULL; context->decision_provider[index] = NULL; context->decision_relation[index] = NULL;
     context->decision_count = count;
     context->decision_requiring[index] = dnfast_solvable_identity(context->pool, requiring);

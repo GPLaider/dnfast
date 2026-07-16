@@ -10,7 +10,8 @@ use dnfast_core::{
     SolverPolicy,
 };
 use dnfast_repo::{
-    KeyBundle, MutationProfile, RepoConfig, key_bundle_digest, load_system_mutation_profile,
+    KeyBundle, MetadataExpire, MutationProfile, RepoConfig, key_bundle_digest,
+    load_system_mutation_profile,
 };
 use hex::encode;
 use rustix::process::geteuid;
@@ -76,6 +77,14 @@ impl RootPlanningPublisher {
     }
 
     pub fn publish_current(&self, published_at_unix: u64) -> Result<String, PlanningError> {
+        self.publish_system(published_at_unix, None)
+    }
+
+    fn publish_system(
+        &self,
+        published_at_unix: u64,
+        refreshed_repository_ids: Option<&[String]>,
+    ) -> Result<String, PlanningError> {
         self.require_publisher()?;
         let profile = load_system_mutation_profile()
             .map_err(|error| PlanningError::Input(error.to_string()))?;
@@ -85,14 +94,21 @@ impl RootPlanningPublisher {
         let inventory = context
             .read_installed_inventory()
             .map_err(|error| PlanningError::Input(error.to_string()))?;
-        self.publish(&profile, inventory, published_at_unix, host_architecture)
+        self.publish(
+            &profile,
+            inventory,
+            published_at_unix,
+            host_architecture,
+            refreshed_repository_ids,
+        )
     }
 
     pub fn publish_after_verified_refresh(
         &self,
         published_at_unix: u64,
+        refreshed_repository_ids: &[String],
     ) -> Result<String, PlanningError> {
-        self.publish_current(published_at_unix)
+        self.publish_system(published_at_unix, Some(refreshed_repository_ids))
     }
 
     /// Publishes the live RPMDB inventory without changing the current source bindings.
@@ -124,8 +140,11 @@ impl RootPlanningPublisher {
         let source = current.digest()?;
         let mut payload = current.payload().clone();
         payload.inventory = inventory;
-        let published =
-            self.store_snapshot(PlanningSnapshot::new(current.published_at_unix(), payload)?)?;
+        let published = self.store_snapshot(PlanningSnapshot::new_with_refreshed_repositories(
+            current.published_at_unix(),
+            current.refreshed_repository_ids().to_vec(),
+            payload,
+        )?)?;
         Ok((source, published))
     }
 
@@ -142,7 +161,9 @@ impl RootPlanningPublisher {
         inventory: InstalledInventory,
         published_at_unix: u64,
         host_architecture: Architecture,
+        refreshed_repository_ids: Option<&[String]>,
     ) -> Result<String, PlanningError> {
+        trace_memory("planning:begin");
         self.require_publisher()?;
         if self.require_root {
             let public_parent =
@@ -161,12 +182,17 @@ impl RootPlanningPublisher {
             published_at_unix,
             host_architecture,
             &Cache::new(&self.roots.cache_root),
+            refreshed_repository_ids,
+            Some(&planning),
         )?;
+        trace_memory("planning:snapshot-built");
         validate_tree(&self.roots.cache_root, self.owner)?;
         let bytes = snapshot.canonical_bytes()?;
-        let digest = snapshot.digest()?;
+        trace_memory("planning:canonicalized");
+        let digest = digest(&bytes);
         publish_snapshot(&planning, &snapshots, &digest, &bytes)?;
         garbage_collect(&snapshots, &digest)?;
+        trace_memory("planning:published");
         Ok(digest)
     }
 
@@ -181,7 +207,7 @@ impl RootPlanningPublisher {
         planning.set_mode(0o755)?;
         let snapshots = planning.child(SNAPSHOTS_DIRECTORY, true, 0o755)?;
         let bytes = snapshot.canonical_bytes()?;
-        let digest = snapshot.digest()?;
+        let digest = digest(&bytes);
         publish_snapshot(&planning, &snapshots, &digest, &bytes)?;
         garbage_collect(&snapshots, &digest)?;
         Ok(digest)
@@ -189,6 +215,88 @@ impl RootPlanningPublisher {
 
     pub fn open_snapshot(&self) -> Result<PlanningSnapshot, PlanningError> {
         open_snapshot(&self.roots, self.owner)
+    }
+
+    pub fn current_metadata_is_fresh(
+        &self,
+        requested_repository_ids: &[String],
+        now_unix: u64,
+    ) -> Result<bool, PlanningError> {
+        self.require_publisher()?;
+        let profile = load_system_mutation_profile()
+            .map_err(|error| PlanningError::Input(error.to_string()))?;
+        let snapshot = self.open_snapshot()?;
+        if snapshot.payload().configuration != normalized_configuration(&profile)?
+            || now_unix < snapshot.published_at_unix()
+        {
+            return Ok(false);
+        }
+        let host = host_rpm_architecture()?;
+        let mut enabled = profile
+            .repositories
+            .iter()
+            .filter(|repository| repository.enabled)
+            .collect::<Vec<_>>();
+        enabled.sort_by(|left, right| left.id.cmp(&right.id));
+        let selected = enabled
+            .iter()
+            .copied()
+            .filter(|repository| {
+                requested_repository_ids.is_empty()
+                    || requested_repository_ids.contains(&repository.id)
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty()
+            || requested_repository_ids
+                .iter()
+                .any(|id| !enabled.iter().any(|repository| repository.id == *id))
+        {
+            return Err(PlanningError::Input(
+                "selected repository is not enabled".into(),
+            ));
+        }
+        let preferences = enabled
+            .iter()
+            .map(|repository| {
+                RepoPreference::new(
+                    &repository.id,
+                    u32::from(repository.priority),
+                    repository.cost,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(domain)?;
+        let expected_policy = policy_for(host, &profile, preferences)?;
+        if snapshot.payload().policy.solver != expected_policy
+            || snapshot.payload().policy.included_packages != profile.main.includepkgs
+            || snapshot.payload().policy.installonly_limit != profile.main.installonly_limit
+        {
+            return Ok(false);
+        }
+        let age = now_unix - snapshot.published_at_unix();
+        for configured in selected {
+            if !snapshot.refreshed_repository_ids().contains(&configured.id) {
+                return Ok(false);
+            }
+            match configured.metadata_expire {
+                MetadataExpire::AfterSeconds(seconds) if age >= seconds => return Ok(false),
+                MetadataExpire::AfterSeconds(_) | MetadataExpire::Never => {}
+            }
+            let Some(published) = snapshot
+                .payload()
+                .allowed_repositories
+                .iter()
+                .find(|repository| repository.id == configured.id)
+            else {
+                return Ok(false);
+            };
+            if configured.key_bundle_digest.map(hex::encode).as_deref()
+                != Some(published.trust.key_bundle_sha256().as_str())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn revalidate_snapshot(&self, snapshot: &PlanningSnapshot) -> Result<(), PlanningError> {
@@ -205,6 +313,8 @@ impl RootPlanningPublisher {
             snapshot.published_at_unix(),
             host_architecture,
             &Cache::new(&self.roots.cache_root),
+            None,
+            None,
         )?;
         validate_tree(&self.roots.cache_root, self.owner)?;
         require_same_source_payload(snapshot, &refreshed)?;
@@ -239,6 +349,19 @@ impl RootPlanningPublisher {
         }
         Ok(())
     }
+}
+
+fn trace_memory(phase: &str) {
+    if std::env::var_os("DNFAST_REFRESH_TRACE").is_none() {
+        return;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let fields = status
+        .lines()
+        .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("dnfast-refresh-trace phase={phase} {fields}");
 }
 
 impl PlanningSnapshot {
@@ -286,6 +409,8 @@ fn snapshot_from(
     published_at_unix: u64,
     host_architecture: Architecture,
     cache: &Cache,
+    refreshed_repository_ids: Option<&[String]>,
+    blob_store: Option<&TrustedDirectory>,
 ) -> Result<PlanningSnapshot, PlanningError> {
     let configuration = normalized_configuration(profile)?;
     let mut enabled = profile
@@ -319,21 +444,26 @@ fn snapshot_from(
     let policy = policy_for(host_architecture, profile, preferences)?;
     let repositories = enabled
         .into_iter()
-        .map(|repository| repository_payload(repository, cache, published_at_unix))
+        .map(|repository| repository_payload(repository, cache, published_at_unix, blob_store))
         .collect::<Result<Vec<_>, _>>()?;
-    PlanningSnapshot::new(
-        published_at_unix,
-        PlanningPayload {
-            policy: PlanningPolicy {
-                solver: policy,
-                included_packages: profile.main.includepkgs.clone(),
-                installonly_limit: profile.main.installonly_limit,
-            },
-            inventory,
-            allowed_repositories: repositories,
-            configuration,
+    let payload = PlanningPayload {
+        policy: PlanningPolicy {
+            solver: policy,
+            included_packages: profile.main.includepkgs.clone(),
+            installonly_limit: profile.main.installonly_limit,
         },
-    )
+        inventory,
+        allowed_repositories: repositories,
+        configuration,
+    };
+    match refreshed_repository_ids {
+        Some(ids) => PlanningSnapshot::new_with_refreshed_repositories(
+            published_at_unix,
+            ids.to_vec(),
+            payload,
+        ),
+        None => PlanningSnapshot::new(published_at_unix, payload),
+    }
 }
 
 fn policy_for(
@@ -365,6 +495,7 @@ fn repository_payload(
     repository: &RepoConfig,
     cache: &Cache,
     valid_at_unix: u64,
+    blob_store: Option<&TrustedDirectory>,
 ) -> Result<PlanningRepository, PlanningError> {
     if !repository.sslverify
         || !repository.gpgcheck
@@ -399,7 +530,7 @@ fn repository_payload(
     let generation = cache
         .open_current_verified_complete_generation(&repository.id)
         .map_err(|error| PlanningError::Cache(error.to_string()))?;
-    generation_payload(repository, generation, trust, bundle)
+    generation_payload(repository, generation, trust, bundle, blob_store)
 }
 
 fn generation_payload(
@@ -407,6 +538,7 @@ fn generation_payload(
     generation: VerifiedCompleteGeneration,
     trust: RepoTrustPolicy,
     bundle: KeyBundle,
+    blob_store: Option<&TrustedDirectory>,
 ) -> Result<PlanningRepository, PlanningError> {
     let keys = bundle
         .paths
@@ -427,6 +559,15 @@ fn generation_payload(
             "cache generation repository differs from configuration".into(),
         ));
     }
+    if let Some(planning) = blob_store {
+        for payload in [
+            generation.repomd(),
+            generation.primary(),
+            generation.filelists(),
+        ] {
+            crate::snapshot_store::publish_blob(planning, payload.sha256(), payload.bytes())?;
+        }
+    }
     let origin = generation.origin();
     Ok(PlanningRepository {
         id: repository.id.clone(),
@@ -440,8 +581,6 @@ fn generation_payload(
         repomd: crate::model::PlanningBytes::from_verified(generation.repomd()),
         primary: crate::model::PlanningBytes::from_verified(generation.primary()),
         filelists: crate::model::PlanningBytes::from_verified(generation.filelists()),
-        solver_inputs: generation.solver_inputs().to_vec(),
-        filelist_inputs: generation.filelist_inputs().to_vec(),
         trust,
         keys,
         repomd_authentication: generation.repomd_authentication().clone(),

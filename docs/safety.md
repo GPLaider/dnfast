@@ -22,6 +22,11 @@ also downloads `repomd.xml.asc` and verifies the detached OpenPGP signature with
 root-owned key bundle at the refresh timestamp. The verified primary and signing fingerprints,
 key-bundle digest, and signature digest are bound into the cache generation and planning snapshot.
 
+An apparently unchanged refresh is not a stale-cache shortcut. Dnfast first fetches the current
+repomd and requires an exact byte digest match, then reopens and rehashes the complete immutable
+raw metadata and search index before reuse. Any mismatch or missing object takes the full refresh
+path or fails closed. A changed repomd can never reuse the old primary or filelists payload.
+
 Snapshots and artifacts are immutable and content addressed. Complete objects are staged on the
 cache filesystem, synced, and renamed before an atomic pointer update. Readers revalidate sizes,
 digests, ownership, modes, retained descriptors, and safe path shapes. Failed refresh or download
@@ -32,6 +37,12 @@ trusted UID. Custom cache roots must not be shared with an untrusted writer.
 Implementation ceilings are 2 MiB for Metalink, 16 MiB for repomd, 512 MiB for compressed
 metadata, 1 GiB for opened metadata, 32 Metalink resources, and 2,000,000 packages. Arithmetic is
 overflow checked and declared oversize input fails before download or allocation.
+
+Schema-v4 planning snapshots refer to content-addressed payloads instead of embedding base64.
+Materialization is permitted only for a snapshot read from its trusted, root-owned planning store;
+each blob is opened beneath that store without following an attacker-selected path and its exact
+size and SHA-256 are checked. The executor stages both compressed evidence and decoded native XML
+from that one validated result. Legacy schema-v3 embedded payloads remain read-only compatible.
 
 ## Configuration, package, and key trust
 
@@ -61,6 +72,13 @@ token binds one canonical solve, RPMDB cookie, planning/trust/policy generation,
 nonce, and sequence; only the same connection can approve it. A token mismatch, unexpected frame,
 changed current snapshot, changed RPMDB cookie, or artifact mismatch aborts before writes and does
 not fall back to another execution path.
+
+The resident solve cache is an optimization of that same proof, not a second authority. A hit
+requires the identical canonical intent, repository selection, planning generation, and RPMDB
+cookie and produces a newly sequence-bound prepared token. The pool omits filelists to reduce the
+normal working set; an absolute-path selector gets an explicit non-authorizing fallback response
+and is solved by the snapshot-bound full planner. Integrity or protocol errors never trigger this
+fallback.
 
 The compatibility fallback can launch only `/usr/libexec/dnfast-executor` with a retained plan
 descriptor and a fixed argument shape. Both paths require root, reject ambient path substitution,

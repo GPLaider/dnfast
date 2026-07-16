@@ -264,7 +264,7 @@ fn version_one_unknown_duplicate_and_extra_manifest_shapes_reject() {
     let original = fs::read_to_string(&manifest).expect("manifest");
     fs::write(
         &manifest,
-        original.replacen("\"version\":2", "\"version\":1", 1),
+        original.replacen("\"version\":3", "\"version\":1", 1),
     )
     .expect("v1");
     assert!(matches!(
@@ -276,7 +276,7 @@ fn version_one_unknown_duplicate_and_extra_manifest_shapes_reject() {
         cache.open_by_digest(&snapshot.digest),
         Err(CacheError::Corrupt(_))
     ));
-    fs::write(&manifest, original.replacen("{", "{\"version\":2,", 1)).expect("duplicate");
+    fs::write(&manifest, original.replacen("{", "{\"version\":3,", 1)).expect("duplicate");
     assert!(matches!(
         cache.open_by_digest(&snapshot.digest),
         Err(CacheError::Corrupt(_))

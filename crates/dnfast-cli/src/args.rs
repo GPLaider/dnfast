@@ -70,6 +70,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    #[command(about = "Inspect the durable dnfast transaction journal")]
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
     #[command(about = "Report read-only runtime capabilities")]
     Doctor,
     #[command(about = "Search verified cached repository metadata without network access")]
@@ -80,6 +85,17 @@ pub(crate) enum Commands {
         cache_dir: Option<PathBuf>,
         query: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum HistoryCommand {
+    #[command(about = "List recent transactions and their terminal state")]
+    List {
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
+    #[command(about = "Show the verified journal sequence for one transaction")]
+    Info { transaction_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +154,11 @@ pub(crate) enum RepoCommand {
     },
     #[command(about = "Refresh verified metadata into the immutable cache")]
     Refresh {
+        #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+        repositories: Vec<String>,
+    },
+    #[command(about = "Refresh only when trusted metadata_expire policy says the cache is stale")]
+    Makecache {
         #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
         repositories: Vec<String>,
     },

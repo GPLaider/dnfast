@@ -1,6 +1,6 @@
 use std::{io::Read, time::Duration};
 
-use crate::{RefreshError, url_policy::validate_https};
+use crate::{RefreshError, url_policy::validate_https_endpoint};
 
 pub trait Transport {
     fn get(&self, url: &str, maximum_bytes: u64) -> Result<Vec<u8>, RefreshError>;
@@ -18,11 +18,20 @@ impl HttpTransport {
             .https_only(true)
             .max_redirects(0)
             .max_redirects_will_error(true)
-            .timeout_global(Some(Duration::from_secs(45)))
+            // Fedora's filelists metadata is often tens of MiB.  A hard 45 second
+            // request deadline aborts healthy, continuously-progressing transfers
+            // on distant mirrors and makes the mirror fallback download the same
+            // objects again.  Keep the short connect/header/body-idle deadlines,
+            // but allow a bounded five minutes for a large response to complete.
+            .timeout_global(Some(Duration::from_secs(300)))
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_send_request(Some(Duration::from_secs(10)))
             .timeout_send_body(Some(Duration::from_secs(10)))
-            .timeout_recv_response(Some(Duration::from_secs(10)))
+            // A busy Fedora mirror can take more than ten seconds to begin a
+            // large metadata response even though the connection is healthy.
+            // Keep connect and body-idle limits short, but do not discard a
+            // selected, checksum-bound mirror during normal server queueing.
+            .timeout_recv_response(Some(Duration::from_secs(30)))
             .timeout_recv_body(Some(Duration::from_secs(10)))
             .user_agent(concat!("dnfast/", env!("CARGO_PKG_VERSION")))
             .tls_config(
@@ -44,7 +53,7 @@ impl Default for HttpTransport {
 
 impl Transport for HttpTransport {
     fn get(&self, url: &str, maximum_bytes: u64) -> Result<Vec<u8>, RefreshError> {
-        validate_https(url)?;
+        validate_https_endpoint(url)?;
         let response = self
             .agent
             .get(url)

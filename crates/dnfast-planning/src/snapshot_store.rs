@@ -9,6 +9,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use sha2::Digest;
+
 use crate::{PlanningError, PlanningRoots, PlanningSnapshot, fs::TrustedDirectory};
 
 const CURRENT_POINTER: &str = "current";
@@ -25,13 +27,83 @@ pub(crate) fn open_snapshot(
     let snapshots = planning.child("snapshots", false, 0)?;
     let snapshot = snapshots.child(&digest, false, 0)?;
     let bytes = snapshot.read(SNAPSHOT_FILE, MAX_SNAPSHOT_BYTES)?;
-    let result = PlanningSnapshot::from_canonical_bytes(&bytes)?;
+    let mut result = PlanningSnapshot::from_canonical_bytes(&bytes)?;
     if result.digest()? != digest {
         return Err(PlanningError::UnsafeSnapshot(
             "pointer digest differs from payload".into(),
         ));
     }
+    result.attach_storage(roots.planning_root(), owner);
     Ok(result)
+}
+
+pub(crate) fn publish_blob(
+    planning: &TrustedDirectory,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), PlanningError> {
+    if !valid_digest(digest) || format!("{:x}", sha2::Sha256::digest(bytes)) != digest {
+        return Err(PlanningError::UnsafeSnapshot(
+            "planning blob digest differs from payload".into(),
+        ));
+    }
+    let blobs = planning.child("blobs", true, 0o755)?;
+    let sha256 = blobs.child("sha256", true, 0o755)?;
+    if let Some(existing) = sha256.read_if_present(digest, bytes.len())? {
+        if existing != bytes {
+            return Err(PlanningError::UnsafeSnapshot(
+                "immutable planning blob digest collision".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let temporary = format!(
+        "/proc/self/fd/{}/.blob-{digest}-{}-{}",
+        sha256.fd().as_fd().as_raw_fd(),
+        std::process::id(),
+        now_nanos()?
+    );
+    write_file(Path::new(&temporary), bytes)?;
+    let target = format!(
+        "/proc/self/fd/{}/{}",
+        sha256.fd().as_fd().as_raw_fd(),
+        digest
+    );
+    match fs::rename(&temporary, &target) {
+        Ok(()) => sha256.sync(),
+        Err(_error) if sha256.read_if_present(digest, bytes.len())?.is_some() => {
+            fs::remove_file(&temporary).map_err(io)?;
+            let existing = sha256.read(digest, bytes.len())?;
+            if existing != bytes {
+                return Err(PlanningError::UnsafeSnapshot(
+                    "immutable planning blob digest collision".into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => Err(io(error)),
+    }
+}
+
+pub(crate) fn read_blob(
+    planning_root: &Path,
+    owner: u32,
+    digest: &str,
+    size: u64,
+) -> Result<Vec<u8>, PlanningError> {
+    if !valid_digest(digest) {
+        return Err(PlanningError::UnsafeSnapshot(
+            "invalid planning blob digest".into(),
+        ));
+    }
+    let maximum = usize::try_from(size)
+        .map_err(|error| PlanningError::UnsafeSnapshot(error.to_string()))?
+        .checked_add(1)
+        .ok_or_else(|| PlanningError::UnsafeSnapshot("planning blob size overflow".into()))?;
+    let planning = TrustedDirectory::open(planning_root, owner, false, 0)?;
+    let blobs = planning.child("blobs", false, 0)?;
+    let sha256 = blobs.child("sha256", false, 0)?;
+    sha256.read(digest, maximum)
 }
 
 pub(crate) fn current_digest(roots: &PlanningRoots, owner: u32) -> Result<String, PlanningError> {

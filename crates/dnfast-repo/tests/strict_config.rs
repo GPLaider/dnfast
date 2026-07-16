@@ -82,6 +82,28 @@ fn stock_fedora_rpm_repository_type_is_accepted_without_adding_a_source() {
 }
 
 #[test]
+fn stock_copr_colon_id_is_accepted_but_path_syntax_remains_rejected() {
+    let accepted = "[copr:copr.fedorainfracloud.org:owner:project]\nbaseurl=https://example.test/repo\nenabled=0\nenabled_metadata=1\n";
+    let profile =
+        parse_repo_profile(Path::new("copr.repo"), accepted, &MainConfig::default()).unwrap();
+    assert_eq!(
+        profile.repositories[0].id,
+        "copr:copr.fedorainfracloud.org:owner:project"
+    );
+    for rejected in ["../escape", "slash/id", "space id"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once("a".repeat(256)))
+    {
+        let input = format!("[{rejected}]\nbaseurl=https://example.test/repo\n");
+        assert!(
+            parse_repo_profile(Path::new("bad.repo"), &input, &MainConfig::default()).is_err(),
+            "{rejected}"
+        );
+    }
+}
+
+#[test]
 fn stock_fedora_countme_is_accepted_as_inert_metadata() {
     // Given Fedora 44's stock countme declaration and a fixed metalink authority.
     let input = "[fedora]\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-44&arch=aarch64\ncountme=1\n";

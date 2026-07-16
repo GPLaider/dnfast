@@ -77,7 +77,7 @@ fn zstd_snapshot_metadata_materializes_xml_for_the_native_solver_boundary() {
 
     // When: the root planner writes its native-solver metadata inputs.
     let materialized = draft
-        .write_repository(&repository, 0)
+        .write_legacy_repository(&repository, 0)
         .expect("materialized repository");
     let mut primary_source = draft
         .open(&materialized.input.primary)
@@ -140,7 +140,7 @@ fn durable_generation_omits_native_xml_and_redecodes_raw_compressed_metadata() {
     let mut draft = draft(root.path());
     let repository = zstd_repository();
     let materialized = draft
-        .write_repository(&repository, 0)
+        .write_legacy_repository(&repository, 0)
         .expect("materialized repository");
     let repomd_name = materialized.input.repomd.name.clone();
     let primary_name = materialized.input.primary.name.clone();
@@ -260,11 +260,11 @@ fn primary_materialization_failure_identifies_the_metadata_role() {
     repository.primary = planning_bytes(b"not-zstd");
 
     // When: root materializes local metadata for the native solver.
-    let result = draft.write_repository(&repository, 0);
+    let result = draft.write_legacy_repository(&repository, 0);
 
     // Then: the actionable failure names the role without exposing payload contents.
     assert!(
-        matches!(result, Err(PreparationError::Snapshot(message)) if message.starts_with("primary rpm-md materialization failed:"))
+        matches!(result, Err(PreparationError::Snapshot(message)) if message.contains("primary rpm-md materialization failed:"))
     );
 }
 
@@ -274,16 +274,6 @@ pub(super) fn zstd_repository() -> PlanningRepository {
     let repomd = fs::read(metadata.join("repomd.xml")).expect("repomd");
     let primary = fs::read(metadata.join("primary.xml.zst")).expect("primary");
     let filelists = fs::read(metadata.join("filelists.xml.zst")).expect("filelists");
-    let records = dnfast_metadata::parse_repomd_records(&repomd).expect("repomd records");
-    let solver_inputs = dnfast_metadata::parse_primary_records(
-        dnfast_metadata::decode_primary(primary.as_slice(), &records.primary)
-            .expect("primary XML")
-            .as_slice(),
-    )
-    .expect("primary records");
-    let filelist_inputs =
-        dnfast_metadata::parse_filelists_record(filelists.as_slice(), &records.filelists)
-            .expect("filelists records");
     let certificate = b"planning-key";
     let bundle_path = "/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-aarch64";
     let mut bundle = Sha256::new();
@@ -312,8 +302,6 @@ pub(super) fn zstd_repository() -> PlanningRepository {
         repomd: planning_bytes(&repomd),
         primary: planning_bytes(&primary),
         filelists: planning_bytes(&filelists),
-        solver_inputs,
-        filelist_inputs,
         trust,
         keys: vec![PlanningKey {
             bundle_path: bundle_path.into(),

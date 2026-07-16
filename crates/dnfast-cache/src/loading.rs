@@ -37,14 +37,56 @@ impl Cache {
 
     pub fn load(&self, repository: &str) -> Result<Snapshot, CacheError> {
         let digest = self.current_pointer(repository)?.digest;
-        let complete = self.open_by_digest(&digest)?;
-        if complete.repository != repository {
+        let (stored_repository, packages) = self.open_search_index(&digest)?;
+        if stored_repository != repository {
             return Err(CacheError::Corrupt("repository identity mismatch".into()));
         }
-        Ok(Snapshot {
-            digest,
-            packages: complete.packages,
-        })
+        Ok(Snapshot { digest, packages })
+    }
+
+    pub(crate) fn open_search_index(
+        &self,
+        digest: &str,
+    ) -> Result<(String, Vec<dnfast_metadata::Package>), CacheError> {
+        if !valid_digest(digest) {
+            return Err(CacheError::Corrupt("invalid object digest".into()));
+        }
+        let object = self.root.join("objects/sha256").join(digest);
+        reject_symlink(&object, true)?;
+        let identity = object_identity(&object)?;
+        let anchored = AnchoredDirectory::open(&object)?;
+        let manifest_bytes =
+            anchored.read(std::ffi::OsStr::new("manifest.json"), MAX_MANIFEST_BYTES)?;
+        let probe: VersionProbe = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| CacheError::Corrupt(error.to_string()))?;
+        match probe.version {
+            None | Some(1) => return Err(CacheError::CacheUpgradeRequired),
+            Some(2 | 3) => {}
+            Some(_) => return Err(CacheError::Corrupt("unsupported manifest version".into())),
+        }
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| CacheError::Corrupt(error.to_string()))?;
+        validate_manifest(&object, &manifest)?;
+        if manifest.repomd.sha256 != digest {
+            return Err(CacheError::Corrupt("manifest identity mismatch".into()));
+        }
+        let repomd = verify_file(&anchored, &manifest.repomd)?;
+        let primary = verified_bytes(&anchored, &manifest.primary)?;
+        let record = parse_repomd(&repomd).map_err(metadata_error)?;
+        if record.checksum != primary.sha256() || record.size != primary.size() {
+            return Err(CacheError::Corrupt(
+                "primary bytes differ from repomd record".into(),
+            ));
+        }
+        let packages = decode_json(&anchored, &manifest.search_index)?;
+        let repository = String::from_utf8(verify_file(&anchored, &manifest.repository)?)
+            .map_err(|error| CacheError::Corrupt(error.to_string()))?;
+        if object_identity(&object)? != identity {
+            return Err(CacheError::Corrupt(
+                "object directory changed during search-index open".into(),
+            ));
+        }
+        Ok((repository, packages))
     }
 
     pub fn open_by_digest(&self, digest: &str) -> Result<CompleteSnapshot, CacheError> {
@@ -61,7 +103,7 @@ impl Cache {
             .map_err(|error| CacheError::Corrupt(error.to_string()))?;
         match probe.version {
             None | Some(1) => return Err(CacheError::CacheUpgradeRequired),
-            Some(2) => {}
+            Some(2 | 3) => {}
             Some(_) => return Err(CacheError::Corrupt("unsupported manifest version".into())),
         }
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
@@ -115,11 +157,8 @@ impl Cache {
         &self,
         digest: &str,
     ) -> Result<VerifiedCompleteGeneration, CacheError> {
-        let snapshot = self.open_by_digest(digest)?;
-        if snapshot.integrity != SnapshotIntegrity::CompleteMetadata {
-            return Err(CacheError::Corrupt(
-                "complete metadata generation is required".into(),
-            ));
+        if !valid_digest(digest) {
+            return Err(CacheError::Corrupt("invalid object digest".into()));
         }
         let object = self.root.join("objects/sha256").join(digest);
         reject_symlink(&object, true)?;
@@ -130,7 +169,10 @@ impl Cache {
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|error| CacheError::Corrupt(error.to_string()))?;
         validate_manifest(&object, &manifest)?;
-        if manifest.version != 2 || manifest.repomd.sha256 != digest {
+        if !matches!(manifest.version, 2 | 3)
+            || manifest.repomd.sha256 != digest
+            || manifest.integrity != SnapshotIntegrity::CompleteMetadata
+        {
             return Err(CacheError::Corrupt(
                 "verified generation manifest mismatch".into(),
             ));
@@ -144,6 +186,18 @@ impl Cache {
                 .as_ref()
                 .ok_or_else(|| CacheError::Corrupt("missing filelists".into()))?,
         )?;
+        let records = parse_repomd_records(repomd.bytes()).map_err(metadata_error)?;
+        if records.primary.checksum != primary.sha256()
+            || records.primary.size != primary.size()
+            || records.filelists.checksum != filelists.sha256()
+            || records.filelists.size != filelists.size()
+        {
+            return Err(CacheError::Corrupt(
+                "metadata bytes differ from repomd records".into(),
+            ));
+        }
+        let repository = String::from_utf8(verify_file(&anchored, &manifest.repository)?)
+            .map_err(|error| CacheError::Corrupt(error.to_string()))?;
         let origin = manifest
             .source_origin
             .as_ref()
@@ -158,14 +212,12 @@ impl Cache {
             ));
         }
         Ok(VerifiedCompleteGeneration {
-            digest: snapshot.digest,
-            repository: snapshot.repository,
+            digest: digest.into(),
+            repository,
             origin,
             repomd,
             primary,
             filelists,
-            solver_inputs: snapshot.solver_inputs,
-            filelist_inputs: snapshot.filelists,
             repomd_authentication: crate::model::RepomdAuthentication::TransportOnly,
         })
     }
@@ -198,44 +250,55 @@ impl Cache {
                 let records = parse_repomd_records(repomd).map_err(metadata_error)?;
                 let opened = dnfast_metadata::decode_record(primary, &records.primary)
                     .map_err(metadata_error)?;
-                let solver = manifest
-                    .solver_inputs
-                    .as_ref()
-                    .ok_or_else(|| CacheError::Corrupt("missing solver inputs".into()))?;
                 let compressed_files = manifest
                     .filelists
                     .as_ref()
                     .ok_or_else(|| CacheError::Corrupt("missing filelists".into()))?;
-                let files = manifest
-                    .filelists_index
-                    .as_ref()
-                    .ok_or_else(|| CacheError::Corrupt("missing filelists index".into()))?;
                 let compressed = verify_file(object, compressed_files)?;
                 let parsed = dnfast_metadata::parse_filelists_record(
                     compressed.as_slice(),
                     &records.filelists,
                 )
                 .map_err(metadata_error)?;
-                let solver_inputs: Vec<dnfast_metadata::CompletePackage> =
-                    decode_json(object, solver)?;
                 let parsed_solver = dnfast_metadata::parse_primary_records(opened.as_slice())
                     .map_err(metadata_error)?;
-                if parsed_solver != solver_inputs {
-                    return Err(CacheError::Corrupt("solver inputs mismatch".into()));
-                }
-                let filelists: Vec<dnfast_metadata::FileListPackage> = decode_json(object, files)?;
-                if parsed != filelists {
-                    return Err(CacheError::Corrupt("filelists index mismatch".into()));
-                }
+                let (solver_inputs, filelists) = if manifest.version == 2 {
+                    let solver = manifest
+                        .solver_inputs
+                        .as_ref()
+                        .ok_or_else(|| CacheError::Corrupt("missing solver inputs".into()))?;
+                    let files = manifest
+                        .filelists_index
+                        .as_ref()
+                        .ok_or_else(|| CacheError::Corrupt("missing filelists index".into()))?;
+                    let solver_inputs: Vec<dnfast_metadata::CompletePackage> =
+                        decode_json(object, solver)?;
+                    if parsed_solver != solver_inputs {
+                        return Err(CacheError::Corrupt("solver inputs mismatch".into()));
+                    }
+                    let filelists: Vec<dnfast_metadata::FileListPackage> =
+                        decode_json(object, files)?;
+                    if parsed != filelists {
+                        return Err(CacheError::Corrupt("filelists index mismatch".into()));
+                    }
+                    (solver_inputs, filelists)
+                } else {
+                    if manifest.solver_inputs.is_some() || manifest.filelists_index.is_some() {
+                        return Err(CacheError::Corrupt(
+                            "version three manifest contains derived indexes".into(),
+                        ));
+                    }
+                    (parsed_solver, parsed)
+                };
                 validate_filelists_generation(&solver_inputs, &filelists)
                     .map_err(metadata_error)?;
-                let packages = parsed_solver.iter().map(search_package).collect();
+                let packages = solver_inputs.iter().map(search_package).collect();
                 Ok((solver_inputs, filelists, packages))
             }
         }
     }
 
-    fn current_pointer(&self, repository: &str) -> Result<CurrentPointer, CacheError> {
+    pub(crate) fn current_pointer(&self, repository: &str) -> Result<CurrentPointer, CacheError> {
         let directory = self.repository_dir(repository);
         if fs::symlink_metadata(directory.join("current"))
             .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
@@ -383,22 +446,28 @@ fn validate_manifest(object: &std::path::Path, manifest: &Manifest) -> Result<()
                     .ok_or_else(|| CacheError::Corrupt("missing filelists".into()))?,
                 "filelists",
             )?;
-            add_record(
-                &mut expected,
-                manifest
-                    .filelists_index
-                    .as_ref()
-                    .ok_or_else(|| CacheError::Corrupt("missing filelists index".into()))?,
-                "filelists-index.json",
-            )?;
-            add_record(
-                &mut expected,
-                manifest
-                    .solver_inputs
-                    .as_ref()
-                    .ok_or_else(|| CacheError::Corrupt("missing solver inputs".into()))?,
-                "solver-inputs.json",
-            )?;
+            if manifest.version == 2 {
+                add_record(
+                    &mut expected,
+                    manifest
+                        .filelists_index
+                        .as_ref()
+                        .ok_or_else(|| CacheError::Corrupt("missing filelists index".into()))?,
+                    "filelists-index.json",
+                )?;
+                add_record(
+                    &mut expected,
+                    manifest
+                        .solver_inputs
+                        .as_ref()
+                        .ok_or_else(|| CacheError::Corrupt("missing solver inputs".into()))?,
+                    "solver-inputs.json",
+                )?;
+            } else if manifest.filelists_index.is_some() || manifest.solver_inputs.is_some() {
+                return Err(CacheError::Corrupt(
+                    "version three manifest contains derived indexes".into(),
+                ));
+            }
         }
     }
     let actual = fs::read_dir(object)

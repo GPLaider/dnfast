@@ -15,9 +15,10 @@
 
 dnfast_status dnfast_limits_before_repo(dnfast_context *context,
                                         const int metadata_fds[3],
+                                        size_t metadata_count,
                                         dnfast_error *error) {
     uint64_t total = context->metadata_bytes;
-    for (size_t index = 0; index < 3; ++index) {
+    for (size_t index = 0; index < metadata_count; ++index) {
         struct stat metadata;
         if (fstat(metadata_fds[index], &metadata) != 0 || metadata.st_size < 0)
             return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
@@ -37,6 +38,7 @@ dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
                                           const dnfast_repo_input *input,
                                           FILE *streams[3],
                                           const struct stat identity[3],
+                                          size_t metadata_count,
                                           dnfast_error *error) {
 #ifdef DNFAST_NATIVE_REAL
     Repo *repo = opaque;
@@ -44,7 +46,7 @@ dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
                            input->filelists_path};
     int current_fds[3] = {-1, -1, -1};
     uint64_t metadata = context->metadata_bytes;
-    for (size_t index = 0; index < 3; ++index) {
+    for (size_t index = 0; index < metadata_count; ++index) {
         struct stat retained;
         struct stat current;
         current_fds[index] = open(paths[index], O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -58,7 +60,7 @@ dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
             current.st_size != identity[index].st_size;
         if (changed || UINT64_MAX - metadata < (uint64_t)identity[index].st_size ||
             metadata + (uint64_t)identity[index].st_size > context->limits.max_metadata_bytes) {
-            for (size_t close_index = 0; close_index < 3; ++close_index)
+            for (size_t close_index = 0; close_index < metadata_count; ++close_index)
                 if (current_fds[close_index] >= 0) (void)close(current_fds[close_index]);
             return dnfast_set_error(error, changed ? DNFAST_STATUS_NATIVE_FAILURE : DNFAST_STATUS_LIMIT_EXCEEDED,
                                     "solver", changed ? "fstat" : NULL,
@@ -87,14 +89,14 @@ dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
     }
     context->package_count += packages;
     context->metadata_bytes = metadata;
-    for (size_t index = 0; index < 3; ++index) (void)close(current_fds[index]);
+    for (size_t index = 0; index < metadata_count; ++index) (void)close(current_fds[index]);
     return DNFAST_STATUS_OK;
 package_limit:
-    for (size_t index = 0; index < 3; ++index) (void)close(current_fds[index]);
+    for (size_t index = 0; index < metadata_count; ++index) (void)close(current_fds[index]);
     return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
                             "solver", NULL, "package limit exceeded");
 relation_limit:
-    for (size_t index = 0; index < 3; ++index) (void)close(current_fds[index]);
+    for (size_t index = 0; index < metadata_count; ++index) (void)close(current_fds[index]);
     return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
                             "solver", NULL, "relation limit exceeded");
 #else

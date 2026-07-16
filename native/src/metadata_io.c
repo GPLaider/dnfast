@@ -20,8 +20,12 @@ void dnfast_metadata_close(FILE *streams[3]) {
 
 dnfast_status dnfast_metadata_open(const dnfast_repo_input *input,
                                    FILE *streams[3], struct stat identity[3],
+                                   size_t stream_count,
                                    dnfast_error *error) {
-    for (size_t index = 0; index < 3; ++index) {
+    if (stream_count < 2 || stream_count > 3)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "solver", NULL, "invalid metadata stream count");
+    for (size_t index = 0; index < stream_count; ++index) {
         int fd = open(metadata_path(input, index), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd < 0 || fstat(fd, &identity[index]) != 0 ||
             !S_ISREG(identity[index].st_mode) || identity[index].st_size < 0) {

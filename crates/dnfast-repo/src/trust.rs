@@ -1,5 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
+use sequoia_openpgp::{cert::CertParser, parse::Parse};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -11,6 +12,46 @@ const DOMAIN: &[u8] = b"dnfast-key-bundle-v1";
 const MAX_KEY_FILES: usize = 256;
 const MAX_KEY_BYTES: u64 = 1_048_576;
 const SYSTEM_KEY_DIRECTORY: &str = "/etc/pki/rpm-gpg";
+
+pub(crate) fn primary_certificate_fingerprints(
+    certificates: &[Vec<u8>],
+) -> Result<Vec<String>, MutationError> {
+    let label = Path::new("<gpgkey>");
+    let mut fingerprints = std::collections::BTreeSet::new();
+    for bytes in certificates {
+        let parser = CertParser::from_bytes(bytes)
+            .map_err(|_| MutationError::new(label, 0, "gpgkey is not an OpenPGP certificate"))?;
+        for certificate in parser {
+            let certificate = certificate.map_err(|_| {
+                MutationError::new(label, 0, "gpgkey contains an invalid OpenPGP certificate")
+            })?;
+            let fingerprint = certificate.fingerprint().to_hex();
+            if fingerprint.len() != 40 {
+                return Err(MutationError::new(
+                    label,
+                    0,
+                    "OpenPGP primary fingerprint is unsupported",
+                ));
+            }
+            fingerprints.insert(fingerprint);
+            if fingerprints.len() > MAX_KEY_FILES {
+                return Err(MutationError::new(
+                    label,
+                    0,
+                    "OpenPGP certificate limit exceeds 256",
+                ));
+            }
+        }
+    }
+    if fingerprints.is_empty() {
+        return Err(MutationError::new(
+            label,
+            0,
+            "OpenPGP certificate bundle is empty",
+        ));
+    }
+    Ok(fingerprints.into_iter().collect())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyBundle {
@@ -290,9 +331,10 @@ fn validate_lexical_path<'a>(
 
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
+        && id.len() <= 255
         && id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
 }
 
 #[cfg(test)]

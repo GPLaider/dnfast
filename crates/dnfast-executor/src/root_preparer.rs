@@ -185,7 +185,7 @@ fn prepare_into_draft(
     let mut candidates = Vec::new();
     let mut metadata = Vec::new();
     for (index, repository) in repositories.iter().enumerate() {
-        let materialized = draft.write_repository(repository, index)?;
+        let materialized = draft.write_repository(snapshot, repository, index)?;
         let mut repomd = draft.open(&materialized.input.repomd)?;
         let mut primary = draft.open(&materialized.input.primary)?;
         let parsed =
@@ -239,6 +239,7 @@ fn prepare_into_draft(
             &inventory,
         )
         .map_err(solver)?;
+        let satisfied_specs = transcript.satisfied_specs().to_vec();
         let resolved = transcript
             .into_resolved(&names, &candidates, &metadata_refs, &inventory)
             .map_err(solver)?;
@@ -250,7 +251,7 @@ fn prepare_into_draft(
             candidates: &candidates,
             expires_at_unix: proposal.proposal().expires_at_unix(),
         }
-        .build(&resolved)
+        .build_with_satisfied(&resolved, &satisfied_specs)
         .map_err(solver)?;
         ReSolveContract::require_equal(proposal, &root_plan)
             .map_err(|_| PreparationError::ReSolveMismatch)?;

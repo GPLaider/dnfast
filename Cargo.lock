@@ -466,6 +466,7 @@ dependencies = [
  "dnfast-refresh",
  "dnfast-repo",
  "dnfast-solver",
+ "dnfast-state",
  "hex",
  "rustix",
  "serde",
@@ -589,6 +590,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "ureq",
+ "url",
  "zstd",
 ]
 
@@ -597,6 +599,7 @@ name = "dnfast-repo"
 version = "0.1.0"
 dependencies = [
  "rustix",
+ "sequoia-openpgp",
  "sha2 0.11.0",
 ]
 

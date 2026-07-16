@@ -8,11 +8,12 @@ use std::{
 
 use dnfast_metadata::{
     MAX_FILELISTS_COMPRESSED_BYTES, MAX_FILELISTS_OPEN_BYTES, MAX_PRIMARY_COMPRESSED_BYTES,
-    MAX_PRIMARY_OPEN_BYTES, MAX_TOTAL_OPEN_BYTES, checked_total_open,
+    MAX_PRIMARY_OPEN_BYTES, MAX_RELATIONS_PER_PACKAGE, MAX_TOTAL_OPEN_BYTES, checked_total_open,
 };
 use dnfast_metadata::{
     RelationFlags, decode_record, parse_filelists, parse_filelists_record, parse_primary_records,
     parse_repomd_records, publish_validated, validate_filelists_generation,
+    validate_filelists_record,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -87,6 +88,17 @@ fn filelists_stream_when_parsing_todo2a_corpus() {
         &files,
     )
     .expect("same generation");
+    let primary = parse_primary_records(
+        decode_record(
+            &std::fs::read(fixture("primary.xml.zst")).expect("primary"),
+            &records.primary,
+        )
+        .expect("opened primary")
+        .as_slice(),
+    )
+    .expect("primary");
+    validate_filelists_record(compressed.as_slice(), &records.filelists, &primary)
+        .expect("streaming identity validation without retaining paths");
     drop(File::open(fixture("filelists.xml.zst")).expect("fixture remains available"));
 }
 
@@ -149,9 +161,9 @@ fn generation_join_fails_when_filelists_is_swapped() {
 
 #[test]
 fn cross_group_relation_limit_rejects_plus_one() {
-    // Given: one package with 2,048 provides and 2,049 requires.
-    let provides = "<rpm:entry name=\"p\"/>".repeat(2_048);
-    let requires = "<rpm:entry name=\"r\"/>".repeat(2_049);
+    // Given: one package with exactly half-cap provides and half-cap-plus-one requires.
+    let provides = "<rpm:entry name=\"p\"/>".repeat(MAX_RELATIONS_PER_PACKAGE / 2);
+    let requires = "<rpm:entry name=\"r\"/>".repeat(MAX_RELATIONS_PER_PACKAGE / 2 + 1);
     let xml = format!(
         "<metadata xmlns=\"http://linux.duke.edu/metadata/common\" xmlns:rpm=\"http://linux.duke.edu/metadata/rpm\" packages=\"1\"><package type=\"rpm\"><name>x</name><arch>noarch</arch><version epoch=\"0\" ver=\"1\" rel=\"1\"/><checksum type=\"sha256\" pkgid=\"YES\">{}</checksum><location href=\"x.rpm\"/><format><rpm:provides>{provides}</rpm:provides><rpm:requires>{requires}</rpm:requires></format></package></metadata>",
         "a".repeat(64)
@@ -161,10 +173,28 @@ fn cross_group_relation_limit_rejects_plus_one() {
         parse_primary_records(xml.as_bytes()),
         Err(dnfast_metadata::MetadataError::LimitExceeded {
             kind: "relations per package",
-            maximum: 4_096,
-            actual: 4_097
+            maximum: 16_384,
+            actual: 16_385
         })
     ));
+}
+
+#[test]
+fn escaped_entities_are_reassembled_before_file_path_validation() {
+    let primary = format!(
+        "<metadata xmlns=\"http://linux.duke.edu/metadata/common\" xmlns:rpm=\"http://linux.duke.edu/metadata/rpm\" packages=\"1\"><package type=\"rpm\"><name>x</name><arch>noarch</arch><version epoch=\"0\" ver=\"1\" rel=\"1\"/><checksum type=\"sha256\" pkgid=\"YES\">{}</checksum><summary>A &amp; B</summary><location href=\"x.rpm\"/><format><file>/usr/share/a&amp;b&lt;\\.html</file></format></package></metadata>",
+        "a".repeat(64)
+    );
+    let primary = parse_primary_records(primary.as_bytes()).expect("escaped primary");
+    assert_eq!(primary[0].summary, "A & B");
+    assert_eq!(primary[0].files, ["/usr/share/a&b<\\.html"]);
+
+    let filelists = format!(
+        "<filelists xmlns=\"http://linux.duke.edu/metadata/filelists\" packages=\"1\"><package pkgid=\"{}\" name=\"x\" arch=\"noarch\"><version epoch=\"0\" ver=\"1\" rel=\"1\"/><file>/usr/share/a&amp;b&lt;\\.html</file></package></filelists>",
+        "a".repeat(64)
+    );
+    let filelists = parse_filelists(filelists.as_bytes()).expect("escaped filelists");
+    assert_eq!(filelists[0].files, ["/usr/share/a&b<\\.html"]);
 }
 
 #[test]

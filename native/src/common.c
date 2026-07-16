@@ -185,7 +185,7 @@ dnfast_limits dnfast_limits_default(void) {
     dnfast_limits limits = {
         .abi_version = DNFAST_NATIVE_ABI_VERSION,
         .max_packages = UINT32_C(2000000),
-        .max_relations_per_package = UINT32_C(4096),
+        .max_relations_per_package = UINT32_C(16384),
         .pool_architecture = DNFAST_POOL_ARCHITECTURE_INVALID,
         .max_metadata_bytes = UINT64_C(17179869184),
     };

@@ -70,7 +70,7 @@ mod tests {
         for (maximum, kind) in [
             (2_000_000, "packages"),
             (20_000_000, "relations"),
-            (4_096, "relations per package"),
+            (16_384, "relations per package"),
             (50_000_000, "file paths"),
             (1_000_000, "files per package"),
             (1_048_576, "XML text"),

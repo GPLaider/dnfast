@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use crate::{MetadataError, xml::attribute_streaming};
 
 pub const MAX_RELATIONS: u64 = 20_000_000;
-pub const MAX_RELATIONS_PER_PACKAGE: usize = 4_096;
+// Fedora 44's kernel-debug-core currently carries 15,944 relations.  Keep a
+// tight power-of-two ceiling above real repository data while retaining the
+// global 20-million relation bound against metadata memory exhaustion.
+pub const MAX_RELATIONS_PER_PACKAGE: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RelationFlags {

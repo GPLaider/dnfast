@@ -10,11 +10,11 @@ use quick_xml::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::CompletePackage;
+use crate::{CompletePackage, PrimaryPackageIdentity};
 use crate::{
     MAX_FILE_PATHS, MAX_FILES_PER_PACKAGE, MAX_PACKAGES, MAX_XML_TEXT_BYTES, MetadataError,
     limits::{checked_increment, checked_limit},
-    xml::{attribute_streaming, decode_text, parse_number},
+    xml::{attribute_streaming, decode_reference, decode_text, parse_number},
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -30,6 +30,46 @@ pub struct FileListPackage {
 
 pub fn validate_filelists_generation(
     primary: &[CompletePackage],
+    filelists: &[FileListPackage],
+) -> Result<(), MetadataError> {
+    if primary.len() != filelists.len() {
+        return Err(MetadataError::Xml(
+            "primary/filelists package count mismatch".into(),
+        ));
+    }
+    let primary_by_id = primary
+        .iter()
+        .map(|package| (package.checksum.as_str(), package))
+        .collect::<HashMap<_, _>>();
+    if primary_by_id.len() != primary.len() {
+        return Err(MetadataError::Xml(
+            "duplicate primary package checksum".into(),
+        ));
+    }
+    let mut seen = HashSet::with_capacity(filelists.len());
+    for files in filelists {
+        if !seen.insert(files.package_id.as_str()) {
+            return Err(MetadataError::Xml("duplicate filelists package id".into()));
+        }
+        let package = primary_by_id
+            .get(files.package_id.as_str())
+            .ok_or_else(|| MetadataError::Xml("mixed primary/filelists generation".into()))?;
+        if package.name != files.name
+            || package.arch != files.arch
+            || package.epoch != files.epoch
+            || package.version != files.version
+            || package.release != files.release
+        {
+            return Err(MetadataError::Xml(
+                "primary/filelists identity mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_filelists_identities(
+    primary: &[PrimaryPackageIdentity],
     filelists: &[FileListPackage],
 ) -> Result<(), MetadataError> {
     if primary.len() != filelists.len() {
@@ -86,26 +126,56 @@ struct Builder {
     version: String,
     release: String,
     files: Vec<String>,
+    file_count: u64,
 }
 
 #[derive(Default)]
 struct State {
     current: Option<Builder>,
-    in_file: bool,
+    file_text: Option<String>,
     packages: Vec<FileListPackage>,
     declared: Option<u64>,
     root_seen: bool,
     root_closed: bool,
     declaration_seen: bool,
     paths: u64,
+    retain_files: bool,
 }
 
 pub fn parse_filelists<R: BufRead>(input: R) -> Result<Vec<FileListPackage>, MetadataError> {
+    parse_filelists_with_mode(input, true)
+}
+
+pub fn validate_filelists_xml<R: BufRead>(
+    input: R,
+    primary: &[CompletePackage],
+) -> Result<(), MetadataError> {
+    let filelists = parse_filelists_with_mode(input, false)?;
+    validate_filelists_generation(primary, &filelists)
+}
+
+pub fn validate_filelists_xml_identities<R: BufRead>(
+    input: R,
+    primary: &[PrimaryPackageIdentity],
+) -> Result<(), MetadataError> {
+    let filelists = parse_filelists_with_mode(input, false)?;
+    validate_filelists_identities(primary, &filelists)
+}
+
+fn parse_filelists_with_mode<R: BufRead>(
+    input: R,
+    retain_files: bool,
+) -> Result<Vec<FileListPackage>, MetadataError> {
     let mut reader = NsReader::from_reader(input);
-    reader.config_mut().trim_text(true);
+    // Preserve text around entity-reference events until the complete path is
+    // reassembled and validated.
+    reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = true;
     let mut buffer = Vec::new();
-    let mut state = State::default();
+    let mut state = State {
+        retain_files,
+        ..State::default()
+    };
     loop {
         match reader.read_resolved_event_into(&mut buffer) {
             Ok((namespace, Event::Start(event))) => {
@@ -116,12 +186,16 @@ pub fn parse_filelists<R: BufRead>(input: R) -> Result<Vec<FileListPackage>, Met
                 validate_resolved(&namespace)?;
                 state.empty(reader.decoder(), &event)?;
             }
-            Ok((_, Event::Text(event))) if state.in_file => state.file(&event)?,
-            Ok((_, Event::Text(event)))
-                if (!state.root_seen || state.root_closed)
-                    && !decode_text(&event)?.trim().is_empty() =>
-            {
-                return Err(MetadataError::Xml("text outside filelists root".into()));
+            Ok((_, Event::Text(event))) if state.file_text.is_some() => {
+                state.append_file_text(&decode_text(&event)?)?
+            }
+            Ok((_, Event::GeneralRef(event))) if state.file_text.is_some() => {
+                state.append_file_text(&decode_reference(&event)?)?
+            }
+            Ok((_, Event::Text(event))) if !state.root_seen || state.root_closed => {
+                if !decode_text(&event)?.trim().is_empty() {
+                    return Err(MetadataError::Xml("text outside filelists root".into()));
+                }
             }
             Ok((_, Event::End(event))) => state.end(event.name().as_ref())?,
             Ok((_, Event::Decl(_))) if !state.root_seen && !state.declaration_seen => {
@@ -183,7 +257,11 @@ impl State {
                     ..Builder::default()
                 });
             }
-            b"file" if self.current.is_some() => self.in_file = true,
+            b"file"
+                if self.current.is_some() && self.file_text.replace(String::new()).is_some() =>
+            {
+                return Err(MetadataError::Xml("nested filelists file".into()));
+            }
             _ => {}
         }
         Ok(())
@@ -212,12 +290,23 @@ impl State {
         Ok(())
     }
 
-    fn file(&mut self, event: &quick_xml::events::BytesText<'_>) -> Result<(), MetadataError> {
-        let value = decode_text(event)?;
-        checked_limit(value.len() as u64, MAX_XML_TEXT_BYTES as u64, "XML text")?;
+    fn append_file_text(&mut self, value: &str) -> Result<(), MetadataError> {
+        let file = self
+            .file_text
+            .as_mut()
+            .ok_or_else(|| MetadataError::Xml("file text outside file".into()))?;
+        file.push_str(value);
+        checked_limit(file.len() as u64, MAX_XML_TEXT_BYTES as u64, "XML text")?;
+        Ok(())
+    }
+
+    fn finish_file(&mut self) -> Result<(), MetadataError> {
+        let value = self
+            .file_text
+            .take()
+            .ok_or_else(|| MetadataError::Xml("file end without start".into()))?;
         if !value.starts_with('/')
             || value.contains("//")
-            || value.contains('\\')
             || value.chars().any(char::is_control)
             || value.split('/').any(|part| part == "." || part == "..")
         {
@@ -227,13 +316,15 @@ impl State {
             .current
             .as_mut()
             .ok_or_else(|| MetadataError::Xml("file outside filelists package".into()))?;
-        checked_increment(
-            package.files.len() as u64,
+        package.file_count = checked_increment(
+            package.file_count,
             MAX_FILES_PER_PACKAGE as u64,
             "files per package",
         )?;
         self.paths = checked_increment(self.paths, MAX_FILE_PATHS, "file paths")?;
-        package.files.push(value);
+        if self.retain_files {
+            package.files.push(value);
+        }
         Ok(())
     }
 
@@ -244,8 +335,11 @@ impl State {
             ));
         }
         if name == b"file" {
-            self.in_file = false;
+            self.finish_file()?;
         } else if name == b"package" {
+            if self.file_text.is_some() {
+                return Err(MetadataError::Xml("unclosed filelists file".into()));
+            }
             let package = self
                 .current
                 .take()

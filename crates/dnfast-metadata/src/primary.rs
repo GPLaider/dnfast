@@ -11,7 +11,7 @@ use crate::{
     MAX_FILE_PATHS, MAX_FILES_PER_PACKAGE, MAX_XML_TEXT_BYTES, MetadataError,
     limits::{checked_increment, checked_limit},
     relations::{MAX_RELATIONS, MAX_RELATIONS_PER_PACKAGE, Relation, parse_relation},
-    xml::{attribute_streaming, decode_text, parse_number},
+    xml::{attribute_streaming, decode_reference, decode_text, parse_number},
 };
 
 pub const MAX_PACKAGES: u64 = 2_000_000;
@@ -64,6 +64,22 @@ pub struct Package {
     pub summary: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimaryPackageIdentity {
+    pub checksum: String,
+    pub name: String,
+    pub arch: String,
+    pub epoch: String,
+    pub version: String,
+    pub release: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedPrimary {
+    pub packages: Vec<Package>,
+    pub identities: Vec<PrimaryPackageIdentity>,
+}
+
 impl Package {
     pub fn nevra(&self) -> String {
         format!(
@@ -109,6 +125,10 @@ struct State {
     field: Option<Vec<u8>>,
     relation_group: Option<Vec<u8>>,
     packages: Vec<CompletePackage>,
+    search_packages: Vec<Package>,
+    identities: Vec<PrimaryPackageIdentity>,
+    retain_complete: bool,
+    parsed_packages: u64,
     root_seen: bool,
     root_closed: bool,
     rpm_namespace: bool,
@@ -119,19 +139,7 @@ struct State {
 }
 
 pub fn parse_primary<R: Read>(input: R) -> Result<Vec<Package>, MetadataError> {
-    parse_complete(input).map(|records| {
-        records
-            .into_iter()
-            .map(|record| Package {
-                name: record.name,
-                arch: record.arch,
-                epoch: record.epoch,
-                version: record.version,
-                release: record.release,
-                summary: record.summary,
-            })
-            .collect()
-    })
+    parse_primary_validated(input).map(|validated| validated.packages)
 }
 
 pub fn parse_primary_records<R: Read>(input: R) -> Result<Vec<CompletePackage>, MetadataError> {
@@ -148,11 +156,29 @@ pub fn parse_primary_records<R: Read>(input: R) -> Result<Vec<CompletePackage>, 
 }
 
 fn parse_complete<R: Read>(input: R) -> Result<Vec<CompletePackage>, MetadataError> {
+    let state = parse_with_mode(input, true)?;
+    Ok(state.packages)
+}
+
+pub fn parse_primary_validated<R: Read>(input: R) -> Result<ValidatedPrimary, MetadataError> {
+    let state = parse_with_mode(input, false)?;
+    Ok(ValidatedPrimary {
+        packages: state.search_packages,
+        identities: state.identities,
+    })
+}
+
+fn parse_with_mode<R: Read>(input: R, retain_complete: bool) -> Result<State, MetadataError> {
     let mut reader = NsReader::from_reader(std::io::BufReader::new(input));
-    reader.config_mut().trim_text(true);
+    // Text and entity references are separate events.  Trimming each event
+    // independently would turn `A &amp; B` into `A&B`.
+    reader.config_mut().trim_text(false);
     reader.config_mut().check_end_names = true;
     let mut buffer = Vec::new();
-    let mut state = State::default();
+    let mut state = State {
+        retain_complete,
+        ..State::default()
+    };
     loop {
         match reader.read_resolved_event_into(&mut buffer) {
             Ok((namespace, Event::Start(event))) => {
@@ -179,6 +205,9 @@ fn parse_complete<R: Read>(input: R) -> Result<Vec<CompletePackage>, MetadataErr
                 }
             }
             Ok((_, Event::Text(event))) => state.text(&event)?,
+            Ok((_, Event::GeneralRef(event))) if state.field.is_some() => {
+                state.append_field(&decode_reference(&event)?)?
+            }
             Ok((_, Event::End(event))) => state.end(event.name().as_ref())?,
             Ok((_, Event::Decl(_))) if !state.root_seen && !state.declaration_seen => {
                 state.declaration_seen = true
@@ -198,7 +227,8 @@ fn parse_complete<R: Read>(input: R) -> Result<Vec<CompletePackage>, MetadataErr
         }
         buffer.clear();
     }
-    state.finish()
+    state.finish()?;
+    Ok(state)
 }
 
 impl State {
@@ -262,6 +292,16 @@ impl State {
             | b"sourcerpm" | b"file")
                 if self.current.is_some() =>
             {
+                if name == b"file" {
+                    let package = self.current.as_mut().expect("checked above");
+                    checked_increment(
+                        package.files.len() as u64,
+                        MAX_FILES_PER_PACKAGE as u64,
+                        "files per package",
+                    )?;
+                    self.paths = checked_increment(self.paths, MAX_FILE_PATHS, "file paths")?;
+                    package.files.push(String::new());
+                }
                 self.field = Some(name.to_vec())
             }
             name @ (b"provides" | b"requires" | b"recommends" | b"suggests" | b"supplements"
@@ -314,28 +354,26 @@ impl State {
 
     fn text(&mut self, event: &quick_xml::events::BytesText<'_>) -> Result<(), MetadataError> {
         let value = decode_text(event)?;
-        checked_limit(value.len() as u64, MAX_XML_TEXT_BYTES as u64, "XML text")?;
+        self.append_field(&value)
+    }
+
+    fn append_field(&mut self, value: &str) -> Result<(), MetadataError> {
         if let Some(package) = self.current.as_mut() {
-            match self.field.as_deref() {
-                Some(b"name") => package.name = value,
-                Some(b"arch") => package.arch = value,
-                Some(b"summary") => package.summary = value,
-                Some(b"description") => package.description = value,
-                Some(b"checksum") => package.checksum = value,
-                Some(b"vendor") => package.vendor = value,
-                Some(b"buildhost") => package.build_host = value,
-                Some(b"sourcerpm") => package.source_rpm = value,
-                Some(b"file") => {
-                    validate_file_path(&value)?;
-                    checked_increment(
-                        package.files.len() as u64,
-                        MAX_FILES_PER_PACKAGE as u64,
-                        "files per package",
-                    )?;
-                    self.paths = checked_increment(self.paths, MAX_FILE_PATHS, "file paths")?;
-                    package.files.push(value);
-                }
-                _ => {}
+            let target = match self.field.as_deref() {
+                Some(b"name") => Some(&mut package.name),
+                Some(b"arch") => Some(&mut package.arch),
+                Some(b"summary") => Some(&mut package.summary),
+                Some(b"description") => Some(&mut package.description),
+                Some(b"checksum") => Some(&mut package.checksum),
+                Some(b"vendor") => Some(&mut package.vendor),
+                Some(b"buildhost") => Some(&mut package.build_host),
+                Some(b"sourcerpm") => Some(&mut package.source_rpm),
+                Some(b"file") => package.files.last_mut(),
+                _ => None,
+            };
+            if let Some(target) = target {
+                target.push_str(value);
+                checked_limit(target.len() as u64, MAX_XML_TEXT_BYTES as u64, "XML text")?;
             }
         }
         Ok(())
@@ -360,6 +398,14 @@ impl State {
             self.root_closed = true;
         }
         let local = local_name(name);
+        if local == b"file" {
+            let path = self
+                .current
+                .as_ref()
+                .and_then(|package| package.files.last())
+                .ok_or_else(|| MetadataError::Xml("file end without start".into()))?;
+            validate_file_path(path)?;
+        }
         if self.relation_group.as_deref() == Some(local) {
             self.relation_group = None;
         }
@@ -394,37 +440,57 @@ impl State {
         } else {
             builder.epoch
         };
-        self.packages.push(CompletePackage {
-            name: builder.name,
-            arch: builder.arch,
-            epoch,
-            version: builder.version,
-            release: builder.release,
-            summary: builder.summary,
-            checksum: builder.checksum,
-            location: builder.location,
-            description: builder.description,
-            vendor: builder.vendor,
-            build_host: builder.build_host,
-            source_rpm: builder.source_rpm,
-            package_size: builder.package_size,
-            installed_size: builder.installed_size,
-            archive_size: builder.archive_size,
-            build_time: builder.build_time,
-            provides: builder.provides,
-            requires: builder.requires,
-            recommends: builder.recommends,
-            suggests: builder.suggests,
-            supplements: builder.supplements,
-            enhances: builder.enhances,
-            conflicts: builder.conflicts,
-            obsoletes: builder.obsoletes,
-            files: builder.files,
-        });
-        if self.packages.len() as u64 > MAX_PACKAGES {
+        if self.retain_complete {
+            self.packages.push(CompletePackage {
+                name: builder.name,
+                arch: builder.arch,
+                epoch,
+                version: builder.version,
+                release: builder.release,
+                summary: builder.summary,
+                checksum: builder.checksum,
+                location: builder.location,
+                description: builder.description,
+                vendor: builder.vendor,
+                build_host: builder.build_host,
+                source_rpm: builder.source_rpm,
+                package_size: builder.package_size,
+                installed_size: builder.installed_size,
+                archive_size: builder.archive_size,
+                build_time: builder.build_time,
+                provides: builder.provides,
+                requires: builder.requires,
+                recommends: builder.recommends,
+                suggests: builder.suggests,
+                supplements: builder.supplements,
+                enhances: builder.enhances,
+                conflicts: builder.conflicts,
+                obsoletes: builder.obsoletes,
+                files: builder.files,
+            });
+        } else {
+            self.identities.push(PrimaryPackageIdentity {
+                checksum: builder.checksum,
+                name: builder.name.clone(),
+                arch: builder.arch.clone(),
+                epoch: epoch.clone(),
+                version: builder.version.clone(),
+                release: builder.release.clone(),
+            });
+            self.search_packages.push(Package {
+                name: builder.name,
+                arch: builder.arch,
+                epoch,
+                version: builder.version,
+                release: builder.release,
+                summary: builder.summary,
+            });
+        }
+        self.parsed_packages = checked_increment(self.parsed_packages, MAX_PACKAGES, "packages")?;
+        if self.parsed_packages > MAX_PACKAGES {
             return Err(MetadataError::SizeMismatch {
                 expected: MAX_PACKAGES,
-                actual: self.packages.len() as u64,
+                actual: self.parsed_packages,
             });
         }
         Ok(())
@@ -443,20 +509,20 @@ impl State {
         }
         Ok(())
     }
-    fn finish(self) -> Result<Vec<CompletePackage>, MetadataError> {
+    fn finish(&self) -> Result<(), MetadataError> {
         if !self.root_seen || !self.root_closed {
             return Err(MetadataError::Xml("incomplete primary root".into()));
         }
         let declared = self
             .declared
             .ok_or_else(|| MetadataError::Xml("missing primary package count".into()))?;
-        if self.packages.len() as u64 != declared {
+        if self.parsed_packages != declared {
             return Err(MetadataError::Xml(format!(
                 "primary package count mismatch: declared {declared}, parsed {}",
-                self.packages.len()
+                self.parsed_packages
             )));
         }
-        Ok(self.packages)
+        Ok(())
     }
 }
 
@@ -544,7 +610,6 @@ fn validate_package_location(href: &str) -> Result<(), MetadataError> {
 fn validate_file_path(path: &str) -> Result<(), MetadataError> {
     if !path.starts_with('/')
         || path.contains("//")
-        || path.contains('\\')
         || path.chars().any(char::is_control)
         || path.split('/').any(|part| part == "." || part == "..")
     {

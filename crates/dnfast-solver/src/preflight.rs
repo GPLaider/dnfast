@@ -7,6 +7,7 @@ use crate::{CandidatePackage, PlanError, ResolvedAction, ResolvedOperation};
 pub(crate) fn validate_inputs(
     builder: &crate::PlanBuilder<'_>,
     actions: &[ResolvedAction],
+    satisfied_specs: &[dnfast_core::PackageSpec],
 ) -> Result<(), PlanError> {
     if actions.is_empty() {
         return Err(PlanError::NoChanges);
@@ -41,6 +42,14 @@ pub(crate) fn validate_inputs(
         return Err(PlanError::DuplicateAction("name".into()));
     }
     let mut covered = BTreeMap::<&str, usize>::new();
+    for spec in satisfied_specs {
+        if !requested.contains(spec.as_str()) {
+            return Err(PlanError::Invalid(
+                "satisfied selector is not in requested intent",
+            ));
+        }
+        *covered.entry(spec.as_str()).or_default() += 1;
+    }
     let mut identities = BTreeSet::new();
     for action in actions {
         if action.name.is_empty() || !action.unresolved_dependencies.is_empty() {
@@ -275,17 +284,71 @@ pub(crate) fn execution_order(
             edges.insert((parent.name.clone(), item.name.clone()));
         }
     }
-    let mut ordered = Vec::new();
-    while !remaining.is_empty() {
-        let ready = remaining
-            .keys()
-            .find(|name| !edges.iter().any(|(_, to)| to == *name))
-            .cloned()
-            .ok_or(PlanError::DependencyCycle)?;
-        ordered.push(remaining.remove(&ready).ok_or(PlanError::DependencyCycle)?);
-        edges.retain(|(from, _)| from != &ready);
+    let mut outgoing = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut incoming = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut indegree = remaining
+        .keys()
+        .cloned()
+        .map(|name| (name, 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    for (from, to) in edges {
+        if outgoing.entry(from.clone()).or_default().insert(to.clone()) {
+            incoming.entry(to.clone()).or_default().insert(from);
+            *indegree.get_mut(&to).ok_or(PlanError::MissingParent(to))? += 1;
+        }
+    }
+    let mut active = remaining.keys().cloned().collect::<BTreeSet<_>>();
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while !active.is_empty() {
+        let next = if let Some(name) = ready.pop_first() {
+            name
+        } else {
+            // Real RPM graphs contain mutually requiring packages.  The RPM
+            // transaction performs its own authoritative rpmtsOrder pass, so
+            // break only a proven cycle here to obtain stable plan bytes while
+            // preserving every acyclic dependency ordering constraint.
+            cycle_member(&active, &incoming).ok_or(PlanError::DependencyCycle)?
+        };
+        if !active.remove(&next) {
+            return Err(PlanError::DependencyCycle);
+        }
+        ordered.push(remaining.remove(&next).ok_or(PlanError::DependencyCycle)?);
+        if let Some(targets) = outgoing.get(&next) {
+            for target in targets.iter().filter(|target| active.contains(*target)) {
+                let count = indegree
+                    .get_mut(target)
+                    .ok_or_else(|| PlanError::MissingParent(target.clone()))?;
+                *count = count.checked_sub(1).ok_or(PlanError::DependencyCycle)?;
+                if *count == 0 {
+                    ready.insert(target.clone());
+                }
+            }
+        }
     }
     Ok(ordered)
+}
+
+fn cycle_member(
+    active: &BTreeSet<String>,
+    incoming: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<String> {
+    let mut current = active.first()?.clone();
+    let mut seen = BTreeSet::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            return Some(current);
+        }
+        current = incoming
+            .get(&current)?
+            .iter()
+            .find(|parent| active.contains(*parent))?
+            .clone();
+    }
 }
 
 fn action_identity(action: &ResolvedAction) -> Option<String> {

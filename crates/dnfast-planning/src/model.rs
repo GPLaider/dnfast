@@ -1,16 +1,18 @@
+use std::path::{Path, PathBuf};
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dnfast_cache::RepomdAuthentication;
 use dnfast_core::{
     CanonicalDocument, InstalledInventory, PlanIntegrity, RepoTrustPolicy, RepositoryBinding,
     SolverPolicy,
 };
-use dnfast_metadata::{CompletePackage, FileListPackage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::PlanningError;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -18,7 +20,12 @@ const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 pub struct PlanningSnapshot {
     schema_version: u32,
     published_at_unix: u64,
+    refreshed_repository_ids: Vec<String>,
     payload: PlanningPayload,
+    #[serde(skip)]
+    planning_root: Option<PathBuf>,
+    #[serde(skip)]
+    storage_owner: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -49,8 +56,6 @@ pub struct PlanningRepository {
     pub repomd: PlanningBytes,
     pub primary: PlanningBytes,
     pub filelists: PlanningBytes,
-    pub solver_inputs: Vec<CompletePackage>,
-    pub filelist_inputs: Vec<FileListPackage>,
     pub trust: RepoTrustPolicy,
     pub keys: Vec<PlanningKey>,
     pub repomd_authentication: RepomdAuthentication,
@@ -68,6 +73,7 @@ pub struct PlanningOrigin {
 pub struct PlanningBytes {
     pub sha256: String,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base64: String,
 }
 
@@ -100,10 +106,26 @@ impl PlanningSnapshot {
         published_at_unix: u64,
         payload: PlanningPayload,
     ) -> Result<Self, PlanningError> {
+        let refreshed_repository_ids = payload
+            .allowed_repositories
+            .iter()
+            .map(|repository| repository.id.clone())
+            .collect();
+        Self::new_with_refreshed_repositories(published_at_unix, refreshed_repository_ids, payload)
+    }
+
+    pub(crate) fn new_with_refreshed_repositories(
+        published_at_unix: u64,
+        refreshed_repository_ids: Vec<String>,
+        payload: PlanningPayload,
+    ) -> Result<Self, PlanningError> {
         let value = Self {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             published_at_unix,
+            refreshed_repository_ids,
             payload,
+            planning_root: None,
+            storage_owner: 0,
         };
         value.validate()?;
         Ok(value)
@@ -114,6 +136,20 @@ impl PlanningSnapshot {
     }
     pub fn payload(&self) -> &PlanningPayload {
         &self.payload
+    }
+
+    pub(crate) fn attach_storage(&mut self, planning_root: &Path, owner: u32) {
+        self.planning_root = Some(planning_root.to_path_buf());
+        self.storage_owner = owner;
+    }
+
+    pub(crate) fn storage(&self) -> Option<(&Path, u32)> {
+        self.planning_root
+            .as_deref()
+            .map(|root| (root, self.storage_owner))
+    }
+    pub fn refreshed_repository_ids(&self) -> &[String] {
+        &self.refreshed_repository_ids
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, PlanningError> {
@@ -191,10 +227,24 @@ impl PlanningSnapshot {
     }
 
     fn validate(&self) -> Result<(), PlanningError> {
-        if self.schema_version != SNAPSHOT_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            LEGACY_SNAPSHOT_SCHEMA_VERSION | SNAPSHOT_SCHEMA_VERSION
+        ) {
             return Err(PlanningError::Input("unsupported snapshot schema".into()));
         }
         if self.payload.allowed_repositories.is_empty()
+            || self
+                .refreshed_repository_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self.refreshed_repository_ids.iter().any(|id| {
+                !self
+                    .payload
+                    .allowed_repositories
+                    .iter()
+                    .any(|repository| repository.id == *id)
+            })
             || self
                 .payload
                 .allowed_repositories
@@ -217,7 +267,7 @@ impl PlanningSnapshot {
             .map_err(domain)?;
         self.payload.inventory.canonical_sha256().map_err(domain)?;
         for repository in &self.payload.allowed_repositories {
-            validate_repository(repository)?;
+            validate_repository(repository, self.schema_version)?;
             let configuration = self
                 .payload
                 .configuration
@@ -311,12 +361,24 @@ impl PlanningBytes {
         Self {
             sha256: bytes.sha256().into(),
             size: bytes.size(),
-            base64: STANDARD.encode(bytes.bytes()),
+            base64: String::new(),
         }
     }
 
-    pub(crate) fn decode_verified(&self) -> Result<Vec<u8>, PlanningError> {
-        let decoded = self.decode()?;
+    pub(crate) fn decode_verified(
+        &self,
+        storage: Option<(&Path, u32)>,
+    ) -> Result<Vec<u8>, PlanningError> {
+        let decoded = if self.base64.is_empty() {
+            let (planning_root, owner) = storage.ok_or_else(|| {
+                PlanningError::UnsafeSnapshot(
+                    "external snapshot payload has no trusted storage binding".into(),
+                )
+            })?;
+            crate::snapshot_store::read_blob(planning_root, owner, &self.sha256, self.size)?
+        } else {
+            self.decode()?
+        };
         if u64::try_from(decoded.len()).map_err(|error| PlanningError::Input(error.to_string()))?
             != self.size
             || format!("{:x}", Sha256::digest(&decoded)) != self.sha256
@@ -328,6 +390,22 @@ impl PlanningBytes {
         Ok(decoded)
     }
 
+    fn validate_shape(&self, schema_version: u32) -> Result<(), PlanningError> {
+        if self.size == 0
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || (schema_version == LEGACY_SNAPSHOT_SCHEMA_VERSION && self.base64.is_empty())
+        {
+            return Err(PlanningError::Input(
+                "snapshot payload descriptor is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn decode(&self) -> Result<Vec<u8>, PlanningError> {
         STANDARD
             .decode(&self.base64)
@@ -335,7 +413,10 @@ impl PlanningBytes {
     }
 }
 
-fn validate_repository(repository: &PlanningRepository) -> Result<(), PlanningError> {
+fn validate_repository(
+    repository: &PlanningRepository,
+    schema_version: u32,
+) -> Result<(), PlanningError> {
     if repository.id.is_empty()
         || repository.generation_sha256 != repository.repomd.sha256
         || repository.trust.repo_id() != repository.id
@@ -349,7 +430,13 @@ fn validate_repository(repository: &PlanningRepository) -> Result<(), PlanningEr
             "repository payload is not canonical".into(),
         ));
     }
-    repository.materialize_native_xml()?;
+    for payload in [
+        &repository.repomd,
+        &repository.primary,
+        &repository.filelists,
+    ] {
+        payload.validate_shape(schema_version)?;
+    }
     if format!(
         "{:x}",
         Sha256::digest(repository.origin.repomd_url.as_bytes())

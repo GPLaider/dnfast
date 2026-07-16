@@ -40,9 +40,9 @@ pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
                 .refresh_with_metadata_trust(&repository.id, source, metadata_trust.as_ref())
                 .map_err(|error| error.to_string())
         },
-        |published_at_unix| {
+        |published_at_unix, refreshed_repository_ids| {
             publisher
-                .publish_after_verified_refresh(published_at_unix)
+                .publish_after_verified_refresh(published_at_unix, refreshed_repository_ids)
                 .map_err(|error| error.to_string())
         },
         now,
@@ -54,6 +54,26 @@ pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
     ))
 }
 
+pub(super) fn makecache(requested: Vec<String>) -> Result<String, AppFailure> {
+    require_root_for("repo makecache")?;
+    let publisher = RootPlanningPublisher::system().map_err(planning_failure)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AppFailure::new(1, error.to_string()))?
+        .as_secs();
+    if publisher
+        .current_metadata_is_fresh(&requested, now)
+        .unwrap_or(false)
+    {
+        let digest =
+            dnfast_planning::PlanningSnapshot::current_system_digest().map_err(planning_failure)?;
+        return Ok(format!(
+            "metadata cache is fresh; planning_snapshot={digest}"
+        ));
+    }
+    refresh(requested)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct RefreshReport {
     refreshed: Vec<String>,
@@ -63,13 +83,13 @@ struct RefreshReport {
 fn refresh_profile<Refresh, Publish>(
     profile: &MutationProfile,
     mut requested: Vec<String>,
-    mut refresh_source: Refresh,
+    refresh_source: Refresh,
     publish_snapshot: Publish,
     published_at_unix: u64,
 ) -> Result<RefreshReport, AppFailure>
 where
-    Refresh: FnMut(&RepoConfig, Source) -> Result<RefreshOutcome, String>,
-    Publish: FnOnce(u64) -> Result<String, String>,
+    Refresh: Fn(&RepoConfig, Source) -> Result<RefreshOutcome, String> + Sync,
+    Publish: FnOnce(u64, &[String]) -> Result<String, String>,
 {
     requested.sort();
     requested.dedup();
@@ -92,33 +112,48 @@ where
     if selected.is_empty() {
         return Err(AppFailure::new(1, "no enabled repositories selected"));
     }
-    let mut refreshed = Vec::new();
-    for repository in selected {
-        let mut outcome = None;
-        let mut last_error = None;
-        for source in sources(repository) {
-            match refresh_source(repository, source) {
-                Ok(value) => {
-                    outcome = Some(value);
-                    break;
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-        outcome.ok_or_else(|| {
-            AppFailure::new(
-                1,
-                format!(
-                    "{}: {}",
-                    repository.id,
-                    last_error.unwrap_or_else(|| "repository has no usable source".into())
-                ),
-            )
-        })?;
-        refreshed.push(escaped_field(&repository.id));
-    }
-    let planning_snapshot =
-        publish_snapshot(published_at_unix).map_err(|error| AppFailure::new(1, error))?;
+    let results = std::thread::scope(|scope| {
+        selected
+            .into_iter()
+            .map(|repository| {
+                let refresh_source = &refresh_source;
+                scope.spawn(move || {
+                    let mut outcome = None;
+                    let mut last_error = None;
+                    for source in sources(repository) {
+                        match refresh_source(repository, source) {
+                            Ok(value) => {
+                                outcome = Some(value);
+                                break;
+                            }
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                    outcome
+                        .map(|_| (escaped_field(&repository.id), repository.id.clone()))
+                        .ok_or_else(|| {
+                            format!(
+                                "{}: {}",
+                                repository.id,
+                                last_error
+                                    .unwrap_or_else(|| "repository has no usable source".into())
+                            )
+                        })
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| "repository refresh worker panicked".to_owned())?
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .map_err(|error| AppFailure::new(1, error))?;
+    let (refreshed, refreshed_repository_ids): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let planning_snapshot = publish_snapshot(published_at_unix, &refreshed_repository_ids)
+        .map_err(|error| AppFailure::new(1, error))?;
     Ok(RefreshReport {
         refreshed,
         planning_snapshot,
@@ -169,10 +204,14 @@ fn sources(repository: &RepoConfig) -> Vec<Source> {
 }
 
 fn require_root() -> Result<(), AppFailure> {
+    require_root_for("repo refresh")
+}
+
+fn require_root_for(command: &str) -> Result<(), AppFailure> {
     if rustix::process::geteuid().as_raw() == 0 {
         Ok(())
     } else {
-        Err(AppFailure::new(1, "repo refresh requires root"))
+        Err(AppFailure::new(1, format!("{command} requires root")))
     }
 }
 
@@ -183,7 +222,7 @@ fn planning_failure(error: dnfast_planning::PlanningError) -> AppFailure {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use dnfast_refresh::RefreshOutcome;
     use dnfast_repo::{MainConfig, MetadataExpire, MutationProfile, RepoConfig, Variables};
@@ -197,23 +236,23 @@ mod tests {
             repositories: vec![repository("first"), repository("second")],
             variables: Variables::default(),
         };
-        let refreshed = Cell::new(0_usize);
-        let published_after = Cell::new(0_usize);
-        let published_at = Cell::new(0_u64);
+        let refreshed = AtomicUsize::new(0);
+        let published_after = AtomicUsize::new(0);
+        let published_at = AtomicU64::new(0);
 
         let report = refresh_profile(
             &profile,
             Vec::new(),
             |_, _| {
-                refreshed.set(refreshed.get() + 1);
+                refreshed.fetch_add(1, Ordering::SeqCst);
                 Ok(RefreshOutcome {
                     digest: "verified-generation".into(),
                     packages: 1,
                 })
             },
-            |timestamp| {
-                published_after.set(refreshed.get());
-                published_at.set(timestamp);
+            |timestamp, _| {
+                published_after.store(refreshed.load(Ordering::SeqCst), Ordering::SeqCst);
+                published_at.store(timestamp, Ordering::SeqCst);
                 Ok("published-snapshot".into())
             },
             42,
@@ -222,8 +261,8 @@ mod tests {
 
         assert_eq!(report.refreshed, ["first", "second"]);
         assert_eq!(report.planning_snapshot, "published-snapshot");
-        assert_eq!(published_after.get(), 2);
-        assert_eq!(published_at.get(), 42);
+        assert_eq!(published_after.load(Ordering::SeqCst), 2);
+        assert_eq!(published_at.load(Ordering::SeqCst), 42);
     }
 
     #[test]
@@ -235,20 +274,20 @@ mod tests {
             repositories: vec![skipped],
             variables: Variables::default(),
         };
-        let publisher_calls = Cell::new(0_usize);
+        let publisher_calls = AtomicUsize::new(0);
 
         let result = refresh_profile(
             &profile,
             Vec::new(),
             |_, _| Err("unavailable".into()),
-            |_| {
-                publisher_calls.set(publisher_calls.get() + 1);
+            |_, _| {
+                publisher_calls.fetch_add(1, Ordering::SeqCst);
                 Ok("published-snapshot".into())
             },
             42,
         );
 
-        assert_eq!(publisher_calls.get(), 0);
+        assert_eq!(publisher_calls.load(Ordering::SeqCst), 0);
         let error = result.expect_err("a selected refresh failure must reject publication");
         assert_eq!(error.code, 1);
         assert_eq!(error.message, "skip: unavailable");
@@ -263,21 +302,21 @@ mod tests {
             repositories: vec![skipped],
             variables: Variables::default(),
         };
-        let publisher_calls = Cell::new(0_usize);
+        let publisher_calls = AtomicUsize::new(0);
 
         let result = refresh_profile(
             &profile,
             vec!["skip".into()],
             |_, _| Err("unavailable".into()),
-            |_| {
-                publisher_calls.set(publisher_calls.get() + 1);
+            |_, _| {
+                publisher_calls.fetch_add(1, Ordering::SeqCst);
                 Ok("published-snapshot".into())
             },
             42,
         );
 
         assert!(result.is_err());
-        assert_eq!(publisher_calls.get(), 0);
+        assert_eq!(publisher_calls.load(Ordering::SeqCst), 0);
     }
 
     fn repository(id: &str) -> RepoConfig {

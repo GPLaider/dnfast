@@ -1,3 +1,4 @@
+mod history;
 mod output;
 mod planner;
 mod repo;
@@ -14,7 +15,7 @@ use dnfast_core::{Action, PackageSpec, TransactionIntent};
 use dnfast_metadata::search;
 
 use crate::{
-    args::{Commands, DaemonCommand, MutationArgs, PlanAction, RepoCommand},
+    args::{Commands, DaemonCommand, HistoryCommand, MutationArgs, PlanAction, RepoCommand},
     environment::{cache_directory, library_present},
     rendering::escaped_field,
     response::{Action as ResponseAction, Response},
@@ -80,6 +81,16 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
             RepoCommand::Refresh { repositories } => {
                 repo::refresh(repositories).map(|message| Response::completed("repo", message))
             }
+            RepoCommand::Makecache { repositories } => {
+                repo::makecache(repositories).map(|message| Response::completed("repo", message))
+            }
+        },
+        Commands::History { command } => match command {
+            HistoryCommand::List { limit } => {
+                history::list(limit).map(|message| Response::completed("history", message))
+            }
+            HistoryCommand::Info { transaction_id } => history::info(&transaction_id)
+                .map(|message| Response::completed("history", message)),
         },
         Commands::Doctor => Ok(run_doctor()),
         Commands::Search {
@@ -99,6 +110,7 @@ pub(crate) fn name(command: &Commands) -> &'static str {
         Commands::Upgrade(_) => "upgrade",
         Commands::Daemon { .. } => "daemon",
         Commands::Repo { .. } => "repo",
+        Commands::History { .. } => "history",
         Commands::Doctor => "doctor",
         Commands::Search { .. } => "search",
     }

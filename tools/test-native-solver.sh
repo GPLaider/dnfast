@@ -146,6 +146,9 @@ grep -q $'action\tinstall\tcost-low\tdnfast-cost-0:1.0-1.noarch' <<<"$COST"
 
 awk 'BEGIN { block="" } /<metadata / { sub(/packages="25"/, "packages=\"2\""); print; next } /<package type=/ { block=$0 ORS; next } block != "" { block=block $0 ORS; if ($0 ~ /<\/package>/) { if (block ~ /<name>dnfast-dep<\/name>/ || (block ~ /<name>dnfast-upgrade<\/name>/ && block ~ /ver="1.0"/)) printf "%s", block; block="" }; next } { print }' "$LIMIT_PRIMARY" >"$TMP/installed.xml"
 SYSTEM="@System,$LIMIT_REPOMD,$TMP/installed.xml,$LIMIT_FILELISTS,9999,0"
+INSTALL_ALREADY=$(solve dnfast-upgrade no-weak "$SYSTEM" "$MAIN")
+grep -qx $'satisfied\tdnfast-upgrade' <<<"$INSTALL_ALREADY"
+! grep -q '^action' <<<"$INSTALL_ALREADY"
 INSTALLED_APP=$(solve dnfast-app no-weak "$SYSTEM" "$MAIN")
 grep -q $'action\tinstall\tmain\tdnfast-app-0:1.0-1.noarch' <<<"$INSTALLED_APP"
 ! grep -q $'action\tinstall\tmain\tdnfast-dep-0:1.0-1.noarch' <<<"$INSTALLED_APP"
@@ -187,6 +190,7 @@ printf '%s\n' 'assert transitive=true' 'assert rich=true' 'assert file-provide=t
   'assert conflict-obsoletes-best=true' 'assert exact-problem=true' \
   'assert relation-selector=true' 'assert bare-selector-latest=true' \
   'assert selector-provenance=true' \
+  'assert installed-install-is-idempotent=true' \
   'assert transactional-limit-recovery=true' 'assert installed-upgrade-obsoletion=true' \
   'assert causal-strong-weak-installed=true' \
   'assert ambiguous-installed-provider-rejected=true' \

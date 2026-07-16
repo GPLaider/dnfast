@@ -55,10 +55,18 @@ pub struct PlanBuilder<'a> {
 
 impl PlanBuilder<'_> {
     pub fn build(&self, resolved: &[ResolvedAction]) -> Result<CanonicalSolverPlan, PlanError> {
+        self.build_with_satisfied(resolved, &[])
+    }
+
+    pub fn build_with_satisfied(
+        &self,
+        resolved: &[ResolvedAction],
+        satisfied_specs: &[dnfast_core::PackageSpec],
+    ) -> Result<CanonicalSolverPlan, PlanError> {
         self.policy
             .ensure_supported()
             .map_err(|error| PlanError::Unsafe(error.to_string()))?;
-        crate::preflight::validate_inputs(self, resolved)?;
+        crate::preflight::validate_inputs(self, resolved, satisfied_specs)?;
         let actions = resolved
             .iter()
             .map(|item| self.action(item))
@@ -186,6 +194,7 @@ impl PlanBuilder<'_> {
             candidate,
             installed,
             resolved.installed_vendor.as_deref(),
+            resolved.requested,
             resolved.requested && resolved.requested_spec.is_some() && resolved.requested_relation,
         )?;
         if candidate.name != resolved.name {
@@ -250,6 +259,7 @@ impl PlanBuilder<'_> {
         candidate: &CandidatePackage,
         installed: Option<&dnfast_core::InstalledPackage>,
         installed_vendor: Option<&str>,
+        enforce_preferred: bool,
         exact_requested_relation: bool,
     ) -> Result<(), PlanError> {
         if candidate.modular {
@@ -275,7 +285,7 @@ impl PlanBuilder<'_> {
             })
             .filter(|item| installed_vendor.is_none_or(|vendor| item.vendor == vendor))
             .max_by(|left, right| candidate_cmp(left, right));
-        if preferred != Some(candidate) && !exact_requested_relation {
+        if enforce_preferred && preferred != Some(candidate) && !exact_requested_relation {
             return Err(PlanError::NonPreferred(candidate.name.clone()));
         }
         Ok(())

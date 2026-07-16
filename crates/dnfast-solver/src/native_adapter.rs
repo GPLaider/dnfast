@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,8 @@ pub struct NativeSolveOutput {
     pub source_transcript_sha256: String,
     pub actions: Vec<NativeAction>,
     pub decisions: Vec<NativeDecision>,
+    #[serde(default)]
+    pub satisfied_specs: Vec<PackageSpec>,
 }
 
 impl NativeSolveOutput {
@@ -70,6 +72,13 @@ impl NativeSolveOutput {
             if identities.insert(nevra.clone(), repo.clone()).is_some() {
                 return Err(PlanError::DuplicateAction(nevra.clone()));
             }
+        }
+        let mut metadata_index = HashMap::<&str, HashMap<String, _>>::new();
+        for (repository, package) in metadata {
+            metadata_index
+                .entry(*repository)
+                .or_default()
+                .insert(complete_nevra(package), *package);
         }
         let raw = result
             .actions
@@ -121,12 +130,10 @@ impl NativeSolveOutput {
                         .cloned()
                         .ok_or_else(|| PlanError::Unresolved(item.provider.clone()))?
                 };
-                let package = metadata
-                    .iter()
-                    .find(|(repo, package)| {
-                        *repo == requiring_repo && complete_nevra(package) == item.requiring
-                    })
-                    .map(|(_, package)| *package)
+                let package = metadata_index
+                    .get(requiring_repo.as_str())
+                    .and_then(|packages| packages.get(item.requiring.as_str()))
+                    .copied()
                     .ok_or(PlanError::Invalid(
                         "native requiring identity absent from rpm-md",
                     ))?;
@@ -137,12 +144,10 @@ impl NativeSolveOutput {
                 };
                 let provider_package = (!item.provider_installed)
                     .then(|| {
-                        metadata
-                            .iter()
-                            .find(|(repo, package)| {
-                                *repo == provider_repo && complete_nevra(package) == item.provider
-                            })
-                            .map(|(_, package)| *package)
+                        metadata_index
+                            .get(provider_repo.as_str())
+                            .and_then(|packages| packages.get(item.provider.as_str()))
+                            .copied()
                             .ok_or(PlanError::Invalid(
                                 "native provider identity absent from rpm-md",
                             ))
@@ -161,11 +166,22 @@ impl NativeSolveOutput {
                 })
             })
             .collect::<Result<Vec<_>, PlanError>>()?;
+        let satisfied_specs = result
+            .satisfied_specs
+            .into_iter()
+            .map(PackageSpec::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PlanError::Invalid("native satisfied selector is invalid"))?;
         Ok(Self {
             source_transcript_sha256,
             actions,
             decisions,
+            satisfied_specs,
         })
+    }
+
+    pub fn satisfied_specs(&self) -> &[PackageSpec] {
+        &self.satisfied_specs
     }
 
     pub fn into_resolved(
@@ -220,18 +236,37 @@ impl NativeSolveOutput {
                 }
             }
         }
-        if assigned_specs.len() != expected_specs.len() {
+        let mut satisfied_specs = BTreeSet::new();
+        for spec in &self.satisfied_specs {
+            if !expected_specs.contains(spec.as_str()) {
+                return Err(PlanError::Invalid(
+                    "native satisfied selector is not in requested intent",
+                ));
+            }
+            if assigned_specs.contains(spec.as_str()) || !satisfied_specs.insert(spec.as_str()) {
+                return Err(PlanError::Invalid(
+                    "native selector provenance is duplicated",
+                ));
+            }
+        }
+        if assigned_specs.len() + satisfied_specs.len() != expected_specs.len() {
             return Err(PlanError::Invalid("native selector provenance is missing"));
         }
         self.validate_decisions(&action_ids, metadata, inventory)?;
+        let mut candidate_index = HashMap::<&str, HashMap<String, _>>::new();
+        for candidate in candidates {
+            candidate_index
+                .entry(candidate.repo_id.as_str())
+                .or_default()
+                .insert(full_nevra(candidate), candidate);
+        }
         self.actions
             .into_iter()
             .map(|action| {
-                let candidate = candidates
-                    .iter()
-                    .find(|item| {
-                        item.repo_id == action.repository && full_nevra(item) == action.nevra
-                    })
+                let candidate = candidate_index
+                    .get(action.repository.as_str())
+                    .and_then(|packages| packages.get(action.nevra.as_str()))
+                    .copied()
                     .cloned();
                 let (operation, name, instance, header, vendor) =
                     action_identity(&action, candidate.as_ref(), inventory)?;
@@ -242,6 +277,8 @@ impl NativeSolveOutput {
                         !decision.provider_installed
                             && decision.provider_nevra == action.nevra
                             && decision.provider_repo == action.repository
+                            && (decision.requiring_nevra != decision.provider_nevra
+                                || decision.requiring_repo != decision.provider_repo)
                     })
                     .map(|decision| {
                         Ok(DependencyEdge {
@@ -280,6 +317,13 @@ impl NativeSolveOutput {
         metadata: &[(&str, &dnfast_metadata::CompletePackage)],
         inventory: &dnfast_core::InstalledInventory,
     ) -> Result<(), PlanError> {
+        let mut metadata_index = HashMap::<&str, HashMap<String, _>>::new();
+        for (repository, package) in metadata {
+            metadata_index
+                .entry(*repository)
+                .or_default()
+                .insert(complete_nevra(package), *package);
+        }
         for decision in &self.decisions {
             if !actions.contains(&(
                 decision.requiring_nevra.as_str(),
@@ -303,25 +347,19 @@ impl NativeSolveOutput {
             } else if decision.provider_repo == "@System" {
                 return Err(PlanError::Invalid("action provider marked as system"));
             }
-            let requiring = metadata
-                .iter()
-                .find(|(repo, item)| {
-                    *repo == decision.requiring_repo
-                        && complete_nevra(item) == decision.requiring_nevra
-                })
-                .map(|(_, item)| *item)
+            let requiring = metadata_index
+                .get(decision.requiring_repo.as_str())
+                .and_then(|packages| packages.get(decision.requiring_nevra.as_str()))
+                .copied()
                 .ok_or(PlanError::Invalid(
                     "native requiring identity absent from rpm-md",
                 ))?;
             let provider = (!decision.provider_installed)
                 .then(|| {
-                    metadata
-                        .iter()
-                        .find(|(repo, item)| {
-                            *repo == decision.provider_repo
-                                && complete_nevra(item) == decision.provider_nevra
-                        })
-                        .map(|(_, item)| *item)
+                    metadata_index
+                        .get(decision.provider_repo.as_str())
+                        .and_then(|packages| packages.get(decision.provider_nevra.as_str()))
+                        .copied()
                         .ok_or(PlanError::Invalid(
                             "native provider identity absent from rpm-md",
                         ))

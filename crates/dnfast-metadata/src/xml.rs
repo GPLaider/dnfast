@@ -1,7 +1,7 @@
 use quick_xml::{
     Reader,
     encoding::Decoder,
-    events::{BytesStart, BytesText},
+    events::{BytesRef, BytesStart, BytesText},
 };
 
 use crate::MetadataError;
@@ -52,6 +52,15 @@ pub(crate) fn decode_text(event: &BytesText<'_>) -> Result<String, MetadataError
         .decode()
         .map_err(|error| MetadataError::Xml(error.to_string()))?;
     quick_xml::escape::unescape(&decoded)
+        .map(|value| value.into_owned())
+        .map_err(|error| MetadataError::Xml(error.to_string()))
+}
+
+pub(crate) fn decode_reference(event: &BytesRef<'_>) -> Result<String, MetadataError> {
+    let reference = event
+        .decode()
+        .map_err(|error| MetadataError::Xml(error.to_string()))?;
+    quick_xml::escape::unescape(&format!("&{reference};"))
         .map(|value| value.into_owned())
         .map_err(|error| MetadataError::Xml(error.to_string()))
 }

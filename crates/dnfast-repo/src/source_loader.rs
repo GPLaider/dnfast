@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     MutationError, MutationProfile, Variables, anchored_fs, key_bundle_digest, parse_main_config,
-    parse_repo_profile, profile::expand_variables,
+    parse_repo_profile, profile::expand_variables, trust::primary_certificate_fingerprints,
 };
 
 const MAIN_PATH: &str = "/etc/dnf/dnf.conf";
@@ -40,6 +40,7 @@ fn load_mutation_profile_owned(
     owner: u32,
     system_variables: Option<SystemVariables>,
 ) -> Result<MutationProfile, MutationError> {
+    let bind_system_certificate_fingerprints = system_variables.is_some();
     let main_text = read_root_file(main_path, owner)?;
     let main = parse_main_config(main_path, &main_text)?;
     let (variables, variable_count) = load_variable_sources(&main.varsdir, owner)?;
@@ -77,8 +78,32 @@ fn load_mutation_profile_owned(
     }
     expand_variables(&mut output, variables)?;
     for repo in &mut output.repositories {
+        if !repo.enabled {
+            repo.key_bundle_digest = None;
+            continue;
+        }
         let key_paths = repo.gpgkey.iter().map(PathBuf::from).collect::<Vec<_>>();
-        repo.key_bundle_digest = Some(key_bundle_digest(&repo.id, &key_paths)?.digest);
+        let bundle = key_bundle_digest(&repo.id, &key_paths)?;
+        if bind_system_certificate_fingerprints && !bundle.certificates.is_empty() {
+            let bundled = primary_certificate_fingerprints(&bundle.certificates)?;
+            if repo.allowed_fingerprints.is_empty() {
+                repo.allowed_fingerprints = bundled;
+            } else {
+                let available = bundled.into_iter().collect::<BTreeSet<_>>();
+                if repo
+                    .allowed_fingerprints
+                    .iter()
+                    .any(|fingerprint| !available.contains(&fingerprint.to_ascii_uppercase()))
+                {
+                    return Err(MutationError::new(
+                        Path::new("<gpgkey>"),
+                        0,
+                        "allowed fingerprint is absent from the repository key bundle",
+                    ));
+                }
+            }
+        }
+        repo.key_bundle_digest = Some(bundle.digest);
     }
     Ok(output)
 }
@@ -414,6 +439,40 @@ mod tests {
             ["/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-aarch64"]
         );
         assert!(profile.repositories[0].key_bundle_digest.is_some());
+        assert_eq!(profile.repositories[0].allowed_fingerprints.len(), 1);
+        assert!(
+            profile.repositories[0].allowed_fingerprints[0]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+    }
+
+    #[test]
+    fn disabled_third_party_remote_key_is_inert_until_repository_enablement() {
+        let fixture = Fixture::new();
+        let repositories = fixture.directory("repos");
+        let variables = fixture.directory("vars");
+        Fixture::file(
+            &repositories.join("third-party.repo"),
+            "[third:party]\nbaseurl=https://example.test/repo\nenabled=0\ngpgkey=https://example.test/key.gpg\n",
+        );
+        let main = fixture.0.join("dnf.conf");
+        Fixture::file(
+            &main,
+            &format!(
+                "[main]\nreposdir={}\nvarsdir={}\n",
+                repositories.display(),
+                variables.display()
+            ),
+        );
+        let profile = load_system_mutation_profile_from_with_values(&main, "44", "aarch64")
+            .expect("disabled third-party trust input must stay inert");
+        assert!(!profile.repositories[0].enabled);
+        assert_eq!(
+            profile.repositories[0].gpgkey,
+            ["https://example.test/key.gpg"]
+        );
+        assert!(profile.repositories[0].key_bundle_digest.is_none());
     }
 
     #[test]

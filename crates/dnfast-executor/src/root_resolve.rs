@@ -71,6 +71,7 @@ pub fn require_equal(
         &inventory,
     )
     .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    let satisfied_specs = transcript.satisfied_specs().to_vec();
     let resolved = transcript
         .into_resolved(&names, &staged.candidates, &metadata, &inventory)
         .map_err(|error| ExecutorError::Plan(error.to_string()))?;
@@ -83,7 +84,7 @@ pub fn require_equal(
         candidates: &staged.candidates,
         expires_at_unix: proposal.expires_at_unix(),
     }
-    .build(&resolved)
+    .build_with_satisfied(&resolved, &satisfied_specs)
     .map_err(|error| ExecutorError::Plan(error.to_string()))?;
     ReSolveContract::require_equal(proposed, &root_plan)
         .map_err(|error| ExecutorError::Plan(error.to_string()))?;

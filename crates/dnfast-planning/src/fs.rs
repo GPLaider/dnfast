@@ -117,6 +117,50 @@ impl TrustedDirectory {
         Ok(bytes)
     }
 
+    pub(crate) fn read_if_present(
+        &self,
+        name: &str,
+        maximum: usize,
+    ) -> Result<Option<Vec<u8>>, PlanningError> {
+        self.recheck()?;
+        validate_name(name)?;
+        let fd = match openat2(
+            &self.fd,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(io(error)),
+        };
+        validate_regular(&fd, self.owner)?;
+        let before = identity(&fd)?;
+        let mut file = File::from(fd);
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(
+                u64::try_from(maximum)
+                    .map_err(|error| PlanningError::UnsafeSnapshot(error.to_string()))?
+                    + 1,
+            )
+            .read_to_end(&mut bytes)
+            .map_err(read)?;
+        if bytes.len() > maximum {
+            return Err(PlanningError::UnsafeSnapshot(
+                "snapshot file exceeds maximum size".into(),
+            ));
+        }
+        if identity(&file.as_fd())? != before {
+            return Err(PlanningError::UnsafeSnapshot(
+                "snapshot file changed while read".into(),
+            ));
+        }
+        self.recheck()?;
+        Ok(Some(bytes))
+    }
+
     pub(crate) fn recheck(&self) -> Result<(), PlanningError> {
         validate_directory(&self.fd, self.owner)?;
         if identity(&self.fd)? != self.identity {

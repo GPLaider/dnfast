@@ -194,8 +194,6 @@ pub struct VerifiedCompleteGeneration {
     pub(crate) repomd: VerifiedBytes,
     pub(crate) primary: VerifiedBytes,
     pub(crate) filelists: VerifiedBytes,
-    pub(crate) solver_inputs: Vec<CompletePackage>,
-    pub(crate) filelist_inputs: Vec<FileListPackage>,
     pub(crate) repomd_authentication: RepomdAuthentication,
 }
 
@@ -217,12 +215,6 @@ impl VerifiedCompleteGeneration {
     }
     pub fn filelists(&self) -> &VerifiedBytes {
         &self.filelists
-    }
-    pub fn solver_inputs(&self) -> &[CompletePackage] {
-        &self.solver_inputs
-    }
-    pub fn filelist_inputs(&self) -> &[FileListPackage] {
-        &self.filelist_inputs
     }
     pub fn repomd_authentication(&self) -> &RepomdAuthentication {
         &self.repomd_authentication

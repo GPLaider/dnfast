@@ -177,6 +177,40 @@ fn typed_edges_override_misleading_prose_and_shared_dep_reaches_two_roots() {
 }
 
 #[test]
+fn reachable_rpm_dependency_cycle_uses_a_stable_order() {
+    let intent = TransactionIntent::from_package_names(Action::Install, &["app"]).unwrap();
+    let inventory = InstalledInventory::new("sqlite", "6.0.1", vec![]).unwrap();
+    let snapshots = snapshots();
+    let policy = SolverPolicy::fedora44_aarch64(vec![], vec![]);
+    let candidates = [candidate("app"), candidate("cycle-a"), candidate("cycle-b")];
+    let plan = build(&intent, &candidates, &inventory, &snapshots, &policy)
+        .build(&[
+            action("app", &[], "root"),
+            action(
+                "cycle-a",
+                &[
+                    ("app", DependencyKind::Strong),
+                    ("cycle-b", DependencyKind::Strong),
+                ],
+                "reachable cycle",
+            ),
+            action(
+                "cycle-b",
+                &[("cycle-a", DependencyKind::Strong)],
+                "reachable cycle",
+            ),
+        ])
+        .unwrap();
+    assert_eq!(
+        plan.actions()
+            .iter()
+            .map(|item| item.name())
+            .collect::<Vec<_>>(),
+        ["cycle-a", "app", "cycle-b"]
+    );
+}
+
+#[test]
 fn explicitly_requested_dependency_keeps_user_reason_and_dependency_order() {
     let intent = TransactionIntent::from_package_names(Action::Install, &["app", "dep"]).unwrap();
     let inventory = InstalledInventory::new("sqlite", "6.0.1", vec![]).unwrap();

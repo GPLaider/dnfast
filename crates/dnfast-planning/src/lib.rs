@@ -100,14 +100,6 @@ mod tests {
         let repomd = fs::read(metadata.join("repomd.xml")).expect("repomd");
         let primary = fs::read(metadata.join("primary.xml.zst")).expect("primary");
         let filelists = fs::read(metadata.join("filelists.xml.zst")).expect("filelists");
-        let records = dnfast_metadata::parse_repomd_records(&repomd).expect("records");
-        let decoded_primary = dnfast_metadata::decode_record(primary.as_slice(), &records.primary)
-            .expect("decoded primary");
-        let solver_inputs = dnfast_metadata::parse_primary_records(decoded_primary.as_slice())
-            .expect("solver inputs");
-        let filelist_inputs =
-            dnfast_metadata::parse_filelists_record(filelists.as_slice(), &records.filelists)
-                .expect("filelist inputs");
         let certificate = b"planning-key";
         let bundle_path = "/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-x86_64";
         let mut bundle = Sha256::new();
@@ -149,8 +141,6 @@ mod tests {
                 repomd: bytes(&repomd),
                 primary: bytes(&primary),
                 filelists: bytes(&filelists),
-                solver_inputs,
-                filelist_inputs,
                 trust,
                 keys: vec![PlanningKey {
                     bundle_path: bundle_path.into(),

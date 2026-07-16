@@ -170,7 +170,9 @@ pub(crate) fn expand_variables(
         expand_list(&variables, &mut repo.excludepkgs)?;
         expand_list(&variables, &mut repo.includepkgs)?;
         expand_list(&variables, &mut repo.gpgkey)?;
-        normalize_gpgkey_locations(&mut repo.gpgkey)?;
+        if repo.enabled {
+            normalize_gpgkey_locations(&mut repo.gpgkey)?;
+        }
     }
     profile.variables = variables;
     Ok(())
@@ -231,6 +233,9 @@ fn assign_repo(
         "skip_if_unavailable" => repo.skip_if_unavailable = boolean(path, line, value)?,
         "metadata_expire" => repo.metadata_expire = parse_metadata_expire(path, line, value)?,
         "countme" => validate_countme(path, line, value)?,
+        "enabled_metadata" => {
+            let _ = boolean(path, line, value)?;
+        }
         "sslverify" if !boolean(path, line, value)? => return rejected(path, line, key),
         "sslverify" => repo.sslverify = true,
         "gpgcheck" if !boolean(path, line, value)? => return rejected(path, line, key),
@@ -402,7 +407,7 @@ pub fn apply_setopts(
             .ok_or_else(|| {
                 MutationError::new(cli, index + 1, "unknown repository setopt target")
             })?;
-        if key == "gpgkey" {
+        if matches!(key, "gpgkey" | "enabled") {
             trust_changed.insert(id.to_owned());
         }
         match key {
@@ -415,13 +420,17 @@ pub fn apply_setopts(
         if !trust_changed.contains(&repo.id) {
             continue;
         }
-        normalize_gpgkey_locations(&mut repo.gpgkey)?;
-        let paths = repo
-            .gpgkey
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect::<Vec<_>>();
-        repo.key_bundle_digest = Some(key_bundle_digest(&repo.id, &paths)?.digest);
+        if repo.enabled {
+            normalize_gpgkey_locations(&mut repo.gpgkey)?;
+            let paths = repo
+                .gpgkey
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>();
+            repo.key_bundle_digest = Some(key_bundle_digest(&repo.id, &paths)?.digest);
+        } else {
+            repo.key_bundle_digest = None;
+        }
     }
     Ok(profile)
 }
@@ -438,9 +447,10 @@ fn nonempty(value: &str) -> Option<String> {
 }
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
+        && id.len() <= 255
         && id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
 }
 fn reset_or_append(target: &mut Vec<String>, value: &str) {
     if value.is_empty() {

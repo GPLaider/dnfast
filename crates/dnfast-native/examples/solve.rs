@@ -32,7 +32,7 @@ fn main() {
     };
     let limits = NativeLimits {
         max_packages: u32_value("DNFAST_MAX_PACKAGES", 2_000_000),
-        max_relations_per_package: u32_value("DNFAST_MAX_RELATIONS", 4_096),
+        max_relations_per_package: u32_value("DNFAST_MAX_RELATIONS", 16_384),
         max_metadata_bytes: u64_value("DNFAST_MAX_METADATA_BYTES", 17_179_869_184),
     };
     let mut context = NativeContext::open_with_limits(Architecture::Aarch64, || false, limits)
@@ -98,6 +98,9 @@ fn main() {
     }
     for problem in result.problems {
         println!("problem\t{problem}");
+    }
+    for spec in result.satisfied_specs {
+        println!("satisfied\t{spec}");
     }
     for decision in result.decisions {
         println!(

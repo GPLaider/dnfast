@@ -60,6 +60,7 @@ pub struct SolveResult {
     pub obsoletes: Vec<Option<String>>,
     pub requested_specs: Vec<Option<String>>,
     pub requested_relation_kinds: Vec<bool>,
+    pub satisfied_specs: Vec<String>,
     pub problems: Vec<String>,
     pub decisions: Vec<SolveDecision>,
 }
@@ -139,6 +140,19 @@ impl NativeContext {
     pub fn add_repository(&mut self, repository: Repository) -> Result<(), NativeError> {
         self.inner
             .add_repo(&dnfast_native_sys::RepoInput {
+                id: repository.id,
+                repomd_path: repository.repomd_path,
+                primary_path: repository.primary_path,
+                filelists_path: repository.filelists_path,
+                priority: repository.priority,
+                cost: repository.cost,
+            })
+            .map_err(NativeError::from)
+    }
+
+    pub fn add_repository_primary(&mut self, repository: Repository) -> Result<(), NativeError> {
+        self.inner
+            .add_repo_primary(&dnfast_native_sys::RepoInput {
                 id: repository.id,
                 repomd_path: repository.repomd_path,
                 primary_path: repository.primary_path,
@@ -245,6 +259,7 @@ impl NativeContext {
                 obsoletes: result.obsoletes,
                 requested_specs: result.requested_specs,
                 requested_relation_kinds: result.requested_relation_kinds,
+                satisfied_specs: result.satisfied_specs,
                 problems: result.problems,
                 decisions: result
                     .decisions

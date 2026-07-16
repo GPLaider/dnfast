@@ -50,3 +50,13 @@ uint8_t dnfast_solver_action_requested_relation_kind(const dnfast_context *conte
             index >= context->action_count
         ? 0 : context->action_requested_relation_kinds[index];
 }
+
+size_t dnfast_solver_satisfied_spec_count(const dnfast_context *context) {
+    return context == NULL ? 0 : context->satisfied_spec_count;
+}
+
+const char *dnfast_solver_satisfied_spec(const dnfast_context *context,
+                                         size_t index) {
+    return context == NULL || index >= context->satisfied_spec_count
+        ? NULL : context->satisfied_specs[index];
+}

@@ -47,6 +47,19 @@ an atomic current-pointer update. Search revalidates the immutable manifest and 
 does not decompress and reparse all primary XML for every query. System cache and planning roots
 are `/var/cache/dnfast` and `/var/lib/dnfast/planning`.
 
+A refresh always obtains fresh `repomd.xml`. When its exact bytes hash to the already published
+generation, dnfast reopens and rehashes the complete immutable primary, filelists, and search-index
+objects and republishes only the verified pointer/evidence. A byte-distinct repomd takes the full
+download, validation, and atomic publication path. Independent repository downloads overlap;
+Fedora-scale metadata validation/publication is serialized to keep peak memory bounded.
+
+Planning snapshot schema v4 stores only SHA-256 and size descriptors in the canonical JSON. The
+raw repomd, compressed primary, and compressed filelists payloads live once under
+`/var/lib/dnfast/planning/blobs/sha256/<digest>`. Readers require a trusted root/owner storage
+binding and verify the descriptor, file shape, size, and digest before decoding or staging it.
+Legacy self-contained schema-v3 snapshots remain readable for migration, but new publications use
+v4 and never embed large base64 metadata in the snapshot.
+
 Current limits are 2 MiB for Metalink, 16 MiB for repomd, 512 MiB for compressed metadata,
 1 GiB for opened metadata, 32 Metalink resources, and 2,000,000 packages. Declared sizes above
 implementation-owned limits fail before allocation or download.
@@ -63,9 +76,16 @@ requests remain invalid.
 Librpm owns package signature verification, transaction checks and ordering, payload changes,
 scriptlets, triggers, plugins, and RPMDB writes. Native libsolv/librpm objects remain on one owner
 thread. `dnfastd` performs a full RPMDB verification before accepting connections. It keeps one
-pool for the exact current planning generation and RPMDB cookie, and refreshes the installed repo
-incrementally after its own successful transaction. An external cookie change invalidates the
-pool and requires another full RPMDB verification before reuse.
+primary-only pool for the exact current planning generation and RPMDB cookie, and refreshes the
+installed repo incrementally after its own successful transaction. It memoizes one solved result
+only under the exact canonical transaction intent, selected repository set, generation, and
+cookie. An external cookie or generation change invalidates both pool and result and requires
+another full RPMDB verification before reuse. Absolute-path package selectors require filelists;
+the daemon explicitly returns a fallback response and the CLI performs the full snapshot-bound
+filelists solve through the fixed planner instead of weakening the resident pool.
+
+An install request for an already installed exact package is idempotent. Install does not silently
+turn into update; upgrade remains the operation that selects a newer eligible version.
 
 Prepare returns the solved actions and a SHA-256 token binding the daemon nonce, monotonic
 sequence, canonical plan digest, RPMDB cookie, metadata/trust/policy digests, and expiry. Approval
@@ -90,8 +110,9 @@ by RPMDB/inventory reconciliation, not described as rollback.
 ## Compatibility and concurrency
 
 RPM and rpm-md compatibility do not imply DNF5 behavioral compatibility. DNF5 also owns policy,
-install reasons, groups, history, plugins, locks, and private state beyond RPMDB. Dnfast therefore
-describes itself as an independent package manager with an explicitly smaller command surface.
+install reasons, groups, modules, plugins, locks, and private state beyond RPMDB. Dnfast's history
+surface reports only its own verified journal. Dnfast therefore describes itself as an independent
+package manager with an explicitly smaller command surface.
 
 Network and decompression may run concurrently through bounded queues. One repomd generation is
 immutable; solver state has one owner; the librpm execution boundary is single-threaded and root

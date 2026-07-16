@@ -9,7 +9,9 @@ use quick_xml::{Reader, events::Event};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    FileListPackage, MAX_FILELISTS_COMPRESSED_BYTES, MAX_FILELISTS_OPEN_BYTES, parse_filelists,
+    CompletePackage, FileListPackage, MAX_FILELISTS_COMPRESSED_BYTES, MAX_FILELISTS_OPEN_BYTES,
+    PrimaryPackageIdentity, ValidatedPrimary, parse_filelists, parse_primary_validated,
+    validate_filelists_xml, validate_filelists_xml_identities,
 };
 use crate::{MAX_PRIMARY_OPEN_BYTES, MetadataError, MetadataRecord, PrimaryRecord};
 
@@ -84,15 +86,64 @@ pub fn parse_filelists_record<R: Read>(
     input: R,
     record: &MetadataRecord,
 ) -> Result<Vec<FileListPackage>, MetadataError> {
-    if record.size > MAX_FILELISTS_COMPRESSED_BYTES {
+    parse_filelists(verified_filelists_reader(input, record)?)
+}
+
+pub fn validate_filelists_record<R: Read>(
+    input: R,
+    record: &MetadataRecord,
+    primary: &[CompletePackage],
+) -> Result<(), MetadataError> {
+    validate_filelists_xml(verified_filelists_reader(input, record)?, primary)
+}
+
+pub fn validate_primary_record<R: Read>(
+    input: R,
+    record: &MetadataRecord,
+) -> Result<ValidatedPrimary, MetadataError> {
+    parse_primary_validated(verified_metadata_reader(
+        input,
+        record,
+        crate::MAX_PRIMARY_COMPRESSED_BYTES,
+        crate::MAX_PRIMARY_OPEN_BYTES,
+    )?)
+}
+
+pub fn validate_filelists_record_identities<R: Read>(
+    input: R,
+    record: &MetadataRecord,
+    primary: &[PrimaryPackageIdentity],
+) -> Result<(), MetadataError> {
+    validate_filelists_xml_identities(verified_filelists_reader(input, record)?, primary)
+}
+
+fn verified_filelists_reader<'a, R: Read + 'a>(
+    input: R,
+    record: &'a MetadataRecord,
+) -> Result<BufReader<OpenVerifier<'a>>, MetadataError> {
+    verified_metadata_reader(
+        input,
+        record,
+        MAX_FILELISTS_COMPRESSED_BYTES,
+        MAX_FILELISTS_OPEN_BYTES,
+    )
+}
+
+fn verified_metadata_reader<'a, R: Read + 'a>(
+    input: R,
+    record: &'a MetadataRecord,
+    max_compressed: u64,
+    max_open: u64,
+) -> Result<BufReader<OpenVerifier<'a>>, MetadataError> {
+    if record.size > max_compressed {
         return Err(MetadataError::SizeMismatch {
-            expected: MAX_FILELISTS_COMPRESSED_BYTES,
+            expected: max_compressed,
             actual: record.size,
         });
     }
-    if record.open_size > MAX_FILELISTS_OPEN_BYTES {
+    if record.open_size > max_open {
         return Err(MetadataError::SizeMismatch {
-            expected: MAX_FILELISTS_OPEN_BYTES,
+            expected: max_open,
             actual: record.open_size,
         });
     }
@@ -129,7 +180,7 @@ pub fn parse_filelists_record<R: Read>(
         record,
         checked: false,
     };
-    parse_filelists(BufReader::new(verified))
+    Ok(BufReader::new(verified))
 }
 
 #[derive(Clone, Copy)]

@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef DNFAST_NATIVE_REAL
 #include <solv/pool.h>
@@ -15,6 +16,13 @@
 #include <solv/selection.h>
 #include <solv/solver.h>
 #include <solv/transaction.h>
+
+static uint64_t monotonic_micros(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
+    return (uint64_t)value.tv_sec * UINT64_C(1000000) +
+           (uint64_t)value.tv_nsec / UINT64_C(1000);
+}
 #endif
 
 #ifdef DNFAST_NATIVE_REAL
@@ -44,25 +52,30 @@ static int add_xml(Repo *repo, FILE *stream, int mode) {
 }
 #endif
 
-dnfast_status dnfast_solver_add_repo(dnfast_context *context,
-                                     const dnfast_repo_input *input,
-                                     dnfast_error *error) {
+static dnfast_status add_repo_kind(dnfast_context *context,
+                                   const dnfast_repo_input *input,
+                                   int include_filelists,
+                                   dnfast_error *error) {
     dnfast_status status = owner_check(context, error);
     if (status != DNFAST_STATUS_OK) return status;
     status = dnfast_callback_check(&context->callbacks, error);
     if (status != DNFAST_STATUS_OK) return status;
     if (input == NULL || input->abi_version != DNFAST_NATIVE_ABI_VERSION ||
         input->id == NULL || input->repomd_path == NULL ||
-        input->primary_path == NULL || input->filelists_path == NULL)
+        input->primary_path == NULL ||
+        (include_filelists && input->filelists_path == NULL))
         return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
                                 "solver", NULL, "invalid repository input");
 #ifdef DNFAST_NATIVE_REAL
     FILE *streams[3] = {NULL, NULL, NULL};
     struct stat identity[3];
-    status = dnfast_metadata_open(input, streams, identity, error);
+    size_t metadata_count = include_filelists ? 3 : 2;
+    status = dnfast_metadata_open(input, streams, identity, metadata_count, error);
     if (status != DNFAST_STATUS_OK) return status;
-    int metadata_fds[3] = {fileno(streams[0]), fileno(streams[1]), fileno(streams[2])};
-    status = dnfast_limits_before_repo(context, metadata_fds, error);
+    int metadata_fds[3] = {fileno(streams[0]), fileno(streams[1]), -1};
+    if (include_filelists) metadata_fds[2] = fileno(streams[2]);
+    status = dnfast_limits_before_repo(context, metadata_fds,
+                                       metadata_count, error);
     if (status != DNFAST_STATUS_OK) {
         dnfast_metadata_close(streams);
         return status;
@@ -74,7 +87,8 @@ dnfast_status dnfast_solver_add_repo(dnfast_context *context,
     }
     Repo *repo = repo_create(context->pool, input->id);
     if (repo == NULL || add_xml(repo, streams[0], 1) != 0 ||
-        add_xml(repo, streams[1], 0) != 0 || add_xml(repo, streams[2], 2) != 0) {
+        add_xml(repo, streams[1], 0) != 0 ||
+        (include_filelists && add_xml(repo, streams[2], 2) != 0)) {
         if (repo != NULL) repo_free(repo, 1);
         dnfast_metadata_close(streams);
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
@@ -83,7 +97,7 @@ dnfast_status dnfast_solver_add_repo(dnfast_context *context,
     status = dnfast_callback_check(&context->callbacks, error);
     if (status == DNFAST_STATUS_OK)
         status = dnfast_limits_finalize_repo(context, repo, input, streams,
-                                             identity, error);
+                                             identity, metadata_count, error);
     dnfast_metadata_close(streams);
     if (status != DNFAST_STATUS_OK) {
         repo_free(repo, 1);
@@ -99,6 +113,18 @@ dnfast_status dnfast_solver_add_repo(dnfast_context *context,
     return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
                             "solv", "repo_add_rpmmd", "real native build disabled");
 #endif
+}
+
+dnfast_status dnfast_solver_add_repo(dnfast_context *context,
+                                     const dnfast_repo_input *input,
+                                     dnfast_error *error) {
+    return add_repo_kind(context, input, 1, error);
+}
+
+dnfast_status dnfast_solver_add_repo_primary(dnfast_context *context,
+                                             const dnfast_repo_input *input,
+                                             dnfast_error *error) {
+    return add_repo_kind(context, input, 0, error);
 }
 
 #ifdef DNFAST_NATIVE_REAL
@@ -192,12 +218,21 @@ static dnfast_status copy_selector_provenance(dnfast_context *context,
     char **requested_specs = calloc(context->action_count, sizeof(char *));
     uint8_t *requested_relation_kinds = calloc(context->action_count,
                                                sizeof(uint8_t));
+    char **satisfied_specs = calloc(request->name_count, sizeof(char *));
+    size_t satisfied_spec_count = 0;
     if (context->action_count != 0 &&
         (requested_specs == NULL || requested_relation_kinds == NULL)) {
         free_selector_provenance(requested_specs, requested_relation_kinds,
                                  context->action_count);
+        free(satisfied_specs);
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                 "dnfast", "calloc", "selector provenance allocation failed");
+    }
+    if (request->name_count != 0 && satisfied_specs == NULL) {
+        free_selector_provenance(requested_specs, requested_relation_kinds,
+                                 context->action_count);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "dnfast", "calloc", "satisfied selector allocation failed");
     }
     for (size_t selector_index = 0; selector_index < request->name_count;
          ++selector_index) {
@@ -219,18 +254,43 @@ static dnfast_status copy_selector_provenance(dnfast_context *context,
             }
         }
         queue_free(&selected);
+        /* A valid selector can be satisfied entirely by the installed repo and
+         * therefore produce no active transaction step.  That is an
+         * idempotent no-op, not lost provenance: provenance is attached only to
+         * executable actions. */
+        if (match_count == 0) {
+            satisfied_specs[satisfied_spec_count] =
+                copy_text(request->names[selector_index]);
+            if (satisfied_specs[satisfied_spec_count] == NULL) {
+                free_selector_provenance(requested_specs,
+                                         requested_relation_kinds,
+                                         context->action_count);
+                for (size_t index = 0; index < satisfied_spec_count; ++index)
+                    free(satisfied_specs[index]);
+                free(satisfied_specs);
+                return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                        "dnfast", "malloc",
+                                        "satisfied selector allocation failed");
+            }
+            ++satisfied_spec_count;
+            continue;
+        }
         if (match_count != 1) {
             free_selector_provenance(requested_specs, requested_relation_kinds,
                                      context->action_count);
+            for (size_t index = 0; index < satisfied_spec_count; ++index)
+                free(satisfied_specs[index]);
+            free(satisfied_specs);
             return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                     "libsolv", "selection_solvables",
-                                    match_count == 0
-                                        ? "selector has no final active transaction action"
-                                        : "selector has multiple final active transaction actions");
+                                    "selector has multiple final active transaction actions");
         }
         if (requested_specs[action_index] != NULL) {
             free_selector_provenance(requested_specs, requested_relation_kinds,
                                      context->action_count);
+            for (size_t index = 0; index < satisfied_spec_count; ++index)
+                free(satisfied_specs[index]);
+            free(satisfied_specs);
             return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                     "libsolv", "selection_solvables",
                                     "selectors overlap on final active transaction action");
@@ -239,6 +299,9 @@ static dnfast_status copy_selector_provenance(dnfast_context *context,
         if (requested_specs[action_index] == NULL) {
             free_selector_provenance(requested_specs, requested_relation_kinds,
                                      context->action_count);
+            for (size_t index = 0; index < satisfied_spec_count; ++index)
+                free(satisfied_specs[index]);
+            free(satisfied_specs);
             return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                     "dnfast", "malloc",
                                     "selector provenance allocation failed");
@@ -248,6 +311,8 @@ static dnfast_status copy_selector_provenance(dnfast_context *context,
     }
     context->action_requested_specs = requested_specs;
     context->action_requested_relation_kinds = requested_relation_kinds;
+    context->satisfied_specs = satisfied_specs;
+    context->satisfied_spec_count = satisfied_spec_count;
     return DNFAST_STATUS_OK;
 }
 #endif
@@ -286,15 +351,22 @@ static dnfast_status solve_operation(dnfast_context *context,
                     (request->best ? SOLVER_FORCEBEST : 0), 0);
     for (size_t name_index = 0; name_index < request->name_count; ++name_index) {
         int start = job.count;
-        int selection_flags = SELECTION_NAME | SELECTION_PROVIDES |
-                              SELECTION_FILELIST | SELECTION_REL;
+        int selector_flags = SELECTION_NAME | SELECTION_PROVIDES | SELECTION_REL;
+        /* Filelist matching scans the repository's very large file index. It
+         * is semantically relevant only to absolute path selectors; ordinary
+         * names, capabilities, and version relations are completely covered by
+         * NAME/PROVIDES/REL. DNF-style type dispatch avoids an O(filelists)
+         * scan for every normal install request without weakening path lookup. */
+        if (request->names[name_index] != NULL &&
+            request->names[name_index][0] == '/')
+            selector_flags |= SELECTION_FILELIST;
+        int selection_flags = selector_flags;
         queue_init(&selectors[name_index]);
         if (name_index != 0) selection_flags |= SELECTION_ADD;
         if (request->names[name_index] == NULL || request->names[name_index][0] == '\0' ||
             selection_make(context->pool, &selectors[name_index],
                            request->names[name_index],
-                           SELECTION_NAME | SELECTION_PROVIDES | SELECTION_FILELIST |
-                           SELECTION_REL) == 0 ||
+                           selector_flags) == 0 ||
             selection_make(context->pool, &job, request->names[name_index],
                            selection_flags) == 0) {
             status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
@@ -311,7 +383,7 @@ static dnfast_status solve_operation(dnfast_context *context,
             ISRELDEP(job.elements[start + 1]) ? 1 : 0;
         for (int index = start; index < job.count; index += 2) {
             if (operation == 0)
-                job.elements[index] |= SOLVER_INSTALL | SOLVER_ORUPDATE |
+                job.elements[index] |= SOLVER_INSTALL |
                                        (request->best ? SOLVER_FORCEBEST : 0);
             else if (operation == 1) job.elements[index] |= SOLVER_ERASE;
             else job.elements[index] |= SOLVER_UPDATE | SOLVER_FORCEBEST;
@@ -321,8 +393,10 @@ static dnfast_status solve_operation(dnfast_context *context,
     if (!request->install_weak_deps)
         solver_set_flag(context->solver, SOLVER_FLAG_IGNORE_RECOMMENDED, 1);
     solver_set_flag(context->solver, SOLVER_FLAG_STRICT_REPO_PRIORITY, 1);
+    uint64_t solve_started = monotonic_micros();
     if (solver_solve(context->solver, &job) != 0) status = copy_problems(context, error);
     else {
+        uint64_t solver_finished = monotonic_micros();
         context->transaction = solver_create_transaction(context->solver);
         if (context->transaction == NULL)
             status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
@@ -333,7 +407,17 @@ static dnfast_status solve_operation(dnfast_context *context,
             status = copy_selector_provenance(context, request, selectors,
                                               selector_relation_kinds,
                                               operation, error);
+        uint64_t actions_finished = monotonic_micros();
         if (status == DNFAST_STATUS_OK) status = dnfast_decisions_collect(context, error);
+        if (getenv("DNFAST_NATIVE_TRACE") != NULL) {
+            uint64_t decisions_finished = monotonic_micros();
+            fprintf(stderr,
+                    "dnfast_native_trace solver_us=%llu actions_us=%llu decisions_us=%llu decisions=%zu\n",
+                    (unsigned long long)(solver_finished - solve_started),
+                    (unsigned long long)(actions_finished - solver_finished),
+                    (unsigned long long)(decisions_finished - actions_finished),
+                    context->decision_count);
+        }
     }
 cleanup:
     for (size_t selector_index = 0; selector_index < request->name_count;

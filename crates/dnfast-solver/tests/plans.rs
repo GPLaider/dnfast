@@ -237,6 +237,34 @@ fn highest_evr_then_priority_cost_and_repo_ties_are_enforced() {
 }
 
 #[test]
+fn validated_dependency_may_use_a_constraint_compatible_non_latest_candidate() {
+    let intent = TransactionIntent::from_package_names(Action::Install, &["app"]).unwrap();
+    let app = candidate("app", "1", "fedora", 99, 1000);
+    let dependency_v1 = candidate("dependency", "1", "fedora", 99, 1000);
+    let dependency_v2 = candidate("dependency", "2", "fedora", 99, 1000);
+    let candidates = [app.clone(), dependency_v1.clone(), dependency_v2];
+    let state = inventory(Vec::new());
+    let snapshots = snapshots();
+    let policy = policy();
+    let builder = PlanBuilder {
+        intent: &intent,
+        snapshots: &snapshots,
+        inventory: &state,
+        policy: &policy,
+        candidates: &candidates,
+        expires_at_unix: 100,
+    };
+    assert!(
+        builder
+            .build(&[
+                install("app", app, None),
+                install("dependency", dependency_v1, Some("app")),
+            ])
+            .is_ok()
+    );
+}
+
+#[test]
 fn exact_native_relation_may_select_h1_while_bare_h1_stays_non_preferred() {
     // Given: H2 is the global name preference, while H1 is a one-to-one exact relation result.
     let h1 = candidate("app", "1", "fedora", 99, 1000);

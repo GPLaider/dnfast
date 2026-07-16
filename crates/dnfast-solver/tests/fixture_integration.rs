@@ -211,6 +211,7 @@ fn real_todo2a_primary_drives_app_dependency_plan_and_failures_do_not_download()
                 .iter()
                 .map(|item| item.requested_relation)
                 .collect(),
+            satisfied_specs: vec![],
             problems: vec![],
             decisions: vec![dnfast_native::SolveDecision {
                 requiring: "dnfast-app-0:1.0-1.noarch".into(),
@@ -296,6 +297,7 @@ fn reverse_weak_supplement_decision_keeps_the_native_plan_connected() {
             obsoletes: vec![None, None, None],
             requested_specs: vec![None, None, Some("dnfast-app".into())],
             requested_relation_kinds: vec![false, false, false],
+            satisfied_specs: vec![],
             problems: vec![],
             decisions: vec![
                 dnfast_native::SolveDecision {
@@ -396,6 +398,7 @@ fn selector_provenance_covers_relation_specs_exactly_once() {
         source_transcript_sha256: digest('b'),
         actions,
         decisions: vec![],
+        satisfied_specs: vec![],
     };
     let relation = "dnfast-upgrade = 1.0-1";
     let resolved = output(vec![action(
@@ -492,6 +495,48 @@ fn selector_provenance_covers_relation_specs_exactly_once() {
             .is_err()
     );
 
+    let already = PackageSpec::parse("already-installed").unwrap();
+    let mixed_output = NativeSolveOutput {
+        source_transcript_sha256: digest('b'),
+        actions: vec![action(
+            "dnfast-upgrade-0:1.0-1.noarch",
+            Some(relation),
+            true,
+        )],
+        decisions: vec![],
+        satisfied_specs: vec![already.clone()],
+    };
+    let mixed_resolved = mixed_output
+        .clone()
+        .into_resolved(
+            &[relation, already.as_str()],
+            &[candidate.clone(), h2.clone()],
+            &[],
+            &inventory,
+        )
+        .unwrap();
+    let mixed_intent =
+        TransactionIntent::from_package_names(Action::Install, &[relation, already.as_str()])
+            .unwrap();
+    let mixed_builder = PlanBuilder {
+        intent: &mixed_intent,
+        snapshots: &snapshots,
+        inventory: &inventory,
+        policy: &policy,
+        candidates: &[candidate.clone(), h2.clone()],
+        expires_at_unix: 100,
+    };
+    assert!(
+        mixed_builder
+            .build_with_satisfied(&mixed_resolved, mixed_output.satisfied_specs())
+            .is_ok()
+    );
+    assert!(
+        mixed_builder
+            .build_with_satisfied(&mixed_resolved, &[])
+            .is_err()
+    );
+
     let bare = "dnfast-upgrade";
     let bare_intent = TransactionIntent::from_package_names(Action::Install, &[bare]).unwrap();
     let bare_builder = PlanBuilder {
@@ -520,6 +565,80 @@ fn selector_provenance_covers_relation_specs_exactly_once() {
     .into_resolved(&[bare], &[candidate.clone(), h2], &[], &inventory)
     .unwrap();
     assert!(bare_builder.build(&bare_h2).is_ok());
+}
+
+#[test]
+fn native_self_provided_requirement_does_not_create_a_self_ordering_edge() {
+    let inventory = InstalledInventory::new("sqlite", "6.0.1", vec![]).unwrap();
+    let repomd = std::fs::read(fixture("repodata/repomd.xml")).unwrap();
+    let records = parse_repomd_records(&repomd).unwrap();
+    let compressed = std::fs::read(fixture(&records.primary.href)).unwrap();
+    let opened = decode_record(&compressed, &records.primary).unwrap();
+    let mut package = parse_primary_records(opened.as_slice())
+        .unwrap()
+        .into_iter()
+        .find(|item| item.name == "dnfast-app")
+        .unwrap();
+    let relation = package.provides[0].clone();
+    package.requires = vec![relation.clone()];
+    let nevra = format!(
+        "{}-{}:{}-{}.{}",
+        package.name, package.epoch, package.version, package.release, package.arch
+    );
+    let candidate = CandidatePackage {
+        name: package.name.clone(),
+        evra: Evra::new(
+            package.epoch.parse().unwrap(),
+            package.version.clone(),
+            package.release.clone(),
+            Architecture::Noarch,
+        ),
+        vendor: package.vendor.clone(),
+        repo_id: "main".into(),
+        priority: 99,
+        cost: 1000,
+        package_size: package.package_size,
+        installed_size: package.installed_size,
+        checksum_sha256: package.checksum.clone(),
+        location: package.location.clone(),
+        excluded: false,
+        modular: false,
+    };
+    let output = NativeSolveOutput {
+        source_transcript_sha256: digest('d'),
+        actions: vec![NativeAction {
+            kind: "install".into(),
+            repository: "main".into(),
+            nevra: nevra.clone(),
+            old_nevra: None,
+            installed_instance: None,
+            installed_header_sha256: None,
+            requested_spec: Some(PackageSpec::parse(package.name.clone()).unwrap()),
+            requested_relation: false,
+            provenance: None,
+            transaction_counterpart_nevra: None,
+        }],
+        decisions: vec![dnfast_solver::NativeDecision {
+            requiring_nevra: nevra.clone(),
+            requiring_repo: "main".into(),
+            requirement: relation,
+            kind: DependencyKind::Strong,
+            provider_nevra: nevra,
+            provider_repo: "main".into(),
+            provider_installed: false,
+        }],
+        satisfied_specs: vec![],
+    };
+    let metadata = [("main", &package)];
+    let resolved = output
+        .into_resolved(
+            &[package.name.as_str()],
+            &[candidate],
+            &metadata,
+            &inventory,
+        )
+        .unwrap();
+    assert!(resolved[0].dependency_edges.is_empty());
 }
 
 #[test]
@@ -606,6 +725,7 @@ fn frozen_todo9_inventory_reader_output_feeds_remove_and_upgrade_plans() {
             obsoletes: vec![None],
             requested_specs: vec![Some("dnfast-upgrade".into())],
             requested_relation_kinds: vec![false],
+            satisfied_specs: vec![],
             problems: vec![],
             decisions: vec![],
         },
@@ -644,6 +764,7 @@ fn frozen_todo9_inventory_reader_output_feeds_remove_and_upgrade_plans() {
             ],
             requested_specs: vec![Some("dnfast-upgrade".into()), None],
             requested_relation_kinds: vec![false, false],
+            satisfied_specs: vec![],
             problems: vec![],
             decisions: vec![],
         },
@@ -686,6 +807,7 @@ fn frozen_todo9_inventory_reader_output_feeds_remove_and_upgrade_plans() {
             ],
             requested_specs: vec![None, None],
             requested_relation_kinds: vec![false, false],
+            satisfied_specs: vec![],
             problems: vec![],
             decisions: vec![],
         },
@@ -737,6 +859,7 @@ fn frozen_todo9_inventory_reader_output_feeds_remove_and_upgrade_plans() {
             obsoletes: vec![None],
             requested_specs: vec![Some("dnfast-upgrade".into())],
             requested_relation_kinds: vec![false],
+            satisfied_specs: vec![],
             problems: vec![],
             decisions: vec![],
         },
@@ -772,6 +895,7 @@ fn frozen_todo9_inventory_reader_output_feeds_remove_and_upgrade_plans() {
         ],
         requested_specs: vec![Some("replacement".into()), None],
         requested_relation_kinds: vec![false, false],
+        satisfied_specs: vec![],
         problems: vec![],
         decisions: vec![],
     };
@@ -791,6 +915,7 @@ fn frozen_todo9_inventory_reader_output_feeds_remove_and_upgrade_plans() {
             obsoletes: vec![None],
             requested_specs: vec![None],
             requested_relation_kinds: vec![false],
+            satisfied_specs: vec![],
             problems: vec![],
             decisions: vec![],
         },
@@ -840,6 +965,7 @@ fn native_multi_obsoletion_is_visible_typed_and_atomic() {
         ],
         requested_specs: vec![Some("replacement".into()), None, None],
         requested_relation_kinds: vec![false, false, false],
+        satisfied_specs: vec![],
         problems: vec![],
         decisions: vec![],
     };

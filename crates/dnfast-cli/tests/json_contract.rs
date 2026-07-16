@@ -17,8 +17,21 @@ const UNSUPPORTED: &[&str] = &[
     "reinstall",
     "distro-sync",
     "advisory",
-    "history",
 ];
+
+#[test]
+fn history_as_a_non_root_user_fails_before_journal_access() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dnfast"));
+    command.args(["history", "list"]);
+    if rustix::process::geteuid().as_raw() == 0 {
+        command.uid(65_534).gid(65_534);
+    }
+    let output = command.output().expect("dnfast binary must run");
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(body["command"], "history");
+    assert_eq!(body["errors"][0]["message"], "history requires root");
+}
 
 fn dnfast(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dnfast"))
