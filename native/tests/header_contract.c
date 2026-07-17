@@ -17,7 +17,7 @@
 #error "RPM headers must expose verification flag macros"
 #endif
 
-_Static_assert(DNFAST_NATIVE_ABI_VERSION == 3, "unexpected dnfast ABI");
+_Static_assert(DNFAST_NATIVE_ABI_VERSION == 4, "unexpected dnfast ABI");
 _Static_assert(offsetof(dnfast_solvable_reference, repository_id) == 0,
                "mapped reference repository field moved");
 _Static_assert(offsetof(dnfast_solvable_reference, package_ordinal) >
@@ -49,5 +49,11 @@ _Static_assert(
                                uint8_t, dnfast_error *): 1,
              default: 0),
     "mapped solve signature changed");
+_Static_assert(
+    _Generic(&dnfast_solver_set_module_excludes,
+             dnfast_status (*)(dnfast_context *, const char *const *, size_t,
+                               dnfast_error *): 1,
+             default: 0),
+    "module exclude signature changed");
 
 int main(void) { return 0; }

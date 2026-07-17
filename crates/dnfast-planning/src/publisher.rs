@@ -14,13 +14,14 @@ use dnfast_repo::{
     load_system_mutation_profile,
 };
 use hex::encode;
+use rustix::fs::{FlockOperation, flock};
 use rustix::process::geteuid;
 #[cfg(test)]
 use rustix::process::getuid;
 
 use crate::{
-    PlanningConfiguration, PlanningError, PlanningKey, PlanningOrigin, PlanningPayload,
-    PlanningPolicy, PlanningRepository, PlanningSnapshot,
+    ModuleState, PlanningConfiguration, PlanningError, PlanningKey, PlanningOrigin,
+    PlanningPayload, PlanningPolicy, PlanningRepository, PlanningSnapshot,
     fs::{TrustedDirectory, validate_root_executable, validate_tree},
     snapshot_store::{current_digest, garbage_collect, open_snapshot, publish_snapshot},
 };
@@ -40,6 +41,31 @@ pub struct RootPlanningPublisher {
     roots: PlanningRoots,
     owner: u32,
     require_root: bool,
+}
+
+struct SnapshotHostState {
+    inventory: InstalledInventory,
+    module_state: ModuleState,
+}
+
+struct PublicationLock<'a> {
+    directory: &'a TrustedDirectory,
+}
+
+impl<'a> PublicationLock<'a> {
+    fn acquire(directory: &'a TrustedDirectory) -> Result<Self, PlanningError> {
+        directory.recheck()?;
+        flock(directory.fd(), FlockOperation::LockExclusive)
+            .map_err(|error| PlanningError::Io(error.to_string()))?;
+        directory.recheck()?;
+        Ok(Self { directory })
+    }
+}
+
+impl Drop for PublicationLock<'_> {
+    fn drop(&mut self) {
+        let _ = flock(self.directory.fd(), FlockOperation::Unlock);
+    }
 }
 
 impl PlanningRoots {
@@ -86,6 +112,8 @@ impl RootPlanningPublisher {
         refreshed_repository_ids: Option<&[String]>,
     ) -> Result<String, PlanningError> {
         self.require_publisher()?;
+        let planning = self.publication_directory()?;
+        let _lock = PublicationLock::acquire(&planning)?;
         let profile = load_system_mutation_profile()
             .map_err(|error| PlanningError::Input(error.to_string()))?;
         let host_architecture = host_rpm_architecture()?;
@@ -100,6 +128,7 @@ impl RootPlanningPublisher {
             published_at_unix,
             host_architecture,
             refreshed_repository_ids,
+            &planning,
         )
     }
 
@@ -136,15 +165,20 @@ impl RootPlanningPublisher {
         inventory: InstalledInventory,
     ) -> Result<(String, String), PlanningError> {
         self.require_publisher()?;
+        let planning = self.existing_publication_directory()?;
+        let _lock = PublicationLock::acquire(&planning)?;
         let current = open_snapshot(&self.roots, self.owner)?;
         let source = current.digest()?;
         let mut payload = current.payload().clone();
         payload.inventory = inventory;
-        let published = self.store_snapshot(PlanningSnapshot::new_with_refreshed_repositories(
-            current.published_at_unix(),
-            current.refreshed_repository_ids().to_vec(),
-            payload,
-        )?)?;
+        let published = self.store_snapshot(
+            &planning,
+            PlanningSnapshot::new_with_refreshed_repositories(
+                current.published_at_unix(),
+                current.refreshed_repository_ids().to_vec(),
+                payload,
+            )?,
+        )?;
         Ok((source, published))
     }
 
@@ -162,42 +196,91 @@ impl RootPlanningPublisher {
         published_at_unix: u64,
         host_architecture: Architecture,
         refreshed_repository_ids: Option<&[String]>,
+        planning: &TrustedDirectory,
     ) -> Result<String, PlanningError> {
         trace_memory("planning:begin");
         self.require_publisher()?;
-        if self.require_root {
-            let public_parent =
-                TrustedDirectory::open(Path::new("/var/lib/dnfast"), self.owner, true, 0o755)?;
-            public_parent.set_mode(0o755)?;
-        }
-        let planning = TrustedDirectory::open(&self.roots.planning_root, self.owner, true, 0o755)?;
-        planning.set_mode(0o755)?;
         let snapshots = planning.child(SNAPSHOTS_DIRECTORY, true, 0o755)?;
+        let module_state = if planning.read_if_present("current", 65)?.is_some() {
+            open_snapshot(&self.roots, self.owner)?
+                .payload()
+                .module_state
+                .clone()
+        } else {
+            ModuleState::default()
+        };
         let cache_root = TrustedDirectory::open(&self.roots.cache_root, self.owner, true, 0o700)?;
         cache_root.recheck()?;
         validate_tree(&self.roots.cache_root, self.owner)?;
-        let snapshot = snapshot_from(
+        let mut snapshot = snapshot_from(
             profile,
-            inventory,
+            SnapshotHostState {
+                inventory,
+                module_state,
+            },
             published_at_unix,
             host_architecture,
             &Cache::new(&self.roots.cache_root),
             refreshed_repository_ids,
-            Some(&planning),
+            Some(planning),
         )?;
+        snapshot.attach_storage(&self.roots.planning_root, self.owner);
+        snapshot
+            .module_catalog(&[])?
+            .validate_state(&snapshot.payload().module_state)?;
         trace_memory("planning:snapshot-built");
         validate_tree(&self.roots.cache_root, self.owner)?;
         let bytes = snapshot.canonical_bytes()?;
         trace_memory("planning:canonicalized");
         let digest = digest(&bytes);
-        publish_snapshot(&planning, &snapshots, &digest, &bytes)?;
+        publish_snapshot(planning, &snapshots, &digest, &bytes)?;
         garbage_collect(&snapshots, &digest)?;
         trace_memory("planning:published");
         Ok(digest)
     }
 
-    fn store_snapshot(&self, snapshot: PlanningSnapshot) -> Result<String, PlanningError> {
+    fn store_snapshot(
+        &self,
+        planning: &TrustedDirectory,
+        snapshot: PlanningSnapshot,
+    ) -> Result<String, PlanningError> {
         self.require_publisher()?;
+        let snapshots = planning.child(SNAPSHOTS_DIRECTORY, true, 0o755)?;
+        let bytes = snapshot.canonical_bytes()?;
+        let digest = digest(&bytes);
+        publish_snapshot(planning, &snapshots, &digest, &bytes)?;
+        garbage_collect(&snapshots, &digest)?;
+        Ok(digest)
+    }
+
+    pub fn publish_module_state_onto_current(
+        &self,
+        expected_snapshot: &str,
+        module_state: ModuleState,
+    ) -> Result<String, PlanningError> {
+        self.require_publisher()?;
+        let planning = self.existing_publication_directory()?;
+        let _lock = PublicationLock::acquire(&planning)?;
+        let current = open_snapshot(&self.roots, self.owner)?;
+        if current.digest()? != expected_snapshot {
+            return Err(PlanningError::Input(
+                "planning snapshot changed during module mutation".into(),
+            ));
+        }
+        current.module_catalog(&[])?.validate_state(&module_state)?;
+        let mut payload = current.payload().clone();
+        payload.module_state = module_state;
+        self.store_snapshot(
+            &planning,
+            PlanningSnapshot::new_with_refreshed_repositories(
+                current.published_at_unix(),
+                current.refreshed_repository_ids().to_vec(),
+                payload,
+            )?,
+        )
+    }
+
+    fn publication_directory(&self) -> Result<TrustedDirectory, PlanningError> {
         if self.require_root {
             let public_parent =
                 TrustedDirectory::open(Path::new("/var/lib/dnfast"), self.owner, true, 0o755)?;
@@ -205,12 +288,11 @@ impl RootPlanningPublisher {
         }
         let planning = TrustedDirectory::open(&self.roots.planning_root, self.owner, true, 0o755)?;
         planning.set_mode(0o755)?;
-        let snapshots = planning.child(SNAPSHOTS_DIRECTORY, true, 0o755)?;
-        let bytes = snapshot.canonical_bytes()?;
-        let digest = digest(&bytes);
-        publish_snapshot(&planning, &snapshots, &digest, &bytes)?;
-        garbage_collect(&snapshots, &digest)?;
-        Ok(digest)
+        Ok(planning)
+    }
+
+    fn existing_publication_directory(&self) -> Result<TrustedDirectory, PlanningError> {
+        TrustedDirectory::open(&self.roots.planning_root, self.owner, false, 0o755)
     }
 
     pub fn open_snapshot(&self) -> Result<PlanningSnapshot, PlanningError> {
@@ -309,7 +391,10 @@ impl RootPlanningPublisher {
         validate_tree(&self.roots.cache_root, self.owner)?;
         let refreshed = snapshot_from(
             &profile,
-            snapshot.payload().inventory.clone(),
+            SnapshotHostState {
+                inventory: snapshot.payload().inventory.clone(),
+                module_state: snapshot.payload().module_state.clone(),
+            },
             snapshot.published_at_unix(),
             host_architecture,
             &Cache::new(&self.roots.cache_root),
@@ -496,13 +581,17 @@ pub fn host_rpm_architecture() -> Result<Architecture, PlanningError> {
 
 fn snapshot_from(
     profile: &MutationProfile,
-    inventory: InstalledInventory,
+    host_state: SnapshotHostState,
     published_at_unix: u64,
     host_architecture: Architecture,
     cache: &Cache,
     refreshed_repository_ids: Option<&[String]>,
     blob_store: Option<&TrustedDirectory>,
 ) -> Result<PlanningSnapshot, PlanningError> {
+    let SnapshotHostState {
+        inventory,
+        module_state,
+    } = host_state;
     let configuration = normalized_configuration(profile)?;
     let mut enabled = profile
         .repositories
@@ -546,6 +635,7 @@ fn snapshot_from(
         inventory,
         allowed_repositories: repositories,
         configuration,
+        module_state,
     };
     match refreshed_repository_ids {
         Some(ids) => PlanningSnapshot::new_with_refreshed_repositories(

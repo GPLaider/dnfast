@@ -146,6 +146,114 @@ dnfast_status dnfast_solver_prepare(dnfast_context *context,
 #endif
 }
 
+dnfast_status dnfast_solver_set_module_excludes(
+    dnfast_context *context, const char *const *nevras, size_t nevra_count,
+    dnfast_error *error) {
+    dnfast_status status = owner_check(context, error);
+    if (status != DNFAST_STATUS_OK) return status;
+    if ((nevra_count != 0 && nevras == NULL) || nevra_count > UINT32_MAX)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "solver", "module_excludes",
+                                "invalid module exclude set");
+#ifdef DNFAST_NATIVE_REAL
+    int *resolved = NULL;
+    size_t resolved_count = 0;
+    for (size_t input = 0; input < nevra_count; ++input) {
+        if (nevras[input] == NULL || nevras[input][0] == '\0') {
+            free(resolved);
+            return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                    "solver", "module_excludes",
+                                    "empty module artifact identity");
+        }
+        for (size_t prior = 0; prior < input; ++prior) {
+            if (strcmp(nevras[input], nevras[prior]) == 0) {
+                free(resolved);
+                return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                        "solver", "module_excludes",
+                                        "duplicate module artifact identity");
+            }
+        }
+        size_t matches = 0;
+        for (Id id = 1; id < context->pool->nsolvables; ++id) {
+            Solvable *item = pool_id2solvable(context->pool, id);
+            if (item == NULL || item->repo == NULL ||
+                item->repo == context->pool->installed)
+                continue;
+            char *identity = dnfast_solvable_identity(context->pool, item);
+            int same = identity != NULL && strcmp(identity, nevras[input]) == 0;
+            if (!same && identity != NULL) {
+                char *zero_epoch = strstr(identity, "-0:");
+                if (zero_epoch != NULL) {
+                    size_t prefix = (size_t)(zero_epoch - identity) + 1;
+                    size_t expected = strlen(identity) - 2;
+                    same = strlen(nevras[input]) == expected &&
+                           memcmp(nevras[input], identity, prefix) == 0 &&
+                           strcmp(nevras[input] + prefix, identity + prefix + 2) == 0;
+                }
+            }
+            free(identity);
+            if (!same) continue;
+            if (resolved_count == SIZE_MAX / sizeof(int)) {
+                free(resolved);
+                return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
+                                        "solver", "module_excludes",
+                                        "module exclude set is too large");
+            }
+            int *grown = realloc(resolved, (resolved_count + 1) * sizeof(int));
+            if (grown == NULL) {
+                free(resolved);
+                return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                        "dnfast", "realloc",
+                                        "module exclude allocation failed");
+            }
+            resolved = grown;
+            resolved[resolved_count++] = id;
+            ++matches;
+        }
+        if (matches == 0) {
+            free(resolved);
+            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                    "solver", "module_excludes",
+                                    "module artifact is absent from selected repositories");
+        }
+    }
+    Map *considered = NULL;
+    if (resolved_count != 0) {
+        considered = calloc(1, sizeof(*considered));
+        if (considered == NULL) {
+            free(resolved);
+            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                    "dnfast", "calloc",
+                                    "module considered map allocation failed");
+        }
+        map_init(considered, context->pool->nsolvables);
+        map_setall(considered);
+        for (size_t index = 0; index < resolved_count; ++index)
+            map_clr(considered, resolved[index]);
+    }
+    free(resolved);
+    Map *previous = context->module_considered;
+    context->module_considered = considered;
+    context->pool->considered = considered;
+    /* whatprovides may have been built using the prior considered map.  A
+     * stream switch must rebuild it so disabled artifacts cannot influence
+     * selection, FORCEBEST, dependencies, or provider choice. */
+    if (context->pool->whatprovides != NULL)
+        pool_freewhatprovides(context->pool);
+    if (previous != NULL) {
+        map_free(previous);
+        free(previous);
+    }
+    return DNFAST_STATUS_OK;
+#else
+    (void)nevras;
+    (void)nevra_count;
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "solv", "module_excludes",
+                            "real native build disabled");
+#endif
+}
+
 #ifdef DNFAST_NATIVE_REAL
 static dnfast_status copy_problems(dnfast_context *context, dnfast_error *error) {
     Id count = solver_problem_count(context->solver);
@@ -513,7 +621,11 @@ static dnfast_status solve_operation(dnfast_context *context,
             selector_flags |= SELECTION_FILELIST;
         int selection_flags = selector_flags;
         queue_init(&selectors[name_index]);
-        if (name_index != 0) selection_flags |= SELECTION_ADD;
+        /* Internal policy jobs (currently modular stream blacklists) precede
+         * user selectors.  Preserve them when the first selector is appended;
+         * without SELECTION_ADD libsolv replaces the queue and also breaks the
+         * start/count provenance invariant below. */
+        if (job.count != 0) selection_flags |= SELECTION_ADD;
         if (request->names[name_index] == NULL || request->names[name_index][0] == '\0' ||
             selection_make(context->pool, &selectors[name_index],
                            request->names[name_index],

@@ -9,11 +9,13 @@ use dnfast_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::ModuleState;
 use crate::PlanningError;
 
 const LEGACY_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const EXTERNAL_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
-const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
+const EXTENDED_SNAPSHOT_SCHEMA_VERSION: u32 = 5;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 6;
 const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -36,6 +38,8 @@ pub struct PlanningPayload {
     pub inventory: InstalledInventory,
     pub allowed_repositories: Vec<PlanningRepository>,
     pub configuration: Vec<PlanningConfiguration>,
+    #[serde(default, skip_serializing_if = "ModuleState::is_empty")]
+    pub module_state: ModuleState,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -242,6 +246,7 @@ impl PlanningSnapshot {
             self.schema_version,
             LEGACY_SNAPSHOT_SCHEMA_VERSION
                 | EXTERNAL_SNAPSHOT_SCHEMA_VERSION
+                | EXTENDED_SNAPSHOT_SCHEMA_VERSION
                 | SNAPSHOT_SCHEMA_VERSION
         ) {
             return Err(PlanningError::Input("unsupported snapshot schema".into()));
@@ -279,6 +284,12 @@ impl PlanningSnapshot {
             .ensure_supported()
             .map_err(domain)?;
         self.payload.inventory.canonical_sha256().map_err(domain)?;
+        self.payload.module_state.validate()?;
+        if self.schema_version < SNAPSHOT_SCHEMA_VERSION && !self.payload.module_state.is_empty() {
+            return Err(PlanningError::Input(
+                "legacy snapshot contains module state".into(),
+            ));
+        }
         for repository in &self.payload.allowed_repositories {
             validate_repository(repository, self.schema_version)?;
             let configuration = self
@@ -333,7 +344,7 @@ impl PlanningSnapshot {
         Ok(())
     }
 
-    fn selected_repositories<'a>(
+    pub(crate) fn selected_repositories<'a>(
         &'a self,
         selected_repository_ids: &[String],
     ) -> Result<Vec<&'a PlanningRepository>, PlanningError> {
@@ -443,7 +454,7 @@ fn validate_repository(
             "repository payload is not canonical".into(),
         ));
     }
-    if schema_version < SNAPSHOT_SCHEMA_VERSION
+    if schema_version < EXTENDED_SNAPSHOT_SCHEMA_VERSION
         && (repository.file_provides.is_some()
             || repository.group.is_some()
             || repository.modules.is_some())
@@ -527,7 +538,7 @@ fn metadata_digest(
     schema_version: u32,
 ) -> Result<String, PlanningError> {
     let mut digest = Sha256::new();
-    digest.update(if schema_version >= SNAPSHOT_SCHEMA_VERSION {
+    digest.update(if schema_version >= EXTENDED_SNAPSHOT_SCHEMA_VERSION {
         b"dnfast-root-metadata-v4".as_slice()
     } else {
         b"dnfast-root-metadata-v3".as_slice()
@@ -556,7 +567,7 @@ fn metadata_digest(
             frame(&mut digest, &bytes.sha256, bytes.sha256.as_bytes())?;
             digest.update(bytes.size.to_be_bytes());
         }
-        if schema_version >= SNAPSHOT_SCHEMA_VERSION {
+        if schema_version >= EXTENDED_SNAPSHOT_SCHEMA_VERSION {
             for (role, bytes) in [
                 ("file-provides", repository.file_provides.as_ref()),
                 ("group", repository.group.as_ref()),

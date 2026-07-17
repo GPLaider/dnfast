@@ -83,6 +83,11 @@ void dnfast_context_free(dnfast_context *context) {
     dnfast_inventory_write_end(context);
     dnfast_inventory_clear(context);
 #ifdef DNFAST_NATIVE_REAL
+    if (context->module_considered != NULL) {
+        context->pool->considered = NULL;
+        map_free(context->module_considered);
+        free(context->module_considered);
+    }
     pool_free(context->pool);
 #endif
     dnfast_unload_libraries(context->libraries);

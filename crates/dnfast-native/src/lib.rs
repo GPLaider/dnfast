@@ -20,6 +20,10 @@ pub fn release_unused_memory() {
     dnfast_native_sys::release_unused_memory();
 }
 
+pub fn parse_modulemd_json(yaml: &[u8]) -> Result<String, NativeError> {
+    dnfast_native_sys::parse_modulemd_json(yaml).map_err(NativeError::from)
+}
+
 #[cfg(feature = "test-fixtures")]
 pub fn fixture_reset_inventory_counts() {
     dnfast_native_sys::fixture_reset_inventory_counts();
@@ -180,6 +184,12 @@ impl NativeContext {
                 priority: repository.priority,
                 cost: repository.cost,
             })
+            .map_err(NativeError::from)
+    }
+
+    pub fn set_module_excludes(&mut self, nevras: &[String]) -> Result<(), NativeError> {
+        self.inner
+            .set_module_excludes(nevras)
             .map_err(NativeError::from)
     }
 

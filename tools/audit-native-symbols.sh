@@ -8,9 +8,9 @@ TOOLROOT=${FEDORA44_TOOLROOT:-$ROOT/.cache/fedora44-vm/toolroot}
 export PKG_CONFIG_PATH="$TOOLROOT/usr/lib64/pkgconfig:$TOOLROOT/usr/share/pkgconfig"
 export PKG_CONFIG_SYSROOT_DIR="$TOOLROOT"
 
-for source in common solver decisions actions installed inventory inventory_write transaction transaction_run transaction_result transaction_payload_fault keyring keyring_identity rpm_signature rpm_payload limits metadata_io rpm callbacks; do
+for source in common solver decisions actions installed inventory inventory_write transaction transaction_run transaction_result transaction_payload_fault keyring keyring_identity rpm_signature rpm_payload limits metadata_io modulemd rpm callbacks; do
   cc -std=c17 -Wno-unused-parameter -DDNFAST_NATIVE_REAL -I"$ROOT/native/include" \
-    -I"$ROOT/native/src" $(pkg-config --cflags libsolv rpm) \
+    -I"$ROOT/native/src" $(pkg-config --cflags libsolv rpm modulemd-2.0) \
     -c "$ROOT/native/src/$source.c" -o "$TMP/$source.o"
 done
 nm -u "$TMP"/*.o | awk '{print $NF}' | sort -u >"$TMP/undefined"

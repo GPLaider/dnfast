@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -24,6 +25,15 @@ pub(super) fn solve(
         .integrity_for_repositories(repository_ids)
         .map_err(snapshot_failure)?;
     let repositories = selected_repositories(&snapshot, &integrity)?;
+    let module_catalog = snapshot
+        .module_catalog(repository_ids)
+        .map_err(snapshot_failure)?;
+    let module_policies = module_catalog
+        .artifact_policies(
+            &snapshot.payload().module_state,
+            snapshot.payload().policy.solver.base_arch(),
+        )
+        .map_err(snapshot_failure)?;
     let workspace = tempfile::tempdir().map_err(io_failure)?;
     let mut context = NativeContext::open(snapshot.payload().policy.solver.base_arch(), || false)
         .map_err(native_failure)?;
@@ -65,6 +75,7 @@ pub(super) fn solve(
             repository,
             &solver_inputs,
             snapshot.payload().policy.solver.base_arch(),
+            &module_policies,
         )?);
         metadata.extend(
             solver_inputs
@@ -73,6 +84,13 @@ pub(super) fn solve(
                 .map(|package| (repository.id.clone(), package)),
         );
     }
+    let module_excludes = module_policies
+        .iter()
+        .filter_map(|(artifact, excluded)| excluded.then_some(artifact.clone()))
+        .collect::<Vec<_>>();
+    context
+        .set_module_excludes(&module_excludes)
+        .map_err(native_failure)?;
     let names = intent
         .packages()
         .iter()
@@ -192,6 +210,7 @@ fn candidates_for(
     repository: &PlanningRepository,
     solver_inputs: &[dnfast_metadata::CompletePackage],
     base_architecture: Architecture,
+    module_policies: &BTreeMap<String, bool>,
 ) -> Result<Vec<CandidatePackage>, AppFailure> {
     let mut candidates = Vec::new();
     for item in solver_inputs {
@@ -202,14 +221,24 @@ fn candidates_for(
             .epoch
             .parse()
             .map_err(|_| AppFailure::new(1, "root-published metadata has an invalid epoch"))?;
+        let evra = Evra::new(
+            epoch,
+            item.version.clone(),
+            item.release.clone(),
+            architecture,
+        );
+        let identity = format!(
+            "{}-{}:{}-{}.{}",
+            item.name,
+            evra.epoch(),
+            evra.version(),
+            evra.release(),
+            evra.arch().as_rpm_arch(),
+        );
+        let module_excluded = module_policies.get(&identity).copied();
         candidates.push(CandidatePackage {
             name: item.name.clone(),
-            evra: Evra::new(
-                epoch,
-                item.version.clone(),
-                item.release.clone(),
-                architecture,
-            ),
+            evra,
             vendor: if item.vendor.is_empty() {
                 "unknown".into()
             } else {
@@ -222,8 +251,8 @@ fn candidates_for(
             installed_size: item.installed_size,
             checksum_sha256: item.checksum.clone(),
             location: item.location.clone(),
-            excluded: false,
-            modular: false,
+            excluded: module_excluded.unwrap_or(false),
+            modular: module_excluded.is_some(),
         });
     }
     Ok(candidates)

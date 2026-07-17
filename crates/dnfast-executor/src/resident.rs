@@ -34,8 +34,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ExecutorError, MountRoot, StagedArtifact, StagedInputs, Staging, execute::run_token_bound,
-    recover_pending_transactions, staged_inputs::StagedRepository, staging::system_directory,
+    ExecutorError, MountRoot, StagedArtifact, StagedInputs, Staging,
+    execute::run_token_bound,
+    recover_pending_transactions,
+    staged_inputs::{StagedRepository, apply_module_artifact_policy},
+    staging::system_directory,
 };
 
 pub const SYSTEM_SOCKET: &str = "/run/dnfast/dnfastd.sock";
@@ -705,6 +708,7 @@ struct ResidentPool {
     integrity: dnfast_core::PlanIntegrity,
     policy: SolverPolicy,
     repositories: Vec<PlanningRepository>,
+    module_artifact_policy: BTreeMap<String, bool>,
     context: NativeContext,
     inventory: InstalledInventory,
     rpmdb_cookie: String,
@@ -1080,6 +1084,10 @@ fn build_pool(
         ));
     }
     let selected = selected_repositories(&snapshot, &integrity)?;
+    let module_catalog = snapshot.module_catalog(&repository_ids).map_err(planning)?;
+    let module_artifact_policy = module_catalog
+        .artifact_policies(&snapshot.payload().module_state, policy.base_arch())
+        .map_err(planning)?;
     trace_phase(trace, started, "resident-build-repositories-selected");
     let workspace = tempfile::tempdir().map_err(|error| DaemonError::Io(error.to_string()))?;
     let solv_cache = SolvCache::new(SYSTEM_CACHE_PATH);
@@ -1145,6 +1153,13 @@ fn build_pool(
             &format!("resident-build-{index}-native-loaded"),
         );
     }
+    let module_excludes = module_artifact_policy
+        .iter()
+        .filter_map(|(artifact, excluded)| excluded.then_some(artifact.clone()))
+        .collect::<Vec<_>>();
+    context
+        .set_module_excludes(&module_excludes)
+        .map_err(planning)?;
     context.prepare_solver().map_err(planning)?;
     trace_phase(trace, started, "resident-build-solver-prepared");
     let verified_cookie = rpmdb_cookie.clone();
@@ -1156,6 +1171,7 @@ fn build_pool(
             integrity,
             policy,
             repositories,
+            module_artifact_policy,
             context,
             inventory,
             rpmdb_cookie,
@@ -1598,6 +1614,7 @@ fn selected_candidate_evidence(
             }
         }
     }
+    apply_module_artifact_policy(&mut candidates, &cached.module_artifact_policy);
     Ok(candidates)
 }
 

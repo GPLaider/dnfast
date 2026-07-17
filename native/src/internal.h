@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #ifdef DNFAST_NATIVE_REAL
+#include <solv/bitmap.h>
 #include <solv/pooltypes.h>
 #include <rpm/rpmts.h>
 #include <rpm/header.h>
@@ -44,6 +45,7 @@ struct dnfast_context {
     struct s_Pool *pool;
     struct s_Solver *solver;
     struct s_Transaction *transaction;
+    Map *module_considered;
     rpmts inventory_write_ts;
     rpmtxn inventory_write_txn;
 #endif

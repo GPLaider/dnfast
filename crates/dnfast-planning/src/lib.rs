@@ -6,6 +6,7 @@ mod error;
 mod file_provides;
 mod fs;
 mod model;
+mod modulemd;
 mod native_xml;
 mod publisher;
 mod snapshot_store;
@@ -14,6 +15,10 @@ pub use error::PlanningError;
 pub use model::{
     PlanningBytes, PlanningConfiguration, PlanningKey, PlanningOrigin, PlanningPayload,
     PlanningPolicy, PlanningRepository, PlanningSnapshot,
+};
+pub use modulemd::{
+    Module, ModuleCatalog, ModuleMutation, ModuleProfile, ModuleState, ModuleStateEntry,
+    ModuleStream,
 };
 pub use native_xml::{NativeRepositoryPrimary, NativeRepositoryXml};
 pub use publisher::{
@@ -168,6 +173,7 @@ mod tests {
                 allowed_fingerprints: vec!["A".repeat(40)],
                 repo_gpgcheck: false,
             }],
+            module_state: Default::default(),
         };
         let snapshot = PlanningSnapshot::new(7, payload).expect("snapshot");
         let mut schema4_value: serde_json::Value =

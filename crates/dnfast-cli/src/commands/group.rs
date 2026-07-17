@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dnfast_metadata::{CompsEnvironment, CompsGroup, CompsPackage, CompsPackageType};
-use dnfast_planning::{PlanningRepository, PlanningSnapshot};
+use dnfast_planning::{
+    ModuleMutation, ModuleState, PlanningRepository, PlanningSnapshot, RootPlanningPublisher,
+};
 
 use crate::{
     args::{GroupInstallArgs, ModuleMutationArgs, MutationArgs, PlanAction},
@@ -193,25 +195,102 @@ pub(super) fn install(arguments: GroupInstallArgs) -> Result<Response, AppFailur
 
 pub(super) fn module_list(repositories: Vec<String>) -> Result<Response, AppFailure> {
     let snapshot = PlanningSnapshot::open_system().map_err(snapshot_error)?;
-    let repositories = selected(&snapshot, canonical_repository_ids(repositories)?)?;
-    for repository in repositories {
-        if snapshot
-            .module_metadata(repository)
-            .map_err(snapshot_error)?
-            .is_some()
-        {
-            return Err(AppFailure::new(
-                1,
-                "module metadata is present but this build cannot safely interpret modulemd",
+    let repository_ids = canonical_repository_ids(repositories)?;
+    let catalog = snapshot
+        .module_catalog(&repository_ids)
+        .map_err(snapshot_error)?;
+    let mut modules = Vec::new();
+    for module in catalog.modules() {
+        let active = catalog.active_stream(&snapshot.payload().module_state, &module.name);
+        let explicit = snapshot
+            .payload()
+            .module_state
+            .entries
+            .iter()
+            .find(|entry| entry.name == module.name);
+        for stream in module.streams.values() {
+            let status = if explicit.is_some_and(|entry| entry.disabled) {
+                "disabled"
+            } else if active == Some(stream.name.as_str()) && explicit.is_some() {
+                "enabled"
+            } else if active == Some(stream.name.as_str()) {
+                "default"
+            } else {
+                "inactive"
+            };
+            modules.push(format!(
+                "{}:{}:{}:{}",
+                escaped_field(&module.name),
+                escaped_field(&stream.name),
+                status,
+                escaped_field(&stream.summary)
             ));
         }
     }
-    Ok(Response::completed("module", "modules=[]"))
+    Ok(Response::completed(
+        "module",
+        format!("modules=[{}]", modules.join(",")),
+    ))
 }
 
 pub(super) fn module_info(repositories: Vec<String>, spec: &str) -> Result<Response, AppFailure> {
     validate_id(spec, "module spec")?;
-    module_absent(repositories, spec)
+    let snapshot = PlanningSnapshot::open_system().map_err(snapshot_error)?;
+    let repository_ids = canonical_repository_ids(repositories)?;
+    let catalog = snapshot
+        .module_catalog(&repository_ids)
+        .map_err(snapshot_error)?;
+    let (name, requested_stream) = module_spec(spec)?;
+    let module = catalog
+        .module(name)
+        .ok_or_else(|| not_found("module", name))?;
+    let active = catalog.active_stream(&snapshot.payload().module_state, name);
+    let streams = match requested_stream {
+        Some(stream) => vec![
+            module
+                .streams
+                .get(stream)
+                .ok_or_else(|| not_found("module stream", spec))?,
+        ],
+        None => module.streams.values().collect(),
+    };
+    let rendered = streams
+        .into_iter()
+        .map(|stream| {
+            let profiles = stream
+                .profiles
+                .iter()
+                .map(|profile| {
+                    format!(
+                        "{}=[{}]",
+                        escaped_field(&profile.name),
+                        profile
+                            .rpms
+                            .iter()
+                            .map(|rpm| escaped_field(rpm))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{}:{}:active={}:summary={}:description={}:profiles=[{}]:artifacts={}",
+                escaped_field(name),
+                escaped_field(&stream.name),
+                active == Some(stream.name.as_str()),
+                escaped_field(&stream.summary),
+                escaped_field(&stream.description),
+                profiles,
+                stream.artifacts.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Response::completed(
+        "module",
+        format!("streams=[{rendered}]"),
+    ))
 }
 
 pub(super) fn module_mutation(
@@ -228,25 +307,70 @@ pub(super) fn module_mutation(
     for spec in &arguments.specs {
         validate_id(spec, "module spec")?;
     }
-    let spec = arguments.specs.join(",");
-    module_absent(repositories, &spec)
-}
-
-fn module_absent(repositories: Vec<String>, spec: &str) -> Result<Response, AppFailure> {
+    let operation_kind = match operation {
+        "enable" => ModuleMutation::Enable,
+        "reset" => ModuleMutation::Reset,
+        "disable" => ModuleMutation::Disable,
+        _ => return Err(AppFailure::new(1, "unsupported module mutation")),
+    };
     let snapshot = PlanningSnapshot::open_system().map_err(snapshot_error)?;
-    for repository in selected(&snapshot, repositories)? {
-        if snapshot
-            .module_metadata(repository)
-            .map_err(snapshot_error)?
-            .is_some()
-        {
-            return Err(AppFailure::new(
-                1,
-                "module metadata is present but this build cannot safely interpret modulemd",
-            ));
+    let selected_catalog = snapshot
+        .module_catalog(&repositories)
+        .map_err(snapshot_error)?;
+    for spec in &arguments.specs {
+        let (name, _) = module_spec(spec)?;
+        if selected_catalog.module(name).is_none() {
+            return Err(not_found("module in selected repositories", name));
         }
     }
-    Err(not_found("module", spec))
+    if operation_kind == ModuleMutation::Enable {
+        // Validate the entire requested stream/dependency closure against the
+        // explicitly selected repositories before publishing global state.
+        // This prevents `--repo` from authorizing a stream that is only
+        // present in some other enabled repository.
+        selected_catalog
+            .mutate(&ModuleState::default(), operation_kind, &arguments.specs)
+            .map_err(snapshot_error)?;
+    }
+    let catalog = snapshot.module_catalog(&[]).map_err(snapshot_error)?;
+    let state = catalog
+        .mutate(
+            &snapshot.payload().module_state,
+            operation_kind,
+            &arguments.specs,
+        )
+        .map_err(snapshot_error)?;
+    let source = snapshot.digest().map_err(snapshot_error)?;
+    let published = RootPlanningPublisher::system()
+        .map_err(snapshot_error)?
+        .publish_module_state_onto_current(&source, state)
+        .map_err(snapshot_error)?;
+    Ok(Response::completed(
+        "module",
+        format!(
+            "operation={operation}; modules=[{}]; planning_snapshot={published}",
+            arguments
+                .specs
+                .iter()
+                .map(|spec| escaped_field(spec))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    ))
+}
+
+fn module_spec(spec: &str) -> Result<(&str, Option<&str>), AppFailure> {
+    let mut parts = spec.split(':');
+    let name = parts.next().unwrap_or_default();
+    let stream = parts.next();
+    if parts.next().is_some() || name.is_empty() || stream.is_some_and(str::is_empty) {
+        return Err(AppFailure::with_error_code(
+            2,
+            "invalid_arguments",
+            "module spec must be NAME or NAME:STREAM",
+        ));
+    }
+    Ok((name, stream))
 }
 
 fn catalog(repositories: Vec<String>) -> Result<(PlanningSnapshot, Catalog), AppFailure> {

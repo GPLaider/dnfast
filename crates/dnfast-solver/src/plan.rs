@@ -262,9 +262,10 @@ impl PlanBuilder<'_> {
         enforce_preferred: bool,
         exact_requested_relation: bool,
     ) -> Result<(), PlanError> {
-        if candidate.modular {
-            return Err(PlanError::Modular(candidate.name.clone()));
-        }
+        // A modular artifact is executable only after the checksum-bound
+        // module state classified it.  Inactive streams are represented by
+        // `excluded`; active modular candidates follow the same independent
+        // preference and artifact validation as non-modular RPMs.
         if candidate.excluded || self.policy.is_excluded(&candidate.name) {
             return Err(PlanError::Excluded(candidate.name.clone()));
         }
@@ -279,7 +280,7 @@ impl PlanBuilder<'_> {
         let preferred = self
             .candidates
             .iter()
-            .filter(|item| item.name == candidate.name && !item.excluded && !item.modular)
+            .filter(|item| item.name == candidate.name && !item.excluded)
             .filter(|item| {
                 installed.is_none_or(|current| item.evra.arch() == current.evra().arch())
             })

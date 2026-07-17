@@ -1,7 +1,10 @@
 use crate::{PlanningBytes, PlanningError, PlanningRepository, PlanningSnapshot};
 
 const MAX_COMPS_OPEN_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_MODULES_OPEN_BYTES: u64 = 512 * 1024 * 1024;
+// Keep this aligned with the native strict parser's DNFAST_MAX_MODULEMD_BYTES.
+// The auxiliary decoder verifies the compressed checksum before opening and
+// enforces this bound while decompressing.
+const MAX_MODULES_OPEN_BYTES: u64 = 128 * 1024 * 1024;
 
 impl PlanningSnapshot {
     pub fn comps(

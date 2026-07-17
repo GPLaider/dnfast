@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define DNFAST_NATIVE_ABI_VERSION UINT32_C(3)
+#define DNFAST_NATIVE_ABI_VERSION UINT32_C(4)
 
 typedef enum dnfast_pool_architecture {
     DNFAST_POOL_ARCHITECTURE_INVALID = 0,
@@ -44,6 +44,12 @@ typedef struct dnfast_error {
     char *symbol;
     char *message;
 } dnfast_error;
+
+dnfast_status dnfast_modulemd_parse_json(const uint8_t *yaml,
+                                         size_t yaml_size,
+                                         char **json,
+                                         dnfast_error *out_error);
+void dnfast_string_free(char *value);
 
 typedef struct dnfast_limits {
     uint32_t abi_version;
@@ -193,6 +199,9 @@ dnfast_status dnfast_solver_add_rpmdb(dnfast_context *context,
                                       dnfast_error *out_error);
 dnfast_status dnfast_solver_prepare(dnfast_context *context,
                                     dnfast_error *out_error);
+dnfast_status dnfast_solver_set_module_excludes(
+    dnfast_context *context, const char *const *nevras, size_t nevra_count,
+    dnfast_error *out_error);
 void dnfast_solver_release_result(dnfast_context *context);
 dnfast_status dnfast_inventory_read(dnfast_context *context,
                                     const char *root,

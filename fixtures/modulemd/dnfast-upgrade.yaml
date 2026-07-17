@@ -1,0 +1,53 @@
+---
+document: modulemd
+version: 2
+data:
+  name: dnfast-upgrade
+  stream: stable
+  version: 2026071701
+  context: dnfast44
+  arch: x86_64
+  summary: dnfast module fixture stable stream
+  description: Signed Fedora x86_64 gate fixture selecting dnfast-upgrade 1.0.
+  license:
+    module:
+      - MIT
+  profiles:
+    default:
+      description: Install the stable fixture package.
+      rpms:
+        - dnfast-upgrade
+  artifacts:
+    rpms:
+      - dnfast-upgrade-0:1.0-1.noarch
+---
+document: modulemd
+version: 2
+data:
+  name: dnfast-upgrade
+  stream: next
+  version: 2026071702
+  context: dnfast44
+  arch: x86_64
+  summary: dnfast module fixture next stream
+  description: Signed Fedora x86_64 gate fixture selecting dnfast-upgrade 2.0.
+  license:
+    module:
+      - MIT
+  profiles:
+    default:
+      description: Install the next fixture package.
+      rpms:
+        - dnfast-upgrade
+  artifacts:
+    rpms:
+      - dnfast-upgrade-0:2.0-1.noarch
+---
+document: modulemd-defaults
+version: 1
+data:
+  module: dnfast-upgrade
+  stream: stable
+  profiles:
+    stable:
+      - default

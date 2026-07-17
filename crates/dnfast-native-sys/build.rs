@@ -21,6 +21,7 @@ fn main() {
         "rpm_payload.c",
         "limits.c",
         "metadata_io.c",
+        "modulemd.c",
         "rpm.c",
         "callbacks.c",
         "authority.c",
@@ -44,7 +45,17 @@ fn main() {
             .exactly_version("6.0.1")
             .probe("rpm")
             .unwrap_or_else(|error| panic!("RPM 6.0.1 build contract failed: {error}"));
-        for include in solv.include_paths.iter().chain(rpm.include_paths.iter()) {
+        let modulemd = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .atleast_version("2.15.2")
+            .probe("modulemd-2.0")
+            .unwrap_or_else(|error| panic!("libmodulemd 2.15.2+ build contract failed: {error}"));
+        for include in solv
+            .include_paths
+            .iter()
+            .chain(rpm.include_paths.iter())
+            .chain(modulemd.include_paths.iter())
+        {
             build.include(include);
         }
         build.define("DNFAST_NATIVE_REAL", None);
@@ -54,6 +65,7 @@ fn main() {
             ["solvext".into(), "rpm".into(), "rpmio".into()],
         );
         append_unique(&mut real_link_libraries, rpm.libs);
+        append_unique(&mut real_link_libraries, modulemd.libs);
     }
     build
         .files([
@@ -76,6 +88,7 @@ fn main() {
             "../../native/src/rpm_payload.c",
             "../../native/src/limits.c",
             "../../native/src/metadata_io.c",
+            "../../native/src/modulemd.c",
             "../../native/src/rpm.c",
             "../../native/src/callbacks.c",
             "../../native/src/authority.c",

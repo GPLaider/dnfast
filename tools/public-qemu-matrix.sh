@@ -384,7 +384,7 @@ package_public_cli() {
   local package_root=/tmp/dnfast-public-package quoted_packages
   local -a packages
   case $ARCH in
-    aarch64) packages=(gcc-16.1.1-2.fc44.aarch64 libsolv-devel-0.7.39-1.fc44.aarch64 rpm-devel-6.0.1-2.fc44.aarch64 pkgconf-pkg-config-2.5.1-1.fc44.aarch64 rust-1.96.1-1.fc44.aarch64 cargo-1.96.1-1.fc44.aarch64) ;;
+    aarch64) packages=(gcc-16.1.1-2.fc44.aarch64 libsolv-devel-0.7.39-1.fc44.aarch64 rpm-devel-6.0.1-2.fc44.aarch64 libmodulemd-devel-2.15.3-1.fc44.aarch64 pkgconf-pkg-config-2.5.1-1.fc44.aarch64 rust-1.96.1-1.fc44.aarch64 cargo-1.96.1-1.fc44.aarch64) ;;
     x86_64) read -r -a packages <<<"${MATRIX_BUILD_PACKAGES:-}"; ((${#packages[@]})) || die 'MATRIX_BUILD_PACKAGES is required for x86_64' ;;
   esac
   quoted_packages=$(printf ' %q' "${packages[@]}")
@@ -395,7 +395,7 @@ package_public_cli() {
 }
 
 require_installed_public_cli() {
-  guest "for path in /usr/bin/dnfast /usr/libexec/dnfast-executor /usr/libexec/dnfastd; do test -f \"\$path\"; test ! -L \"\$path\"; test -x \"\$path\"; test \"\$(stat -c '%u:%g:%a:%h' \"\$path\")\" = '0:0:755:1'; done; for path in /usr/bin/dnfast /usr/libexec/dnfast-executor /usr/libexec/dnfastd; do ldd \"\$path\" | grep -F 'libsolv.so.1'; ldd \"\$path\" | grep -F 'librpm.so.10'; done; test \"\$(stat -c '%u:%g:%a:%h' /etc/systemd/system/dnfastd.service)\" = '0:0:644:1'; /usr/bin/dnfast --help >/tmp/dnfast-public-help.json; /usr/bin/python3 -c 'import os, pty, sys; assert os.waitstatus_to_exitcode'"
+  guest "for path in /usr/bin/dnfast /usr/libexec/dnfast-executor /usr/libexec/dnfastd; do test -f \"\$path\"; test ! -L \"\$path\"; test -x \"\$path\"; test \"\$(stat -c '%u:%g:%a:%h' \"\$path\")\" = '0:0:755:1'; done; for path in /usr/bin/dnfast /usr/libexec/dnfast-executor /usr/libexec/dnfastd; do ldd \"\$path\" | grep -F 'libsolv.so.1'; ldd \"\$path\" | grep -F 'librpm.so.10'; ldd \"\$path\" | grep -F 'libmodulemd.so.2'; done; test \"\$(stat -c '%u:%g:%a:%h' /etc/systemd/system/dnfastd.service)\" = '0:0:644:1'; /usr/bin/dnfast --help >/tmp/dnfast-public-help.json; /usr/bin/python3 -c 'import os, pty, sys; assert os.waitstatus_to_exitcode'"
 }
 
 start_guest_https_fixture() {

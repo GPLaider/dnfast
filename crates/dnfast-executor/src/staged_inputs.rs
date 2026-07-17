@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{Read, Seek},
 };
@@ -17,6 +18,26 @@ use crate::{
 };
 
 type ParsedCandidates = (Vec<CandidatePackage>, Vec<(String, CompletePackage)>);
+
+pub(crate) fn apply_module_artifact_policy(
+    candidates: &mut [CandidatePackage],
+    policies: &BTreeMap<String, bool>,
+) {
+    for candidate in candidates {
+        let identity = format!(
+            "{}-{}:{}-{}.{}",
+            candidate.name,
+            candidate.evra.epoch(),
+            candidate.evra.version(),
+            candidate.evra.release(),
+            candidate.evra.arch().as_rpm_arch(),
+        );
+        if let Some(excluded) = policies.get(&identity) {
+            candidate.modular = true;
+            candidate.excluded = *excluded;
+        }
+    }
+}
 
 pub struct StagedInputs {
     pub policy: SolverPolicy,

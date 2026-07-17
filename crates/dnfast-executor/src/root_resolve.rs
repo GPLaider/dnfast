@@ -1,6 +1,7 @@
 use dnfast_core::{Action, CanonicalDocument};
 use dnfast_solver::{CanonicalSolverPlan, NativeSolveOutput, PlanBuilder, ReSolveContract};
 
+use crate::staged_inputs::apply_module_artifact_policy;
 use crate::{ExecutorError, StagedInputs};
 
 pub fn require_equal(
@@ -43,6 +44,19 @@ pub fn require_equal(
             .add_repository(repository.repository.clone())
             .map_err(native)?;
     }
+    let module_policies = snapshot
+        .module_catalog(&selected)
+        .and_then(|catalog| {
+            catalog.artifact_policies(&snapshot.payload().module_state, staged.policy.base_arch())
+        })
+        .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    let module_excludes = module_policies
+        .iter()
+        .filter_map(|(artifact, excluded)| excluded.then_some(artifact.clone()))
+        .collect::<Vec<_>>();
+    context
+        .set_module_excludes(&module_excludes)
+        .map_err(native)?;
     let intent = proposal.intent();
     let names = intent
         .packages()
@@ -72,8 +86,10 @@ pub fn require_equal(
     )
     .map_err(|error| ExecutorError::Plan(error.to_string()))?;
     let satisfied_specs = transcript.satisfied_specs().to_vec();
+    let mut candidates = staged.candidates.clone();
+    apply_module_artifact_policy(&mut candidates, &module_policies);
     let resolved = transcript
-        .into_resolved(&names, &staged.candidates, &metadata, &inventory)
+        .into_resolved(&names, &candidates, &metadata, &inventory)
         .map_err(|error| ExecutorError::Plan(error.to_string()))?;
     let snapshots = proposal.integrity();
     let root_plan = PlanBuilder {
@@ -81,7 +97,7 @@ pub fn require_equal(
         snapshots: &snapshots,
         inventory: &inventory,
         policy: &staged.policy,
-        candidates: &staged.candidates,
+        candidates: &candidates,
         expires_at_unix: proposal.expires_at_unix(),
     }
     .build_with_satisfied(&resolved, &satisfied_specs)

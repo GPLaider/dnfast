@@ -365,7 +365,7 @@ fn protected_and_reverse_dependency_removals_fail_before_plan() {
 }
 
 #[test]
-fn excluded_modular_and_unsafe_upgrade_candidates_fail_closed() {
+fn excluded_and_unsafe_upgrade_candidates_fail_closed_while_active_modular_is_allowed() {
     let installed = InstalledPackage::new(
         "app",
         Evra::new(0, "2", "1", Architecture::Noarch),
@@ -419,7 +419,11 @@ fn excluded_modular_and_unsafe_upgrade_candidates_fail_closed() {
             introduced_by_requested: false,
             solver_rule: "upgrade newest".into(),
         };
-        assert!(builder.build(&[action]).is_err());
+        if mutation == 1 {
+            assert!(builder.build(&[action]).is_ok());
+        } else {
+            assert!(builder.build(&[action]).is_err());
+        }
     }
     let mut switched = candidate("app", "3", "fedora", 99, 1000);
     switched.vendor = "Other".into();

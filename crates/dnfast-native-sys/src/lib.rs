@@ -21,7 +21,7 @@ mod callback_state;
 mod error_impl;
 use callback_state::{CallbackState, interrupt_trampoline, transaction_start_trampoline};
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +111,13 @@ pub(crate) struct RawError {
 }
 
 unsafe extern "C" {
+    fn dnfast_modulemd_parse_json(
+        yaml: *const u8,
+        yaml_size: usize,
+        json: *mut *mut c_char,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_string_free(value: *mut c_char);
     fn dnfast_limits_default() -> RawLimits;
     fn dnfast_release_unused_memory();
     fn dnfast_fsverity_enable(retained_fd: i32) -> i32;
@@ -207,6 +214,12 @@ unsafe extern "C" {
         error: *mut RawError,
     ) -> i32;
     fn dnfast_solver_prepare(context: *mut RawContext, error: *mut RawError) -> i32;
+    fn dnfast_solver_set_module_excludes(
+        context: *mut RawContext,
+        nevras: *const *const c_char,
+        nevra_count: usize,
+        error: *mut RawError,
+    ) -> i32;
     fn dnfast_solver_release_result(context: *mut RawContext);
     fn dnfast_solver_solve_operation(
         context: *mut RawContext,
@@ -251,6 +264,41 @@ pub fn release_unused_memory() {
     // SAFETY: the native function has no arguments and only asks the process
     // allocator to return currently unused pages to the operating system.
     unsafe { dnfast_release_unused_memory() };
+}
+
+pub fn parse_modulemd_json(yaml: &[u8]) -> Result<String, NativeError> {
+    let mut value = std::ptr::null_mut();
+    let mut error = empty_error();
+    // SAFETY: the byte slice and out parameters remain live for the synchronous
+    // call; native code returns a separately allocated NUL-terminated string.
+    let status =
+        unsafe { dnfast_modulemd_parse_json(yaml.as_ptr(), yaml.len(), &mut value, &mut error) };
+    if status != 0 {
+        return Err(take_error(&mut error));
+    }
+    if value.is_null() {
+        return Err(NativeError {
+            status: 7,
+            component: "modulemd".into(),
+            symbol: "parse".into(),
+            message: "native module parser returned a null catalog".into(),
+        });
+    }
+    // SAFETY: successful native parsing returns one live NUL-terminated
+    // string and transfers it to this function for exactly one free.
+    let copied = unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| NativeError {
+            status: 7,
+            component: "modulemd".into(),
+            symbol: "catalog".into(),
+            message: "native module catalog is not UTF-8".into(),
+        });
+    // SAFETY: `value` is the allocation returned by the successful native call
+    // and has not previously been freed.
+    unsafe { dnfast_string_free(value) };
+    copied
 }
 
 /// Enables Linux fs-verity on an immutable regular file when the backing
@@ -373,6 +421,33 @@ impl Context {
             0 => Ok(false),
             5 => Ok(true),
             _ => Err(take_error(&mut error)),
+        }
+    }
+
+    pub fn set_module_excludes(&mut self, nevras: &[String]) -> Result<(), NativeError> {
+        let values = nevras
+            .iter()
+            .map(|value| c_string(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pointers = values
+            .iter()
+            .map(|value| value.as_ptr())
+            .collect::<Vec<_>>();
+        let mut error = empty_error();
+        // SAFETY: every C string and the pointer array stay live for the
+        // synchronous call; native code copies only resolved solvable IDs.
+        let status = unsafe {
+            dnfast_solver_set_module_excludes(
+                self.raw.as_ptr(),
+                pointers.as_ptr(),
+                pointers.len(),
+                &mut error,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(take_error(&mut error))
         }
     }
 

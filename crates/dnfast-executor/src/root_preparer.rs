@@ -10,8 +10,9 @@ use rustix::process::geteuid;
 use thiserror::Error;
 
 use crate::{
-    ExecutorError, InheritedPlan, RootInputs, input_model::InputManifest,
-    staged_inputs::parse_candidates,
+    ExecutorError, InheritedPlan, RootInputs,
+    input_model::InputManifest,
+    staged_inputs::{apply_module_artifact_policy, parse_candidates},
 };
 
 mod prepared_generation;
@@ -212,12 +213,27 @@ fn prepare_into_draft(
         materialized_repositories.push(materialized);
     }
 
+    let module_catalog = snapshot
+        .module_catalog(&selected_ids)
+        .map_err(snapshot_error)?;
+    let module_policies = module_catalog
+        .artifact_policies(&snapshot.payload().module_state, policy.base_arch())
+        .map_err(snapshot_error)?;
+    apply_module_artifact_policy(&mut candidates, &module_policies);
+
     draft.discard_native_metadata(&materialized_repositories)?;
     let repository_inputs = materialized_repositories
         .into_iter()
         .map(|materialized| materialized.input)
         .collect::<Vec<_>>();
     if let Some((mut context, inventory)) = context {
+        let module_excludes = module_policies
+            .iter()
+            .filter_map(|(artifact, excluded)| excluded.then_some(artifact.clone()))
+            .collect::<Vec<_>>();
+        context
+            .set_module_excludes(&module_excludes)
+            .map_err(native)?;
         let names = proposal
             .proposal()
             .intent()
