@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -109,7 +110,7 @@ dnfast_status dnfast_solver_add_repo_solv(
     dnfast_status status = owner_check(context, error);
     if (status != DNFAST_STATUS_OK) return status;
     if (input == NULL || input->abi_version != DNFAST_NATIVE_ABI_VERSION ||
-        input->id == NULL || expected_userdata == NULL ||
+        input->id == NULL || input->installed > 1 || expected_userdata == NULL ||
         expected_userdata_size == 0 || expected_userdata_size > 4096)
         return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
                                 "solver-cache", NULL, "invalid solv cache input");
@@ -168,9 +169,13 @@ dnfast_status dnfast_solver_add_repo_solv(
         if (repo != NULL) repo_free(repo, 1);
         return status;
     }
-    repo->priority = -input->priority;
-    repo->subpriority = -input->cost;
+    repo->priority = input->installed ? INT_MIN : -input->priority;
+    repo->subpriority = input->installed ? 0 : -input->cost;
     repo_internalize(repo);
+    if (input->installed) {
+        pool_set_rootdir(context->pool, "/");
+        pool_set_installed(context->pool, repo);
+    }
     return DNFAST_STATUS_OK;
 #else
     (void)input; (void)retained_fd; (void)expected_userdata;

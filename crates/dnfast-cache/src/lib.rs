@@ -8,6 +8,7 @@ mod fs_safety;
 mod loading;
 mod model;
 mod publication;
+mod rpmdb_receipt;
 mod solv_cache;
 
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ pub use model::{
     CacheError, CompleteSnapshot, OriginError, RepomdAuthentication, SelectedOrigin, Snapshot,
     SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration,
 };
+pub use rpmdb_receipt::{RpmDbReceiptCache, RpmDbReceiptCheck, RpmDbVerifiedGeneration};
 pub use solv_cache::{CachedSolv, SolvCache, StagedSolv};
 
 #[derive(Debug)]

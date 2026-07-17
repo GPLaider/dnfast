@@ -414,6 +414,26 @@ impl Context {
         file: &std::fs::File,
         userdata: &[u8],
     ) -> Result<(), NativeError> {
+        self.add_repo_solv_kind(repository_id, priority, cost, file, userdata, false)
+    }
+
+    pub fn add_installed_repo_solv(
+        &mut self,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        self.add_repo_solv_kind("@System", 0, 0, file, userdata, true)
+    }
+
+    fn add_repo_solv_kind(
+        &mut self,
+        repository_id: &str,
+        priority: i32,
+        cost: i32,
+        file: &std::fs::File,
+        userdata: &[u8],
+        installed: bool,
+    ) -> Result<(), NativeError> {
         let id = c_string(repository_id)?;
         let empty = c_string("")?;
         let input = RawRepoInput {
@@ -424,7 +444,7 @@ impl Context {
             filelists_path: empty.as_ptr(),
             priority,
             cost,
-            installed: 0,
+            installed: u8::from(installed),
         };
         let mut error = empty_error();
         // SAFETY: the input strings, userdata, retained file, and uniquely
@@ -921,7 +941,6 @@ impl Context {
         // storage (or copying failed); the uniquely borrowed context stays
         // live and on its owner thread. The repository pool remains resident.
         unsafe { dnfast_solver_release_result(self.raw.as_ptr()) };
-        release_unused_memory();
         output
     }
 }

@@ -27,6 +27,19 @@ fn primary_only_repository(directory: &tempfile::TempDir) -> Repository {
     }
 }
 
+fn installed_repository(directory: &tempfile::TempDir) -> Repository {
+    let mut repository = primary_only_repository(directory);
+    let filelists = std::process::Command::new("/usr/bin/zstd")
+        .args(["-qdc", &fixture("filelists.xml.zst").display().to_string()])
+        .output()
+        .expect("run zstd");
+    assert!(filelists.status.success(), "decode fixture filelists");
+    let filelists_path = directory.path().join("filelists.xml");
+    std::fs::write(&filelists_path, filelists.stdout).expect("materialized filelists");
+    repository.filelists_path = filelists_path.display().to_string();
+    repository
+}
+
 #[test]
 fn solv_cache_round_trip_preserves_packages_relations_and_solves() {
     let directory = tempfile::tempdir().expect("temporary metadata");
@@ -105,4 +118,35 @@ fn solv_cache_round_trip_preserves_packages_relations_and_solves() {
             .add_repository_solv("main", 99, 1000, &cache, b"wrong binding")
             .is_err()
     );
+}
+
+#[test]
+fn installed_solv_cache_restores_the_pool_installed_repository() {
+    let directory = tempfile::tempdir().expect("temporary metadata");
+    let binding = b"dnfast installed solv cache fixture v1";
+    let cache = tempfile::tempfile().expect("cache file");
+    let mut source = NativeContext::open(Architecture::Aarch64, || false).expect("source");
+    source
+        .add_installed_repository(installed_repository(&directory))
+        .expect("installed repository");
+    source
+        .write_repository_solv("main", &cache, binding)
+        .expect("write installed cache");
+
+    let mut loaded = NativeContext::open(Architecture::Aarch64, || false).expect("loaded");
+    loaded
+        .add_installed_repository_solv(&cache, binding)
+        .expect("load installed cache");
+    loaded
+        .prepare_solver()
+        .expect("prepare cached installed pool");
+    assert!(
+        loaded
+            .has_provider("dnfast-app")
+            .expect("installed provider")
+    );
+    let solve = loaded
+        .solve_install_many(&["dnfast-app"], true, true)
+        .expect("already installed solve");
+    assert!(solve.actions.is_empty());
 }

@@ -13,8 +13,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dnfast_cache::{
-    ArtifactCache, ArtifactSpec, Digest as ArtifactDigest, HttpArtifactTransport, SolvCache,
-    TransactionRequest,
+    ArtifactCache, ArtifactSpec, Digest as ArtifactDigest, HttpArtifactTransport,
+    RpmDbReceiptCache, RpmDbReceiptCheck, SolvCache, TransactionRequest,
 };
 use dnfast_core::{
     Action, Architecture, CanonicalDocument, Evra, InstalledInventory, PackageSpec, SolverPolicy,
@@ -45,6 +45,8 @@ const PLAN_LIFETIME_SECONDS: u64 = 300;
 const PROTOCOL_SCHEMA: &str = "dnfast.daemon.v1";
 const CONNECT_RETRY_LIMIT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const SYSTEM_RPMDB_PATH: &str = "/usr/lib/sysimage/rpm/rpmdb.sqlite";
+const SYSTEM_RPMDB_WAL_PATH: &str = "/usr/lib/sysimage/rpm/rpmdb.sqlite-wal";
 type MaterializedPaths = (String, String, String);
 type MaterializedRepository = MaterializedPaths;
 
@@ -399,6 +401,12 @@ pub fn serve_system() -> Result<(), DaemonError> {
         if let Err(error) = handle_connection(&mut state, &mut stream) {
             let _ = write_failed(&mut stream, &error.to_string());
         }
+        if state.planner.take_trim_pending() {
+            // Result bytes have already crossed the socket boundary.  Keep
+            // allocator reclamation off the latency-critical solve/response
+            // path while preserving the resident memory bound.
+            dnfast_native::release_unused_memory();
+        }
     }
     Ok(())
 }
@@ -682,6 +690,13 @@ fn trace_phase(enabled: bool, started: Instant, phase: &str) {
 struct ResidentPlanner {
     cached: Option<ResidentPool>,
     verified_rpmdb_cookie: Option<String>,
+    pending_installed: Option<PendingInstalled>,
+}
+
+struct PendingInstalled {
+    architecture: Architecture,
+    context: NativeContext,
+    snapshot: InventorySnapshot,
 }
 
 struct ResidentPool {
@@ -694,6 +709,7 @@ struct ResidentPool {
     inventory: InstalledInventory,
     rpmdb_cookie: String,
     last_solve: Option<CachedResidentSolve>,
+    trim_pending: bool,
 }
 
 struct CachedResidentSolve {
@@ -713,14 +729,49 @@ struct SolvedPlan {
 
 impl ResidentPlanner {
     fn verify_startup(&mut self, architecture: Architecture) -> Result<(), DaemonError> {
+        let trace = std::env::var_os("DNFASTD_TRACE").is_some();
+        let started = Instant::now();
         let mut context = NativeContext::open(architecture, || false).map_err(planning)?;
-        context.verify_installed_rpmdb().map_err(planning)?;
-        self.verified_rpmdb_cookie = Some(
-            context
-                .read_installed_inventory_snapshot()
-                .map_err(planning)?
-                .rpmdb_cookie,
-        );
+        let before = context
+            .read_installed_inventory_snapshot()
+            .map_err(planning)?;
+        trace_phase(trace, started, "startup-rpmdb-opened");
+        let binding = rpmdb_receipt_binding(&before, architecture)?;
+        let receipts =
+            RpmDbReceiptCache::new(SYSTEM_CACHE_PATH, SYSTEM_RPMDB_PATH, SYSTEM_RPMDB_WAL_PATH);
+        let (snapshot, receipt_generation) = match receipts.check(&binding).map_err(planning)? {
+            RpmDbReceiptCheck::Hit(generation) => {
+                trace_phase(trace, started, "startup-rpmdb-receipt-hit");
+                (before, Some(generation))
+            }
+            RpmDbReceiptCheck::Miss {
+                generation,
+                corrupted,
+            } => {
+                if trace {
+                    eprintln!("dnfastd_trace rpmdb_receipt_corrupted={corrupted}");
+                }
+                let snapshot = verify_rpmdb_unchanged(&mut context, before)?;
+                receipts.publish(&generation).map_err(planning)?;
+                trace_phase(trace, started, "startup-rpmdb-receipt-published");
+                (snapshot, Some(generation))
+            }
+            RpmDbReceiptCheck::Unsupported => {
+                let snapshot = verify_rpmdb_unchanged(&mut context, before)?;
+                trace_phase(trace, started, "startup-rpmdb-full-verified");
+                (snapshot, None)
+            }
+        };
+        if trace && receipt_generation.is_some() {
+            trace_phase(trace, started, "startup-rpmdb-generation-verified");
+        }
+        load_installed_solv_cache(&mut context, &snapshot, architecture, trace, started)?;
+        self.verified_rpmdb_cookie = Some(snapshot.rpmdb_cookie.clone());
+        self.pending_installed = Some(PendingInstalled {
+            architecture,
+            context,
+            snapshot,
+        });
         Ok(())
     }
 
@@ -824,6 +875,7 @@ impl ResidentPlanner {
             Action::Remove => cached.context.solve_erase_many(&names),
         }
         .map_err(planning)?;
+        cached.trim_pending = true;
         trace_phase(trace, started, "resident-native-solve");
         if trace {
             eprintln!(
@@ -904,6 +956,7 @@ impl ResidentPlanner {
             repositories.to_vec(),
             integrity,
             self.verified_rpmdb_cookie.as_deref(),
+            self.pending_installed.take(),
         )?;
         self.verified_rpmdb_cookie = Some(verified_cookie);
         self.cached = Some(pool);
@@ -912,6 +965,13 @@ impl ResidentPlanner {
 
     fn invalidate(&mut self) {
         self.cached = None;
+        self.pending_installed = None;
+    }
+
+    fn take_trim_pending(&mut self) -> bool {
+        self.cached
+            .as_mut()
+            .is_some_and(|cached| std::mem::take(&mut cached.trim_pending))
     }
 
     fn refresh_after_mutation(
@@ -980,27 +1040,28 @@ fn build_pool(
     repository_ids: Vec<String>,
     integrity: dnfast_core::PlanIntegrity,
     verified_rpmdb_cookie: Option<&str>,
+    pending_installed: Option<PendingInstalled>,
 ) -> Result<(ResidentPool, String), DaemonError> {
     let trace = std::env::var_os("DNFASTD_TRACE").is_some();
     let started = Instant::now();
     let policy = snapshot.payload().policy.solver.clone();
-    let mut context = NativeContext::open(policy.base_arch(), || false).map_err(planning)?;
-    trace_phase(trace, started, "resident-build-context-open");
-    context.add_installed_rpmdb("/").map_err(planning)?;
-    let mut current = context
-        .read_installed_inventory_snapshot()
-        .map_err(planning)?;
-    if verified_rpmdb_cookie != Some(current.rpmdb_cookie.as_str()) {
-        let cookie_before = current.rpmdb_cookie.clone();
-        context.verify_installed_rpmdb().map_err(planning)?;
-        current = context
-            .read_installed_inventory_snapshot()
-            .map_err(planning)?;
-        if current.rpmdb_cookie != cookie_before {
-            return Err(DaemonError::Planning(
-                "RPMDB changed while full verification was in progress".into(),
-            ));
+    let (mut context, mut current) = match pending_installed {
+        Some(mut pending) if pending.architecture == policy.base_arch() => {
+            let live = pending
+                .context
+                .read_installed_inventory_snapshot()
+                .map_err(planning)?;
+            if same_inventory_generation(&pending.snapshot, &live)? {
+                (pending.context, live)
+            } else {
+                open_installed_context(policy.base_arch())?
+            }
         }
+        _ => open_installed_context(policy.base_arch())?,
+    };
+    trace_phase(trace, started, "resident-build-context-open");
+    if verified_rpmdb_cookie != Some(current.rpmdb_cookie.as_str()) {
+        current = verify_rpmdb_unchanged(&mut context, current)?;
     }
     trace_phase(trace, started, "resident-build-rpmdb-verified");
     let InventorySnapshot {
@@ -1086,7 +1147,6 @@ fn build_pool(
     }
     context.prepare_solver().map_err(planning)?;
     trace_phase(trace, started, "resident-build-solver-prepared");
-    dnfast_native::release_unused_memory();
     let verified_cookie = rpmdb_cookie.clone();
     let repositories = selected.into_iter().cloned().collect();
     Ok((
@@ -1100,9 +1160,130 @@ fn build_pool(
             inventory,
             rpmdb_cookie,
             last_solve: None,
+            // Pool construction is the other large transient allocation.
+            // Reclaim it after the first response even when that response is
+            // only a warm request and does not execute a solve.
+            trim_pending: true,
         },
         verified_cookie,
     ))
+}
+
+fn open_installed_context(
+    architecture: Architecture,
+) -> Result<(NativeContext, InventorySnapshot), DaemonError> {
+    let mut context = NativeContext::open(architecture, || false).map_err(planning)?;
+    context.add_installed_rpmdb("/").map_err(planning)?;
+    let snapshot = context
+        .read_installed_inventory_snapshot()
+        .map_err(planning)?;
+    Ok((context, snapshot))
+}
+
+fn verify_rpmdb_unchanged(
+    context: &mut NativeContext,
+    before: InventorySnapshot,
+) -> Result<InventorySnapshot, DaemonError> {
+    context.verify_installed_rpmdb().map_err(planning)?;
+    let after = context
+        .read_installed_inventory_snapshot()
+        .map_err(planning)?;
+    if !same_inventory_generation(&before, &after)? {
+        return Err(DaemonError::Planning(
+            "RPMDB changed while full verification was in progress".into(),
+        ));
+    }
+    Ok(after)
+}
+
+fn same_inventory_generation(
+    before: &InventorySnapshot,
+    after: &InventorySnapshot,
+) -> Result<bool, DaemonError> {
+    Ok(before.rpmdb_cookie == after.rpmdb_cookie
+        && before.inventory.canonical_sha256().map_err(planning)?
+            == after.inventory.canonical_sha256().map_err(planning)?)
+}
+
+fn rpmdb_receipt_binding(
+    snapshot: &InventorySnapshot,
+    architecture: Architecture,
+) -> Result<String, DaemonError> {
+    let inventory = snapshot.inventory.canonical_sha256().map_err(planning)?;
+    let value = format!(
+        "dnfast-rpmdb-verification-receipt-v1\nnative_abi={}\narchitecture={}\nrpmdb_cookie={}\ninventory_sha256={}\n",
+        dnfast_native_sys::ABI_VERSION,
+        architecture.as_rpm_arch(),
+        snapshot.rpmdb_cookie,
+        inventory.as_str(),
+    );
+    Ok(hex::encode(Sha256::digest(value.as_bytes())))
+}
+
+fn load_installed_solv_cache(
+    context: &mut NativeContext,
+    snapshot: &InventorySnapshot,
+    architecture: Architecture,
+    trace: bool,
+    started: Instant,
+) -> Result<(), DaemonError> {
+    let (binding, binding_sha256) = installed_solv_cache_binding(snapshot, architecture)?;
+    let cache = SolvCache::new(SYSTEM_CACHE_PATH);
+    match cache.open(&binding_sha256).map_err(planning)? {
+        Some(cached) => {
+            context
+                .add_installed_repository_solv(cached.file(), &binding)
+                .map_err(planning)?;
+            if trace {
+                eprintln!(
+                    "dnfastd_trace installed_solv_cache verification={:?} sha256={} size={}",
+                    cached.verification(),
+                    cached.sha256(),
+                    cached.size()
+                );
+            }
+            trace_phase(trace, started, "startup-installed-solv-cache-hit");
+        }
+        None => {
+            context.add_installed_rpmdb("/").map_err(planning)?;
+            let staged = cache.stage(&binding_sha256).map_err(planning)?;
+            context
+                .write_repository_solv("@System", staged.file(), &binding)
+                .map_err(planning)?;
+            let published = staged.commit().map_err(planning)?;
+            if trace {
+                eprintln!(
+                    "dnfastd_trace installed_solv_cache published_sha256={} size={}",
+                    published.sha256(),
+                    published.size()
+                );
+            }
+            trace_phase(trace, started, "startup-installed-solv-cache-published");
+        }
+    }
+    Ok(())
+}
+
+fn installed_solv_cache_binding(
+    snapshot: &InventorySnapshot,
+    architecture: Architecture,
+) -> Result<(Vec<u8>, String), DaemonError> {
+    let inventory = snapshot.inventory.canonical_sha256().map_err(planning)?;
+    let binding = format!(
+        "dnfast-installed-solv-cache-v1\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrpmdb_cookie={}\ninventory_sha256={}\n",
+        dnfast_native_sys::ABI_VERSION,
+        architecture.as_rpm_arch(),
+        snapshot.rpmdb_cookie,
+        inventory.as_str(),
+    )
+    .into_bytes();
+    if binding.len() > 4096 {
+        return Err(DaemonError::Planning(
+            "installed solv cache binding exceeds native limit".into(),
+        ));
+    }
+    let sha256 = hex::encode(Sha256::digest(&binding));
+    Ok((binding, sha256))
 }
 
 fn system_architecture() -> Result<Architecture, DaemonError> {

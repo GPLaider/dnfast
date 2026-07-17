@@ -54,6 +54,10 @@ run_dnfast_cold() {
     local iteration=$1
     local prefix="$output/raw/dnfast-cold-$iteration"
     local restart_ns ready_ns done_ns status
+    # A faster daemon can otherwise trip systemd's default burst limiter during
+    # an intentionally restart-heavy benchmark.  Clearing only the historical
+    # failed counter does not change the measured service lifecycle.
+    systemctl reset-failed dnfastd.service
     restart_ns=$(date +%s%N)
     systemctl restart dnfastd.service
     wait_for_daemon

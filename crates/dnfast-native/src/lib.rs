@@ -209,6 +209,16 @@ impl NativeContext {
             .map_err(NativeError::from)
     }
 
+    pub fn add_installed_repository_solv(
+        &mut self,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        self.inner
+            .add_installed_repo_solv(file, userdata)
+            .map_err(NativeError::from)
+    }
+
     pub fn write_repository_solv(
         &mut self,
         repository_id: &str,
