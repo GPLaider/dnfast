@@ -226,25 +226,53 @@ impl NativeContext {
     ) -> Result<Vec<RepositoryPackage>, NativeError> {
         self.inner
             .repository_packages(repository_id)
-            .map(|packages| {
-                packages
-                    .into_iter()
-                    .map(|package| RepositoryPackage {
-                        name: package.name,
-                        arch: package.arch,
-                        evr: package.evr,
-                        vendor: package.vendor,
-                        checksum_sha256: package.checksum_sha256,
-                        location: package.location,
-                        package_size: package.package_size,
-                        installed_size: package.installed_size,
-                        requires: package.requires,
-                        recommends: package.recommends,
-                        supplements: package.supplements,
-                        enhances: package.enhances,
-                    })
-                    .collect()
-            })
+            .map(map_repository_packages)
+            .map_err(NativeError::from)
+    }
+
+    /// Returns the package transaction catalog without copying dependency
+    /// relation strings out of libsolv.  Relation evidence can be fetched by
+    /// ordinal after a solve selects the small causal subset that needs it.
+    pub fn repository_catalog(
+        &mut self,
+        repository_id: &str,
+    ) -> Result<Vec<RepositoryPackage>, NativeError> {
+        self.inner
+            .repository_catalog(repository_id)
+            .map(map_repository_packages)
+            .map_err(NativeError::from)
+    }
+
+    pub fn repository_package_evidence(
+        &mut self,
+        repository_id: &str,
+        ordinal: usize,
+    ) -> Result<RepositoryPackage, NativeError> {
+        self.inner
+            .repository_package_evidence(repository_id, ordinal)
+            .map(map_repository_package)
+            .map_err(NativeError::from)
+    }
+
+    pub fn repository_package_identity_evidence(
+        &mut self,
+        repository_id: &str,
+        identity: &str,
+    ) -> Result<RepositoryPackage, NativeError> {
+        self.inner
+            .repository_package_identity_evidence(repository_id, identity)
+            .map(map_repository_package)
+            .map_err(NativeError::from)
+    }
+
+    pub fn repository_catalog_named(
+        &mut self,
+        repository_id: &str,
+        name: &str,
+    ) -> Result<Vec<RepositoryPackage>, NativeError> {
+        self.inner
+            .repository_catalog_named(repository_id, name)
+            .map(map_repository_packages)
             .map_err(NativeError::from)
     }
 
@@ -404,6 +432,29 @@ impl NativeContext {
                     .collect(),
             })
             .map_err(NativeError::from)
+    }
+}
+
+fn map_repository_packages(
+    packages: Vec<dnfast_native_sys::RepositoryPackage>,
+) -> Vec<RepositoryPackage> {
+    packages.into_iter().map(map_repository_package).collect()
+}
+
+fn map_repository_package(package: dnfast_native_sys::RepositoryPackage) -> RepositoryPackage {
+    RepositoryPackage {
+        name: package.name,
+        arch: package.arch,
+        evr: package.evr,
+        vendor: package.vendor,
+        checksum_sha256: package.checksum_sha256,
+        location: package.location,
+        package_size: package.package_size,
+        installed_size: package.installed_size,
+        requires: package.requires,
+        recommends: package.recommends,
+        supplements: package.supplements,
+        enhances: package.enhances,
     }
 }
 

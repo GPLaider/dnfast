@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Write},
     os::unix::{
@@ -7,7 +8,7 @@ use std::{
     },
     path::{Path, PathBuf},
     rc::Rc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -42,6 +43,8 @@ const RUNTIME_PATH: [&str; 2] = ["run", "dnfast"];
 const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 const PLAN_LIFETIME_SECONDS: u64 = 300;
 const PROTOCOL_SCHEMA: &str = "dnfast.daemon.v1";
+const CONNECT_RETRY_LIMIT: Duration = Duration::from_secs(2);
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 type MaterializedPaths = (String, String, String);
 type MaterializedRepository = MaterializedPaths;
 
@@ -178,7 +181,7 @@ enum ServerMessage {
 }
 
 pub fn daemon_status() -> Result<bool, DaemonError> {
-    let mut stream = match connect() {
+    let mut stream = match connect_once() {
         Ok(stream) => stream,
         Err(DaemonError::Unavailable) => return Ok(false),
         Err(error) => return Err(error),
@@ -198,7 +201,7 @@ pub fn daemon_status() -> Result<bool, DaemonError> {
 }
 
 pub fn warm_daemon(repositories: &[String]) -> Result<String, DaemonError> {
-    let mut stream = connect()?;
+    let mut stream = connect_retry()?;
     write_frame(
         &mut stream,
         &ClientMessage::Warm {
@@ -222,7 +225,7 @@ pub fn plan_via_daemon(
     packages: &[String],
     repositories: &[String],
 ) -> Result<DaemonPlan, DaemonError> {
-    let mut stream = connect()?;
+    let mut stream = connect_retry()?;
     write_frame(
         &mut stream,
         &ClientMessage::Plan {
@@ -264,7 +267,7 @@ pub fn transact_via_daemon(
     repositories: &[String],
     approval: DaemonApproval,
 ) -> Result<DaemonOutcome, DaemonError> {
-    let mut stream = connect()?;
+    let mut stream = connect_retry()?;
     write_frame(
         &mut stream,
         &ClientMessage::Prepare {
@@ -342,7 +345,7 @@ fn prompt_approval() -> Result<bool, DaemonError> {
     Ok(matches!(reply.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-fn connect() -> Result<UnixStream, DaemonError> {
+fn connect_once() -> Result<UnixStream, DaemonError> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(DaemonError::NotRoot);
     }
@@ -350,6 +353,19 @@ fn connect() -> Result<UnixStream, DaemonError> {
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => DaemonError::Unavailable,
         _ => DaemonError::Io(error.to_string()),
     })
+}
+
+fn connect_retry() -> Result<UnixStream, DaemonError> {
+    let deadline = Instant::now() + CONNECT_RETRY_LIMIT;
+    loop {
+        match connect_once() {
+            Ok(stream) => return Ok(stream),
+            Err(DaemonError::Unavailable) if Instant::now() < deadline => {
+                std::thread::sleep(CONNECT_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub fn serve_system() -> Result<(), DaemonError> {
@@ -524,27 +540,6 @@ impl DaemonState {
         solved: SolvedPlan,
     ) -> Result<(), DaemonError> {
         let started = Instant::now();
-        let plan_bytes = solved.plan.canonical_json().map_err(planning)?;
-        revalidate_solved(&solved)?;
-        let snapshot = PlanningSnapshot::open_system().map_err(planning)?;
-        snapshot.revalidate_system_state().map_err(planning)?;
-        if PlanningSnapshot::current_system_digest().map_err(planning)?
-            != solved.integrity.planning_snapshot_sha256().as_str()
-        {
-            return Err(DaemonError::Planning(
-                "root-published planning snapshot changed before staging".into(),
-            ));
-        }
-        let architecture = solved.policy.base_arch();
-        if self.recovered_architecture != Some(architecture) {
-            recover_pending_transactions(&self.journal, architecture).map_err(executor)?;
-            self.recovered_architecture = Some(architecture);
-        }
-        trace_phase(self.trace, started, "revalidate-recover");
-        let staging = Staging::create(&plan_bytes).map_err(executor)?;
-        let mut staged = direct_staged_inputs(&solved)?;
-        let mut root = MountRoot::create(&staging).map_err(executor)?;
-        trace_phase(self.trace, started, "stage");
         let command = action_name(solved.plan.proposal().intent().action()).to_owned();
         let digest = solved.plan.digest().map_err(planning)?.as_str().to_owned();
         let actions = daemon_actions(&solved.plan);
@@ -586,8 +581,6 @@ impl DaemonState {
         };
         trace_phase(self.trace, started, "decision-read");
         if !approved {
-            root.cleanup().map_err(executor)?;
-            staging.cleanup().map_err(executor)?;
             return write_frame(
                 stream,
                 &ServerMessage::Outcome {
@@ -602,6 +595,27 @@ impl DaemonState {
         }
         revalidate_solved(&solved)?;
         trace_phase(self.trace, started, "decision-revalidated");
+        let snapshot = PlanningSnapshot::open_system().map_err(planning)?;
+        snapshot.revalidate_runtime_bindings().map_err(planning)?;
+        trace_phase(self.trace, started, "runtime-bindings-revalidated");
+        if PlanningSnapshot::current_system_digest().map_err(planning)?
+            != solved.integrity.planning_snapshot_sha256().as_str()
+        {
+            return Err(DaemonError::Planning(
+                "root-published planning snapshot changed before staging".into(),
+            ));
+        }
+        let architecture = solved.policy.base_arch();
+        if self.recovered_architecture != Some(architecture) {
+            recover_pending_transactions(&self.journal, architecture).map_err(executor)?;
+            self.recovered_architecture = Some(architecture);
+        }
+        trace_phase(self.trace, started, "revalidate-recover");
+        let plan_bytes = solved.plan.canonical_json().map_err(planning)?;
+        let staging = Staging::create(&plan_bytes).map_err(executor)?;
+        let mut staged = direct_staged_inputs(&solved)?;
+        let mut root = MountRoot::create(&staging).map_err(executor)?;
+        trace_phase(self.trace, started, "stage");
         let id = dnfast_state::TransactionId::parse(staging.id())
             .map_err(|error| DaemonError::Execution(error.to_string()))?;
         let journal = self
@@ -679,9 +693,6 @@ struct ResidentPool {
     context: NativeContext,
     inventory: InstalledInventory,
     rpmdb_cookie: String,
-    candidates: Vec<CandidatePackage>,
-    metadata: Vec<(String, NativePackageEvidence)>,
-    primary_identities: Vec<(String, Vec<String>)>,
     last_solve: Option<CachedResidentSolve>,
 }
 
@@ -821,8 +832,11 @@ impl ResidentPlanner {
                 result.decisions.len()
             );
         }
-        let metadata = cached
-            .metadata
+        let candidates = selected_candidate_evidence(cached, &result, policy.base_arch())?;
+        trace_phase(trace, started, "resident-candidate-evidence");
+        let metadata = selected_decision_evidence(cached, &result)?;
+        trace_phase(trace, started, "resident-decision-evidence");
+        let metadata = metadata
             .iter()
             .map(|(repository, package)| (repository.as_str(), package))
             .collect::<Vec<_>>();
@@ -836,7 +850,7 @@ impl ResidentPlanner {
         trace_phase(trace, started, "resident-native-adapter");
         let satisfied_specs = transcript.satisfied_specs().to_vec();
         let resolved = transcript
-            .into_resolved_compact(&names, &cached.candidates, &metadata, &cached.inventory)
+            .into_resolved_compact(&names, &candidates, &metadata, &cached.inventory)
             .map_err(planning)?;
         trace_phase(trace, started, "resident-resolved");
         let plan = PlanBuilder {
@@ -844,7 +858,7 @@ impl ResidentPlanner {
             snapshots: &cached.integrity,
             inventory: &cached.inventory,
             policy: &policy,
-            candidates: &cached.candidates,
+            candidates: &candidates,
             expires_at_unix: now.saturating_add(PLAN_LIFETIME_SECONDS),
         }
         .build_with_satisfied(&resolved, &satisfied_specs)
@@ -1008,9 +1022,6 @@ fn build_pool(
     trace_phase(trace, started, "resident-build-repositories-selected");
     let workspace = tempfile::tempdir().map_err(|error| DaemonError::Io(error.to_string()))?;
     let solv_cache = SolvCache::new(SYSTEM_CACHE_PATH);
-    let mut candidates = Vec::new();
-    let mut metadata = Vec::new();
-    let mut primary_identities = Vec::new();
     for (index, repository) in selected.iter().enumerate() {
         let priority = i32::try_from(repository.priority).map_err(planning)?;
         let cost = i32::try_from(repository.cost).map_err(planning)?;
@@ -1020,6 +1031,15 @@ fn build_pool(
                 context
                     .add_repository_solv(&repository.id, priority, cost, cache.file(), &binding)
                     .map_err(planning)?;
+                if trace {
+                    eprintln!(
+                        "dnfastd_trace solv_cache_repo={} verification={:?} sha256={} size={}",
+                        repository.id,
+                        cache.verification(),
+                        cache.sha256(),
+                        cache.size()
+                    );
+                }
                 trace_phase(
                     trace,
                     started,
@@ -1063,23 +1083,6 @@ fn build_pool(
             started,
             &format!("resident-build-{index}-native-loaded"),
         );
-        let packages = context
-            .repository_packages(&repository.id)
-            .map_err(planning)?;
-        let records = resident_records_for(repository, packages, policy.base_arch())?;
-        trace_phase(
-            trace,
-            started,
-            &format!("resident-build-{index}-records-built"),
-        );
-        candidates.extend(records.candidates);
-        metadata.extend(
-            records
-                .metadata
-                .into_iter()
-                .map(|package| (repository.id.clone(), package)),
-        );
-        primary_identities.push((repository.id.clone(), records.primary_identities));
     }
     context.prepare_solver().map_err(planning)?;
     trace_phase(trace, started, "resident-build-solver-prepared");
@@ -1096,9 +1099,6 @@ fn build_pool(
             context,
             inventory,
             rpmdb_cookie,
-            candidates,
-            metadata,
-            primary_identities,
             last_solve: None,
         },
         verified_cookie,
@@ -1333,84 +1333,166 @@ fn display(path: &Path) -> Result<String, DaemonError> {
         .ok_or_else(|| DaemonError::Planning("temporary metadata path is not UTF-8".into()))
 }
 
-struct ResidentRepositoryRecords {
-    candidates: Vec<CandidatePackage>,
-    metadata: Vec<NativePackageEvidence>,
-    primary_identities: Vec<String>,
-}
-
-fn resident_records_for(
+fn resident_candidate_for(
     repository: &PlanningRepository,
-    solver_inputs: Vec<dnfast_native::RepositoryPackage>,
+    item: dnfast_native::RepositoryPackage,
     base_architecture: Architecture,
-) -> Result<ResidentRepositoryRecords, DaemonError> {
-    let mut candidates = Vec::new();
-    let mut metadata = Vec::new();
-    let mut primary_identities = Vec::with_capacity(solver_inputs.len());
-    for item in solver_inputs {
-        let (epoch, version, release) = parse_native_evr(&item.evr)?;
-        primary_identities.push(format!(
-            "{}-{}:{}-{}.{}",
-            item.name, epoch, version, release, item.arch
-        ));
-        let architecture = match item.arch.as_str() {
-            "aarch64" => Architecture::Aarch64,
-            "x86_64" => Architecture::X86_64,
-            "noarch" => Architecture::Noarch,
-            "i686" if base_architecture == Architecture::X86_64 => continue,
-            _ => {
-                return Err(DaemonError::Planning(
-                    "root-published metadata has an unsupported architecture".into(),
-                ));
-            }
-        };
-        if item.checksum_sha256.len() != 64
-            || !item
-                .checksum_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+) -> Result<Option<CandidatePackage>, DaemonError> {
+    let (epoch, version, release) = parse_native_evr(&item.evr)?;
+    let architecture = match item.arch.as_str() {
+        "aarch64" => Architecture::Aarch64,
+        "x86_64" => Architecture::X86_64,
+        "noarch" => Architecture::Noarch,
+        "i686" if base_architecture == Architecture::X86_64 => return Ok(None),
+        _ => {
             return Err(DaemonError::Planning(
-                "native package checksum is not canonical SHA-256".into(),
+                "root-published metadata has an unsupported architecture".into(),
             ));
         }
-        candidates.push(CandidatePackage {
-            name: item.name.clone(),
-            evra: Evra::new(epoch, version.clone(), release.clone(), architecture),
-            vendor: if item.vendor.is_empty() {
-                "unknown".into()
-            } else {
-                item.vendor.clone()
-            },
-            repo_id: repository.id.clone(),
-            priority: repository.priority,
-            cost: repository.cost,
-            package_size: item.package_size,
-            installed_size: item.installed_size,
-            checksum_sha256: item.checksum_sha256.clone(),
-            location: item.location.clone(),
-            excluded: false,
-            modular: false,
-        });
-        metadata.push(NativePackageEvidence::from_native(
-            NativePackageEvidenceParts {
-                name: item.name,
-                arch: item.arch,
+    };
+    if item.checksum_sha256.len() != 64
+        || !item
+            .checksum_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DaemonError::Planning(
+            "native package checksum is not canonical SHA-256".into(),
+        ));
+    }
+    Ok(Some(CandidatePackage {
+        name: item.name,
+        evra: Evra::new(epoch, version, release, architecture),
+        vendor: if item.vendor.is_empty() {
+            "unknown".into()
+        } else {
+            item.vendor
+        },
+        repo_id: repository.id.clone(),
+        priority: repository.priority,
+        cost: repository.cost,
+        package_size: item.package_size,
+        installed_size: item.installed_size,
+        checksum_sha256: item.checksum_sha256,
+        location: item.location,
+        excluded: false,
+        modular: false,
+    }))
+}
+
+fn selected_candidate_evidence(
+    cached: &mut ResidentPool,
+    result: &dnfast_native::SolveResult,
+    base_architecture: Architecture,
+) -> Result<Vec<CandidatePackage>, DaemonError> {
+    let mut names = BTreeSet::new();
+    for (identity, repository) in result.actions.iter().zip(&result.repositories) {
+        if repository == "@System" {
+            continue;
+        }
+        let package = cached
+            .context
+            .repository_package_identity_evidence(repository, identity)
+            .map_err(planning)?;
+        if native_package_identity(&package)? != *identity {
+            return Err(DaemonError::Planning(
+                "selected candidate identity changed during extraction".into(),
+            ));
+        }
+        names.insert(package.name);
+    }
+    let mut candidates = Vec::new();
+    for repository in &cached.repositories {
+        for name in &names {
+            for package in cached
+                .context
+                .repository_catalog_named(&repository.id, name)
+                .map_err(planning)?
+            {
+                if let Some(candidate) =
+                    resident_candidate_for(repository, package, base_architecture)?
+                {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn selected_decision_evidence(
+    cached: &mut ResidentPool,
+    result: &dnfast_native::SolveResult,
+) -> Result<Vec<(String, NativePackageEvidence)>, DaemonError> {
+    let mut action_repositories = BTreeMap::new();
+    for (identity, repository) in result.actions.iter().zip(&result.repositories) {
+        if action_repositories
+            .insert(identity.as_str(), repository.as_str())
+            .is_some()
+        {
+            return Err(DaemonError::Planning(
+                "native action identity is duplicated".into(),
+            ));
+        }
+    }
+    let mut selected = BTreeSet::new();
+    for decision in &result.decisions {
+        let requiring_repository = action_repositories
+            .get(decision.requiring.as_str())
+            .copied()
+            .ok_or_else(|| {
+                DaemonError::Planning("native requiring action has no repository".into())
+            })?;
+        selected.insert((requiring_repository.to_owned(), decision.requiring.clone()));
+        if !decision.provider_installed {
+            let provider_repository = action_repositories
+                .get(decision.provider.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    DaemonError::Planning("native provider action has no repository".into())
+                })?;
+            selected.insert((provider_repository.to_owned(), decision.provider.clone()));
+        }
+    }
+    let mut evidence = Vec::with_capacity(selected.len());
+    for (repository, identity) in selected {
+        let package = cached
+            .context
+            .repository_package_identity_evidence(&repository, &identity)
+            .map_err(planning)?;
+        let package_identity = native_package_identity(&package)?;
+        if package_identity != identity {
+            return Err(DaemonError::Planning(
+                "decision evidence ordinal changed identity".into(),
+            ));
+        }
+        let (epoch, version, release) = parse_native_evr(&package.evr)?;
+        evidence.push((
+            repository,
+            NativePackageEvidence::from_native(NativePackageEvidenceParts {
+                name: package.name,
+                arch: package.arch,
                 epoch: epoch.to_string(),
                 version,
                 release,
-                requires: item.requires,
-                recommends: item.recommends,
-                supplements: item.supplements,
-                enhances: item.enhances,
-            },
+                requires: package.requires,
+                recommends: package.recommends,
+                supplements: package.supplements,
+                enhances: package.enhances,
+            }),
         ));
     }
-    Ok(ResidentRepositoryRecords {
-        candidates,
-        metadata,
-        primary_identities,
-    })
+    Ok(evidence)
+}
+
+fn native_package_identity(
+    package: &dnfast_native::RepositoryPackage,
+) -> Result<String, DaemonError> {
+    let (epoch, version, release) = parse_native_evr(&package.evr)?;
+    Ok(format!(
+        "{}-{}:{}-{}.{}",
+        package.name, epoch, version, release, package.arch
+    ))
 }
 
 fn parse_native_evr(evr: &str) -> Result<(u32, String, String), DaemonError> {
@@ -1432,7 +1514,7 @@ fn parse_native_evr(evr: &str) -> Result<(u32, String, String), DaemonError> {
 }
 
 fn mapped_file_selectors(
-    cached: &ResidentPool,
+    cached: &mut ResidentPool,
     names: &[&str],
 ) -> Result<Vec<MappedSelector>, DaemonError> {
     let mut mapped = Vec::new();
@@ -1447,23 +1529,15 @@ fn mapped_file_selectors(
                 .file_providers(repository, selector)
                 .map_err(planning)?
             {
-                let identities = cached
-                    .primary_identities
-                    .iter()
-                    .find(|(id, _)| id == &repository.id)
-                    .map(|(_, identities)| identities)
-                    .ok_or_else(|| {
-                        DaemonError::Planning(
-                            "file-provides repository identities disappeared".into(),
-                        )
-                    })?;
-                let identity = identities.get(ordinal as usize).ok_or_else(|| {
-                    DaemonError::Planning("file-provides package ordinal is out of range".into())
-                })?;
+                let package = cached
+                    .context
+                    .repository_package_evidence(&repository.id, ordinal as usize)
+                    .map_err(planning)?;
+                let identity = native_package_identity(&package)?;
                 providers.push(FileProvider {
                     repository_id: repository.id.clone(),
                     package_ordinal: ordinal,
-                    expected_identity: identity.clone(),
+                    expected_identity: identity,
                 });
             }
         }

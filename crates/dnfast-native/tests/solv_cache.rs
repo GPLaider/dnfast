@@ -68,6 +68,36 @@ fn solv_cache_round_trip_preserves_packages_relations_and_solves() {
         .expect("cached solve");
     assert_eq!(cached_solve.actions, source_solve.actions);
     assert_eq!(cached_solve.decisions, source_solve.decisions);
+    let selected = cached_solve
+        .actions
+        .iter()
+        .zip(&cached_solve.repositories)
+        .find(|(identity, repository)| {
+            repository.as_str() == "main" && identity.starts_with("dnfast-app-")
+        })
+        .expect("selected repository action");
+    let selected_evidence = loaded
+        .repository_package_identity_evidence("main", selected.0)
+        .expect("identity-selected evidence");
+    assert_eq!(selected_evidence.name, "dnfast-app");
+    assert!(!selected_evidence.requires.is_empty());
+    let named = loaded
+        .repository_catalog_named("main", "dnfast-app")
+        .expect("name-selected catalog");
+    assert!(!named.is_empty());
+    assert!(named.iter().all(|package| package.name == "dnfast-app"));
+    assert!(named.iter().all(|package| package.requires.is_empty()));
+    assert!(
+        loaded
+            .repository_catalog_named("main", "absent-package")
+            .expect("absent name selection")
+            .is_empty()
+    );
+    assert!(
+        loaded
+            .repository_package_identity_evidence("main", "absent-0:1-1.noarch")
+            .is_err()
+    );
 
     let mut rejected = NativeContext::open(Architecture::Aarch64, || false).expect("rejected");
     assert!(

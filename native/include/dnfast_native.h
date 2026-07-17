@@ -134,6 +134,15 @@ typedef struct dnfast_inventory_record {
  */
 dnfast_limits dnfast_limits_default(void);
 void dnfast_release_unused_memory(void);
+/*
+ * Linux fs-verity helpers used by the immutable solv cache.  Enable returns
+ * 1 when verity is enabled (including an already-enabled file), 0 when the
+ * backing filesystem has no fs-verity support, and -1 on any other error.
+ * Measure returns 1 and a 32-byte SHA-256 fs-verity digest, 0 when verity is
+ * absent/unsupported, and -1 on error.
+ */
+int dnfast_fsverity_enable(int retained_fd);
+int dnfast_fsverity_measure(int retained_fd, uint8_t digest[32]);
 dnfast_status dnfast_context_open(const dnfast_limits *limits,
                                   const dnfast_callbacks *callbacks,
                                   dnfast_context **out_context,
@@ -157,7 +166,17 @@ dnfast_status dnfast_solver_write_repo_solv(
     const uint8_t *userdata, size_t userdata_size, dnfast_error *out_error);
 size_t dnfast_solver_repo_package_count(const dnfast_context *context,
                                         const char *repository_id);
+dnfast_status dnfast_solver_repo_package_find_identity(
+    dnfast_context *context, const char *repository_id, const char *identity,
+    size_t *ordinal, dnfast_error *out_error);
+dnfast_status dnfast_solver_repo_package_next_name(
+    dnfast_context *context, const char *repository_id, const char *name,
+    size_t start_ordinal, size_t *ordinal, uint8_t *found,
+    dnfast_error *out_error);
 dnfast_status dnfast_solver_repo_package_get(
+    dnfast_context *context, const char *repository_id, size_t ordinal,
+    dnfast_repo_package *package, dnfast_error *out_error);
+dnfast_status dnfast_solver_repo_package_catalog_get(
     dnfast_context *context, const char *repository_id, size_t ordinal,
     dnfast_repo_package *package, dnfast_error *out_error);
 dnfast_status dnfast_solver_repo_package_payload(

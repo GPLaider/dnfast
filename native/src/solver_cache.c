@@ -238,9 +238,112 @@ size_t dnfast_solver_repo_package_count(const dnfast_context *context,
 #endif
 }
 
-dnfast_status dnfast_solver_repo_package_get(
+#ifdef DNFAST_NATIVE_REAL
+static int package_identity_matches(Pool *pool, Solvable *item,
+                                    const char *identity) {
+    const char *name = pool_id2str(pool, item->name);
+    const char *evr = pool_id2str(pool, item->evr);
+    const char *arch = pool_id2str(pool, item->arch);
+    if (name == NULL || evr == NULL || arch == NULL || identity == NULL)
+        return 0;
+    size_t name_size = strlen(name);
+    size_t evr_size = strlen(evr);
+    size_t arch_size = strlen(arch);
+    size_t identity_size = strlen(identity);
+    size_t epoch_size = strchr(evr, ':') == NULL ? 2 : 0;
+    size_t expected_size = name_size;
+    if (expected_size > SIZE_MAX - evr_size) return 0;
+    expected_size += evr_size;
+    if (expected_size > SIZE_MAX - arch_size) return 0;
+    expected_size += arch_size;
+    if (expected_size > SIZE_MAX - epoch_size - 2) return 0;
+    expected_size += epoch_size + 2;
+    if (identity_size != expected_size)
+        return 0;
+    size_t offset = 0;
+    if (memcmp(identity + offset, name, name_size) != 0) return 0;
+    offset += name_size;
+    if (identity[offset++] != '-') return 0;
+    if (epoch_size != 0) {
+        if (memcmp(identity + offset, "0:", 2) != 0) return 0;
+        offset += 2;
+    }
+    if (memcmp(identity + offset, evr, evr_size) != 0) return 0;
+    offset += evr_size;
+    if (identity[offset++] != '.') return 0;
+    return memcmp(identity + offset, arch, arch_size) == 0;
+}
+#endif
+
+dnfast_status dnfast_solver_repo_package_find_identity(
+    dnfast_context *context, const char *repository_id, const char *identity,
+    size_t *ordinal, dnfast_error *error) {
+    dnfast_status status = owner_check(context, error);
+    if (status != DNFAST_STATUS_OK) return status;
+#ifdef DNFAST_NATIVE_REAL
+    Repo *repo = find_repo(context, repository_id);
+    if (repo == NULL || identity == NULL || ordinal == NULL)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "solver-cache", NULL,
+                                "package identity lookup is invalid");
+    for (Id id = repo->start; id < repo->end; ++id) {
+        Solvable *item = pool_id2solvable(context->pool, id);
+        if (package_identity_matches(context->pool, item, identity)) {
+            *ordinal = (size_t)(id - repo->start);
+            return DNFAST_STATUS_OK;
+        }
+    }
+    return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                            "solver-cache", "package_identity",
+                            "package identity is absent from repository");
+#else
+    (void)repository_id; (void)identity; (void)ordinal;
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "solv", "package_identity",
+                            "real native build disabled");
+#endif
+}
+
+dnfast_status dnfast_solver_repo_package_next_name(
+    dnfast_context *context, const char *repository_id, const char *name,
+    size_t start_ordinal, size_t *ordinal, uint8_t *found,
+    dnfast_error *error) {
+    dnfast_status status = owner_check(context, error);
+    if (status != DNFAST_STATUS_OK) return status;
+#ifdef DNFAST_NATIVE_REAL
+    Repo *repo = find_repo(context, repository_id);
+    size_t count = repo == NULL ? 0 : (size_t)(repo->end - repo->start);
+    if (repo == NULL || name == NULL || ordinal == NULL || found == NULL ||
+        start_ordinal > count)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "solver-cache", NULL,
+                                "package name lookup is invalid");
+    for (size_t index = start_ordinal; index < count; ++index) {
+        Solvable *item = pool_id2solvable(context->pool,
+                                         repo->start + (Id)index);
+        const char *candidate = pool_id2str(context->pool, item->name);
+        if (candidate != NULL && strcmp(candidate, name) == 0) {
+            *ordinal = index;
+            *found = 1;
+            return DNFAST_STATUS_OK;
+        }
+    }
+    *ordinal = 0;
+    *found = 0;
+    return DNFAST_STATUS_OK;
+#else
+    (void)repository_id; (void)name; (void)start_ordinal;
+    (void)ordinal; (void)found;
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "solv", "package_name",
+                            "real native build disabled");
+#endif
+}
+
+static dnfast_status repo_package_get(
     dnfast_context *context, const char *repository_id, size_t ordinal,
-    dnfast_repo_package *package, dnfast_error *error) {
+    dnfast_repo_package *package, uint8_t include_relations,
+    dnfast_error *error) {
     dnfast_status status = owner_check(context, error);
     if (status != DNFAST_STATUS_OK) return status;
     if (package == NULL)
@@ -279,12 +382,13 @@ dnfast_status dnfast_solver_repo_package_get(
     package->installed_size = solvable_lookup_num(item, SOLVABLE_INSTALLSIZE, 0);
     package->checksum_size = strlen(checksum);
     package->location_size = strlen(location);
-    for (uint8_t kind = 0; kind < 4; ++kind)
-        if (!relation_stats(item, kind, &package->relation_counts[kind],
-                            &package->relation_bytes[kind]))
-            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
-                                    "solver-cache", "pool_dep2str",
-                                    "relation evidence is incomplete");
+    if (include_relations)
+        for (uint8_t kind = 0; kind < 4; ++kind)
+            if (!relation_stats(item, kind, &package->relation_counts[kind],
+                                &package->relation_bytes[kind]))
+                return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                        "solver-cache", "pool_dep2str",
+                                        "relation evidence is incomplete");
     return DNFAST_STATUS_OK;
 #else
     (void)repository_id; (void)ordinal; (void)package;
@@ -292,6 +396,18 @@ dnfast_status dnfast_solver_repo_package_get(
                             "solv", "repository_package",
                             "real native build disabled");
 #endif
+}
+
+dnfast_status dnfast_solver_repo_package_get(
+    dnfast_context *context, const char *repository_id, size_t ordinal,
+    dnfast_repo_package *package, dnfast_error *error) {
+    return repo_package_get(context, repository_id, ordinal, package, 1, error);
+}
+
+dnfast_status dnfast_solver_repo_package_catalog_get(
+    dnfast_context *context, const char *repository_id, size_t ordinal,
+    dnfast_repo_package *package, dnfast_error *error) {
+    return repo_package_get(context, repository_id, ordinal, package, 0, error);
 }
 
 dnfast_status dnfast_solver_repo_package_payload(

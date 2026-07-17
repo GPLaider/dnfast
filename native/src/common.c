@@ -14,6 +14,9 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <linux/fsverity.h>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -51,6 +54,51 @@ void dnfast_release_unused_memory(void) {
 #ifdef __GLIBC__
     (void)malloc_trim(0);
 #endif
+}
+
+int dnfast_fsverity_enable(int retained_fd) {
+    struct fsverity_enable_arg argument;
+    if (retained_fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    memset(&argument, 0, sizeof(argument));
+    argument.version = 1;
+    argument.hash_algorithm = FS_VERITY_HASH_ALG_SHA256;
+    if (ioctl(retained_fd, FS_IOC_ENABLE_VERITY, &argument) == 0 ||
+        errno == EEXIST)
+        return 1;
+    if (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOTTY ||
+        errno == ENOSYS)
+        return 0;
+    return -1;
+}
+
+int dnfast_fsverity_measure(int retained_fd, uint8_t digest[32]) {
+    struct {
+        struct fsverity_digest header;
+        uint8_t bytes[32];
+    } measurement;
+    if (retained_fd < 0 || digest == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&measurement, 0, sizeof(measurement));
+    measurement.header.digest_algorithm = FS_VERITY_HASH_ALG_SHA256;
+    measurement.header.digest_size = sizeof(measurement.bytes);
+    if (ioctl(retained_fd, FS_IOC_MEASURE_VERITY, &measurement) == 0) {
+        if (measurement.header.digest_algorithm != FS_VERITY_HASH_ALG_SHA256 ||
+            measurement.header.digest_size != sizeof(measurement.bytes)) {
+            errno = EPROTO;
+            return -1;
+        }
+        memcpy(digest, measurement.bytes, sizeof(measurement.bytes));
+        return 1;
+    }
+    if (errno == ENODATA || errno == EOPNOTSUPP || errno == ENOTTY ||
+        errno == ENOSYS)
+        return 0;
+    return -1;
 }
 
 dnfast_status dnfast_set_error(dnfast_error *error, dnfast_status status,

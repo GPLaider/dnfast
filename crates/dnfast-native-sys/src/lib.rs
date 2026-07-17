@@ -113,6 +113,8 @@ pub(crate) struct RawError {
 unsafe extern "C" {
     fn dnfast_limits_default() -> RawLimits;
     fn dnfast_release_unused_memory();
+    fn dnfast_fsverity_enable(retained_fd: i32) -> i32;
+    fn dnfast_fsverity_measure(retained_fd: i32, digest: *mut u8) -> i32;
     fn dnfast_context_open(
         limits: *const RawLimits,
         callbacks: *const RawCallbacks,
@@ -151,7 +153,30 @@ unsafe extern "C" {
         context: *const RawContext,
         repository_id: *const c_char,
     ) -> usize;
+    fn dnfast_solver_repo_package_find_identity(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        identity: *const c_char,
+        ordinal: *mut usize,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_repo_package_next_name(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        name: *const c_char,
+        start_ordinal: usize,
+        ordinal: *mut usize,
+        found: *mut u8,
+        error: *mut RawError,
+    ) -> i32;
     fn dnfast_solver_repo_package_get(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        ordinal: usize,
+        package: *mut RawRepoPackage,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_repo_package_catalog_get(
         context: *mut RawContext,
         repository_id: *const c_char,
         ordinal: usize,
@@ -226,6 +251,32 @@ pub fn release_unused_memory() {
     // SAFETY: the native function has no arguments and only asks the process
     // allocator to return currently unused pages to the operating system.
     unsafe { dnfast_release_unused_memory() };
+}
+
+/// Enables Linux fs-verity on an immutable regular file when the backing
+/// filesystem supports it.  `Ok(false)` is the explicit unsupported result;
+/// every other kernel failure is preserved instead of silently weakening
+/// cache verification.
+pub fn enable_fsverity(file: &std::fs::File) -> std::io::Result<bool> {
+    // SAFETY: the descriptor is live for the synchronous ioctl and the native
+    // helper retains neither the descriptor nor any pointer.
+    match unsafe { dnfast_fsverity_enable(file.as_raw_fd()) } {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Measures the kernel-authenticated SHA-256 fs-verity file digest.
+pub fn measure_fsverity(file: &std::fs::File) -> std::io::Result<Option<[u8; 32]>> {
+    let mut digest = [0_u8; 32];
+    // SAFETY: the descriptor and exact-size output buffer are live for the
+    // synchronous ioctl and the native helper retains neither.
+    match unsafe { dnfast_fsverity_measure(file.as_raw_fd(), digest.as_mut_ptr()) } {
+        1 => Ok(Some(digest)),
+        0 => Ok(None),
+        _ => Err(std::io::Error::last_os_error()),
+    }
 }
 
 pub struct Context {
@@ -426,28 +477,132 @@ impl Context {
         &mut self,
         repository_id: &str,
     ) -> Result<Vec<RepositoryPackage>, NativeError> {
+        self.repository_packages_with_relations(repository_id, true)
+    }
+
+    pub fn repository_catalog(
+        &mut self,
+        repository_id: &str,
+    ) -> Result<Vec<RepositoryPackage>, NativeError> {
+        self.repository_packages_with_relations(repository_id, false)
+    }
+
+    fn repository_packages_with_relations(
+        &mut self,
+        repository_id: &str,
+        include_relations: bool,
+    ) -> Result<Vec<RepositoryPackage>, NativeError> {
         let id = c_string(repository_id)?;
         // SAFETY: the repository identifier and context are live and the
         // scalar count call does not mutate native storage.
         let count = unsafe { dnfast_solver_repo_package_count(self.raw.as_ptr(), id.as_ptr()) };
         let mut packages = Vec::with_capacity(count);
         for ordinal in 0..count {
-            let mut raw = RawRepoPackage {
-                name: std::ptr::null(),
-                arch: std::ptr::null(),
-                evr: std::ptr::null(),
-                vendor: std::ptr::null(),
-                package_size: 0,
-                installed_size: 0,
-                checksum_size: 0,
-                location_size: 0,
-                relation_counts: [0; 4],
-                relation_bytes: [0; 4],
-            };
+            packages.push(self.repository_package_at(&id, ordinal, include_relations)?);
+        }
+        Ok(packages)
+    }
+
+    pub fn repository_package_evidence(
+        &mut self,
+        repository_id: &str,
+        ordinal: usize,
+    ) -> Result<RepositoryPackage, NativeError> {
+        let id = c_string(repository_id)?;
+        self.repository_package_at(&id, ordinal, true)
+    }
+
+    pub fn repository_package_identity_evidence(
+        &mut self,
+        repository_id: &str,
+        identity: &str,
+    ) -> Result<RepositoryPackage, NativeError> {
+        let id = c_string(repository_id)?;
+        let identity = c_string(identity)?;
+        let mut ordinal = 0;
+        let mut error = empty_error();
+        // SAFETY: both C strings and the scalar output remain live for the
+        // synchronous repository scan; native storage owns all package text.
+        let status = unsafe {
+            dnfast_solver_repo_package_find_identity(
+                self.raw.as_ptr(),
+                id.as_ptr(),
+                identity.as_ptr(),
+                &mut ordinal,
+                &mut error,
+            )
+        };
+        if status != 0 {
+            return Err(status_error(status, &mut error));
+        }
+        self.repository_package_at(&id, ordinal, true)
+    }
+
+    pub fn repository_catalog_named(
+        &mut self,
+        repository_id: &str,
+        name: &str,
+    ) -> Result<Vec<RepositoryPackage>, NativeError> {
+        let id = c_string(repository_id)?;
+        let name = c_string(name)?;
+        let mut packages = Vec::new();
+        let mut start = 0;
+        loop {
+            let mut ordinal = 0;
+            let mut found = 0;
             let mut error = empty_error();
-            // SAFETY: ordinal is bounded by the native count; output is live
-            // and native strings remain pool-owned while the context lives.
+            // SAFETY: both C strings and scalar outputs remain live for the
+            // synchronous bounded scan, which does not retain pointers.
             let status = unsafe {
+                dnfast_solver_repo_package_next_name(
+                    self.raw.as_ptr(),
+                    id.as_ptr(),
+                    name.as_ptr(),
+                    start,
+                    &mut ordinal,
+                    &mut found,
+                    &mut error,
+                )
+            };
+            if status != 0 {
+                return Err(status_error(status, &mut error));
+            }
+            if found == 0 {
+                return Ok(packages);
+            }
+            packages.push(self.repository_package_at(&id, ordinal, false)?);
+            start = ordinal.checked_add(1).ok_or_else(|| NativeError {
+                status: 1,
+                component: "solver-cache".into(),
+                symbol: "package_name".into(),
+                message: "package ordinal overflow".into(),
+            })?;
+        }
+    }
+
+    fn repository_package_at(
+        &mut self,
+        id: &CString,
+        ordinal: usize,
+        include_relations: bool,
+    ) -> Result<RepositoryPackage, NativeError> {
+        let mut raw = RawRepoPackage {
+            name: std::ptr::null(),
+            arch: std::ptr::null(),
+            evr: std::ptr::null(),
+            vendor: std::ptr::null(),
+            package_size: 0,
+            installed_size: 0,
+            checksum_size: 0,
+            location_size: 0,
+            relation_counts: [0; 4],
+            relation_bytes: [0; 4],
+        };
+        let mut error = empty_error();
+        // SAFETY: the repository identifier is live; the native getter bounds
+        // checks the ordinal and keeps all returned text pool-owned.
+        let status = unsafe {
+            if include_relations {
                 dnfast_solver_repo_package_get(
                     self.raw.as_ptr(),
                     id.as_ptr(),
@@ -455,44 +610,54 @@ impl Context {
                     &mut raw,
                     &mut error,
                 )
-            };
-            if status != 0 {
-                return Err(status_error(status, &mut error));
-            }
-            let payload_size = raw
-                .checksum_size
-                .checked_add(raw.location_size)
-                .ok_or_else(|| invalid_repository_evidence("package_payload"))?;
-            let mut payload = vec![0_u8; payload_size];
-            let mut error = empty_error();
-            // SAFETY: the byte buffer is live with the exact size reported by
-            // the bounded package getter and context access is unique.
-            let status = unsafe {
-                dnfast_solver_repo_package_payload(
+            } else {
+                dnfast_solver_repo_package_catalog_get(
                     self.raw.as_ptr(),
                     id.as_ptr(),
                     ordinal,
-                    payload.as_mut_ptr(),
-                    payload.len(),
+                    &mut raw,
                     &mut error,
                 )
-            };
-            if status != 0 {
-                return Err(status_error(status, &mut error));
             }
-            let checksum_sha256 = std::str::from_utf8(&payload[..raw.checksum_size])
-                .map_err(|_| invalid_repository_evidence("package_checksum"))?
-                .to_owned();
-            let location = std::str::from_utf8(&payload[raw.checksum_size..])
-                .map_err(|_| invalid_repository_evidence("package_location"))?
-                .to_owned();
-            let mut relations: [Vec<String>; 4] =
-                std::array::from_fn(|kind| Vec::with_capacity(raw.relation_counts[kind]));
+        };
+        if status != 0 {
+            return Err(status_error(status, &mut error));
+        }
+        let payload_size = raw
+            .checksum_size
+            .checked_add(raw.location_size)
+            .ok_or_else(|| invalid_repository_evidence("package_payload"))?;
+        let mut payload = vec![0_u8; payload_size];
+        let mut error = empty_error();
+        // SAFETY: the exact-size byte buffer and repository identifier remain
+        // live for the synchronous bounded copy.
+        let status = unsafe {
+            dnfast_solver_repo_package_payload(
+                self.raw.as_ptr(),
+                id.as_ptr(),
+                ordinal,
+                payload.as_mut_ptr(),
+                payload.len(),
+                &mut error,
+            )
+        };
+        if status != 0 {
+            return Err(status_error(status, &mut error));
+        }
+        let checksum_sha256 = std::str::from_utf8(&payload[..raw.checksum_size])
+            .map_err(|_| invalid_repository_evidence("package_checksum"))?
+            .to_owned();
+        let location = std::str::from_utf8(&payload[raw.checksum_size..])
+            .map_err(|_| invalid_repository_evidence("package_location"))?
+            .to_owned();
+        let mut relations: [Vec<String>; 4] =
+            std::array::from_fn(|kind| Vec::with_capacity(raw.relation_counts[kind]));
+        if include_relations {
             for (kind, output) in relations.iter_mut().enumerate() {
                 let mut bytes = vec![0_u8; raw.relation_bytes[kind]];
                 let mut error = empty_error();
-                // SAFETY: the output byte buffer has the exact capacity
-                // reported for this package and remains live synchronously.
+                // SAFETY: the exact-size output buffer remains live for the
+                // synchronous bounded relation copy.
                 let status = unsafe {
                     dnfast_solver_repo_package_relations(
                         self.raw.as_ptr(),
@@ -525,22 +690,21 @@ impl Context {
                     return Err(invalid_repository_evidence("package_relation"));
                 }
             }
-            packages.push(RepositoryPackage {
-                name: copy_native_text(raw.name, "package_name")?,
-                arch: copy_native_text(raw.arch, "package_arch")?,
-                evr: copy_native_text(raw.evr, "package_evr")?,
-                vendor: copy_native_text(raw.vendor, "package_vendor")?,
-                checksum_sha256,
-                location,
-                package_size: raw.package_size,
-                installed_size: raw.installed_size,
-                requires: std::mem::take(&mut relations[0]),
-                recommends: std::mem::take(&mut relations[1]),
-                supplements: std::mem::take(&mut relations[2]),
-                enhances: std::mem::take(&mut relations[3]),
-            });
         }
-        Ok(packages)
+        Ok(RepositoryPackage {
+            name: copy_native_text(raw.name, "package_name")?,
+            arch: copy_native_text(raw.arch, "package_arch")?,
+            evr: copy_native_text(raw.evr, "package_evr")?,
+            vendor: copy_native_text(raw.vendor, "package_vendor")?,
+            checksum_sha256,
+            location,
+            package_size: raw.package_size,
+            installed_size: raw.installed_size,
+            requires: std::mem::take(&mut relations[0]),
+            recommends: std::mem::take(&mut relations[1]),
+            supplements: std::mem::take(&mut relations[2]),
+            enhances: std::mem::take(&mut relations[3]),
+        })
     }
 
     pub fn has_provider(&self, capability: &str) -> Result<bool, NativeError> {

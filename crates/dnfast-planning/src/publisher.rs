@@ -322,6 +322,93 @@ impl RootPlanningPublisher {
         Ok(())
     }
 
+    /// Revalidates every live authority that can change the meaning or trust
+    /// of an already root-published snapshot without reparsing the immutable
+    /// multi-hundred-megabyte metadata generation.
+    ///
+    /// Metadata bytes are content-addressed below the root-owned planning
+    /// store and are checked when loaded into the solver.  This gate therefore
+    /// checks the current snapshot pointer, repository configuration, solver
+    /// policy, host architecture, and live key-bundle bytes.  It is suitable
+    /// for the final pre-transaction gate; publication and refresh retain the
+    /// full cache-generation reconstruction above.
+    pub fn revalidate_runtime_bindings(
+        &self,
+        snapshot: &PlanningSnapshot,
+    ) -> Result<(), PlanningError> {
+        self.require_publisher()?;
+        let profile = load_system_mutation_profile()
+            .map_err(|error| PlanningError::Input(error.to_string()))?;
+        if snapshot.payload().configuration != normalized_configuration(&profile)? {
+            return Err(PlanningError::Input(
+                "root repository configuration changed after publication".into(),
+            ));
+        }
+        let mut enabled = profile
+            .repositories
+            .iter()
+            .filter(|repository| repository.enabled)
+            .collect::<Vec<_>>();
+        enabled.sort_by(|left, right| left.id.cmp(&right.id));
+        let preferences = enabled
+            .iter()
+            .map(|repository| {
+                RepoPreference::new(
+                    &repository.id,
+                    u32::from(repository.priority),
+                    repository.cost,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(domain)?;
+        let expected_policy = policy_for(host_rpm_architecture()?, &profile, preferences)?;
+        if snapshot.payload().policy.solver != expected_policy
+            || snapshot.payload().policy.included_packages != profile.main.includepkgs
+            || snapshot.payload().policy.installonly_limit != profile.main.installonly_limit
+        {
+            return Err(PlanningError::Input(
+                "root solver policy changed after publication".into(),
+            ));
+        }
+        for repository in enabled {
+            if !repository.sslverify
+                || !repository.gpgcheck
+                || !repository.pkg_gpgcheck
+                || repository.allowed_fingerprints.is_empty()
+                || repository.gpgkey.is_empty()
+            {
+                return Err(PlanningError::Input(
+                    "repository trust policy changed after publication".into(),
+                ));
+            }
+            let paths = repository
+                .gpgkey
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let bundle = key_bundle_digest(&repository.id, &paths)
+                .map_err(|error| PlanningError::Input(error.to_string()))?;
+            let published = snapshot
+                .payload()
+                .allowed_repositories
+                .iter()
+                .find(|published| published.id == repository.id)
+                .ok_or_else(|| {
+                    PlanningError::Input(
+                        "enabled repository disappeared from published snapshot".into(),
+                    )
+                })?;
+            if repository.key_bundle_digest != Some(bundle.digest)
+                || encode(bundle.digest) != published.trust.key_bundle_sha256().as_str()
+            {
+                return Err(PlanningError::Input(
+                    "repository key bundle changed after publication".into(),
+                ));
+            }
+        }
+        require_current_snapshot(snapshot, &self.open_snapshot()?)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(roots: PlanningRoots) -> Self {
         Self {
@@ -375,6 +462,10 @@ impl PlanningSnapshot {
 
     pub fn revalidate_system_state(&self) -> Result<(), PlanningError> {
         RootPlanningPublisher::system()?.revalidate_snapshot(self)
+    }
+
+    pub fn revalidate_runtime_bindings(&self) -> Result<(), PlanningError> {
+        RootPlanningPublisher::system()?.revalidate_runtime_bindings(self)
     }
 }
 

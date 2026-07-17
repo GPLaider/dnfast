@@ -5,13 +5,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rustix::fs::{AtFlags, Mode, OFlags, fstat, fsync, linkat, open, openat};
+use rustix::fs::{
+    AtFlags, IFlags, Mode, OFlags, fstat, fstatfs, fsync, ioctl_getflags, linkat, open, openat,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{CacheError, fs_safety::create_private_tree, model::io_error};
 
 const CACHE_DIRECTORY: &str = "solv-v1";
 const MAX_SOLV_BYTES: u64 = 512 * 1024 * 1024;
+const INTEGRITY_COOKIE_VERSION: &str = "dnfast-solv-integrity-v2";
+const MAX_INTEGRITY_COOKIE_BYTES: u64 = 512;
+const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 
 #[derive(Debug)]
 pub struct SolvCache {
@@ -22,6 +27,14 @@ pub struct CachedSolv {
     file: File,
     sha256: String,
     size: u64,
+    verification: SolvVerification,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SolvVerification {
+    FullSha256,
+    FsVerity,
+    BtrfsChecksum,
 }
 
 pub struct StagedSolv {
@@ -78,6 +91,10 @@ impl CachedSolv {
     pub const fn size(&self) -> u64 {
         self.size
     }
+
+    pub const fn verification(&self) -> SolvVerification {
+        self.verification
+    }
 }
 
 impl StagedSolv {
@@ -99,7 +116,10 @@ impl StagedSolv {
             Ok(()) | Err(rustix::io::Errno::EXIST) => {}
             Err(error) => return Err(errno(error)),
         }
-        let existing = open_content(&self.directory, &content_name, &sha256)?;
+        // Enabling fs-verity requires that no writable descriptor remains open.
+        // The linked inode is durable and can now be reopened read-only below.
+        drop(self.file);
+        let existing = open_content(&self.directory, &self.binding, &content_name, &sha256)?;
         if existing.size != size {
             return Err(CacheError::Corrupt(
                 "published solv cache size differs".into(),
@@ -186,11 +206,17 @@ fn open_cached(directory: &OwnedFd, binding: &str) -> Result<Option<CachedSolv>,
         None => return Ok(None),
     };
     let content_name = format!("{binding}-{sha256}.solv");
-    Ok(Some(open_content(directory, &content_name, &sha256)?))
+    Ok(Some(open_content(
+        directory,
+        binding,
+        &content_name,
+        &sha256,
+    )?))
 }
 
 fn open_content(
     directory: &OwnedFd,
+    binding: &str,
     name: &str,
     expected_sha256: &str,
 ) -> Result<CachedSolv, CacheError> {
@@ -204,17 +230,327 @@ fn open_content(
     validate_regular(&fd)?;
     let before = fstat(&fd).map_err(errno)?;
     let mut file = File::from(fd);
-    let (sha256, size) = verify_stream(&mut file, Some(expected_sha256))?;
+    let cookie_name = format!("{binding}-{expected_sha256}.integrity");
+    let cookie = read_integrity_cookie_if_present(directory, &cookie_name)?;
+    let (sha256, size, verification) = if let Some(cookie) = cookie {
+        if cookie.binding != binding
+            || cookie.sha256 != expected_sha256
+            || cookie.size != before.st_size as u64
+            || cookie.generation != FileGeneration::from_stat(&before)
+        {
+            return Err(CacheError::Corrupt(
+                "solv cache integrity cookie differs from file generation".into(),
+            ));
+        }
+        let verification = match cookie.protection {
+            IntegrityProtection::FsVerity(expected) => {
+                let measured = dnfast_native_sys::measure_fsverity(&file)
+                    .map_err(io_error)?
+                    .ok_or_else(|| {
+                        CacheError::Corrupt("solv cache verity protection disappeared".into())
+                    })?;
+                if measured != expected {
+                    return Err(CacheError::Corrupt(
+                        "solv cache verity digest differs".into(),
+                    ));
+                }
+                SolvVerification::FsVerity
+            }
+            IntegrityProtection::BtrfsChecksum => {
+                if !has_btrfs_checksums(&file)? {
+                    return Err(CacheError::Corrupt(
+                        "solv cache Btrfs checksum protection disappeared".into(),
+                    ));
+                }
+                SolvVerification::BtrfsChecksum
+            }
+        };
+        file.rewind().map_err(io_error)?;
+        (
+            expected_sha256.to_owned(),
+            before.st_size as u64,
+            verification,
+        )
+    } else {
+        let (sha256, size) = verify_stream(&mut file, Some(expected_sha256))?;
+        let protection = if dnfast_native_sys::enable_fsverity(&file).map_err(io_error)? {
+            Some(IntegrityProtection::FsVerity(
+                dnfast_native_sys::measure_fsverity(&file)
+                    .map_err(io_error)?
+                    .ok_or_else(|| {
+                        CacheError::Corrupt("enabled solv cache verity cannot be measured".into())
+                    })?,
+            ))
+        } else if has_btrfs_checksums(&file)? {
+            Some(IntegrityProtection::BtrfsChecksum)
+        } else {
+            None
+        };
+        let verification = if let Some(protection) = protection {
+            let after_hash = fstat(&file).map_err(errno)?;
+            if !same_file_generation(&before, &after_hash) {
+                return Err(CacheError::Corrupt(
+                    "solv cache changed before integrity cookie publication".into(),
+                ));
+            }
+            publish_integrity_cookie(
+                directory,
+                &cookie_name,
+                &IntegrityCookie {
+                    binding: binding.to_owned(),
+                    sha256: sha256.clone(),
+                    size,
+                    generation: FileGeneration::from_stat(&after_hash),
+                    protection,
+                },
+            )?;
+            match protection {
+                IntegrityProtection::FsVerity(_) => SolvVerification::FsVerity,
+                IntegrityProtection::BtrfsChecksum => SolvVerification::BtrfsChecksum,
+            }
+        } else {
+            SolvVerification::FullSha256
+        };
+        (sha256, size, verification)
+    };
     let after = fstat(&file).map_err(errno)?;
-    if before.st_dev != after.st_dev
-        || before.st_ino != after.st_ino
-        || before.st_size != after.st_size
-    {
+    if !same_file_generation(&before, &after) {
         return Err(CacheError::Corrupt(
-            "solv cache changed while hashing".into(),
+            "solv cache changed while being verified".into(),
         ));
     }
-    Ok(CachedSolv { file, sha256, size })
+    Ok(CachedSolv {
+        file,
+        sha256,
+        size,
+        verification,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileGeneration {
+    device: u64,
+    inode: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl FileGeneration {
+    fn from_stat(value: &rustix::fs::Stat) -> Self {
+        Self {
+            device: value.st_dev,
+            inode: value.st_ino,
+            mtime: value.st_mtime,
+            mtime_nsec: value.st_mtime_nsec as i64,
+            ctime: value.st_ctime,
+            ctime_nsec: value.st_ctime_nsec as i64,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntegrityProtection {
+    FsVerity([u8; 32]),
+    BtrfsChecksum,
+}
+
+struct IntegrityCookie {
+    binding: String,
+    sha256: String,
+    size: u64,
+    generation: FileGeneration,
+    protection: IntegrityProtection,
+}
+
+fn publish_integrity_cookie(
+    directory: &OwnedFd,
+    name: &str,
+    cookie: &IntegrityCookie,
+) -> Result<(), CacheError> {
+    let (protection, digest) = match cookie.protection {
+        IntegrityProtection::FsVerity(digest) => ("fsverity-sha256", hex::encode(digest)),
+        IntegrityProtection::BtrfsChecksum => ("btrfs-checksum", "-".into()),
+    };
+    let value = format!(
+        "{INTEGRITY_COOKIE_VERSION} {protection} {} {} {} {} {} {} {} {} {} {digest}\n",
+        cookie.binding,
+        cookie.sha256,
+        cookie.size,
+        cookie.generation.device,
+        cookie.generation.inode,
+        cookie.generation.mtime,
+        cookie.generation.mtime_nsec,
+        cookie.generation.ctime,
+        cookie.generation.ctime_nsec,
+    );
+    if value.len() as u64 > MAX_INTEGRITY_COOKIE_BYTES {
+        return Err(CacheError::Corrupt(
+            "solv cache integrity cookie exceeds limit".into(),
+        ));
+    }
+    let mut file = File::from(
+        openat(
+            directory,
+            ".",
+            OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(errno)?,
+    );
+    file.write_all(value.as_bytes()).map_err(io_error)?;
+    file.sync_all().map_err(io_error)?;
+    match linkat(&file, "", directory, name, AtFlags::EMPTY_PATH) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {
+            let existing = read_integrity_cookie(directory, name)?;
+            if existing.binding != cookie.binding
+                || existing.sha256 != cookie.sha256
+                || existing.size != cookie.size
+                || existing.generation != cookie.generation
+                || existing.protection != cookie.protection
+            {
+                return Err(CacheError::Corrupt(
+                    "solv cache integrity cookie is nondeterministic".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(errno(error)),
+    }
+    fsync(directory).map_err(errno)
+}
+
+fn read_integrity_cookie(directory: &OwnedFd, name: &str) -> Result<IntegrityCookie, CacheError> {
+    read_integrity_cookie_if_present(directory, name)?
+        .ok_or_else(|| CacheError::Corrupt("solv cache integrity cookie disappeared".into()))
+}
+
+fn read_integrity_cookie_if_present(
+    directory: &OwnedFd,
+    name: &str,
+) -> Result<Option<IntegrityCookie>, CacheError> {
+    let fd = match openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(errno(error)),
+    };
+    validate_regular(&fd)?;
+    let before = fstat(&fd).map_err(errno)?;
+    if before.st_size as u64 > MAX_INTEGRITY_COOKIE_BYTES {
+        return Err(CacheError::Corrupt(
+            "solv cache integrity cookie exceeds limit".into(),
+        ));
+    }
+    let mut file = File::from(fd);
+    let mut value = String::new();
+    Read::by_ref(&mut file)
+        .take(MAX_INTEGRITY_COOKIE_BYTES + 1)
+        .read_to_string(&mut value)
+        .map_err(io_error)?;
+    let after = fstat(&file).map_err(errno)?;
+    if !same_file_generation(&before, &after) || value.len() as i64 != before.st_size {
+        return Err(CacheError::Corrupt(
+            "solv cache integrity cookie changed while reading".into(),
+        ));
+    }
+    let mut fields = value.split_whitespace();
+    if fields.next() != Some(INTEGRITY_COOKIE_VERSION) {
+        return Err(CacheError::Corrupt(
+            "solv cache integrity cookie version differs".into(),
+        ));
+    }
+    let protection = fields
+        .next()
+        .ok_or_else(|| CacheError::Corrupt("solv cache protection is absent".into()))?;
+    let binding = fields
+        .next()
+        .ok_or_else(|| CacheError::Corrupt("solv cache integrity binding is absent".into()))?;
+    let sha256 = fields
+        .next()
+        .ok_or_else(|| CacheError::Corrupt("solv cache integrity content is absent".into()))?;
+    validate_digest(binding, "solv cache integrity binding")?;
+    validate_digest(sha256, "solv cache integrity content")?;
+    let size = fields
+        .next()
+        .and_then(|field| field.parse::<u64>().ok())
+        .filter(|size| *size > 0 && *size <= MAX_SOLV_BYTES)
+        .ok_or_else(|| CacheError::Corrupt("solv cache integrity size is invalid".into()))?;
+    let generation = FileGeneration {
+        device: parse_cookie_field(&mut fields, "device")?,
+        inode: parse_cookie_field(&mut fields, "inode")?,
+        mtime: parse_cookie_field(&mut fields, "mtime")?,
+        mtime_nsec: parse_cookie_field(&mut fields, "mtime_nsec")?,
+        ctime: parse_cookie_field(&mut fields, "ctime")?,
+        ctime_nsec: parse_cookie_field(&mut fields, "ctime_nsec")?,
+    };
+    let digest = fields
+        .next()
+        .ok_or_else(|| CacheError::Corrupt("solv cache protection digest is absent".into()))?;
+    if fields.next().is_some() || !value.ends_with('\n') {
+        return Err(CacheError::Corrupt(
+            "solv cache integrity cookie has trailing data".into(),
+        ));
+    }
+    let protection = match protection {
+        "fsverity-sha256" => {
+            validate_digest(digest, "solv cache verity digest")?;
+            let bytes = hex::decode(digest)
+                .map_err(|_| CacheError::Corrupt("solv cache verity digest is invalid".into()))?;
+            IntegrityProtection::FsVerity(
+                bytes.try_into().map_err(|_| {
+                    CacheError::Corrupt("solv cache verity digest size differs".into())
+                })?,
+            )
+        }
+        "btrfs-checksum" if digest == "-" => IntegrityProtection::BtrfsChecksum,
+        _ => {
+            return Err(CacheError::Corrupt(
+                "solv cache integrity protection is invalid".into(),
+            ));
+        }
+    };
+    Ok(Some(IntegrityCookie {
+        binding: binding.to_owned(),
+        sha256: sha256.to_owned(),
+        size,
+        generation,
+        protection,
+    }))
+}
+
+fn parse_cookie_field<T: std::str::FromStr>(
+    fields: &mut std::str::SplitWhitespace<'_>,
+    name: &str,
+) -> Result<T, CacheError> {
+    fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| CacheError::Corrupt(format!("solv cache {name} is invalid")))
+}
+
+fn has_btrfs_checksums(file: &File) -> Result<bool, CacheError> {
+    let filesystem = fstatfs(file).map_err(errno)?;
+    if filesystem.f_type as u64 != BTRFS_SUPER_MAGIC {
+        return Ok(false);
+    }
+    let flags = ioctl_getflags(file).map_err(errno)?;
+    Ok(!flags.contains(IFlags::NOCOW))
+}
+
+fn same_file_generation(before: &rustix::fs::Stat, after: &rustix::fs::Stat) -> bool {
+    before.st_dev == after.st_dev
+        && before.st_ino == after.st_ino
+        && before.st_size == after.st_size
+        && before.st_mtime == after.st_mtime
+        && before.st_mtime_nsec == after.st_mtime_nsec
+        && before.st_ctime == after.st_ctime
+        && before.st_ctime_nsec == after.st_ctime_nsec
 }
 
 fn read_reference(directory: &OwnedFd, name: &str) -> Result<String, CacheError> {
@@ -335,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_round_trip_revalidates_content_digest() {
+    fn cache_round_trip_uses_fail_closed_verification() {
         let root = tempfile::tempdir().expect("cache root");
         let cache = SolvCache::new(root.path());
         let staged = cache.stage(&binding()).expect("stage");
@@ -367,8 +703,27 @@ mod tests {
             .path()
             .join("solv-v1")
             .join(format!("{}-{digest}.solv", binding()));
-        std::fs::write(path, b"evil payload").expect("tamper");
+        std::fs::remove_file(&path).expect("remove immutable cache entry");
+        std::fs::write(path, b"evil payload").expect("replace cache entry");
         assert!(cache.open(&binding()).is_err());
+    }
+
+    #[test]
+    fn cache_rejects_integrity_cookie_tampering_when_supported() {
+        let root = tempfile::tempdir().expect("cache root");
+        let cache = SolvCache::new(root.path());
+        let staged = cache.stage(&binding()).expect("stage");
+        staged.file().write_all(b"solv payload").expect("write");
+        let digest = staged.commit().expect("commit").sha256().to_owned();
+        let path = root
+            .path()
+            .join("solv-v1")
+            .join(format!("{}-{digest}.integrity", binding()));
+        if path.exists() {
+            std::fs::remove_file(&path).expect("remove integrity cookie");
+            std::fs::write(&path, b"corrupt\n").expect("replace integrity cookie");
+            assert!(cache.open(&binding()).is_err());
+        }
     }
 
     #[test]
