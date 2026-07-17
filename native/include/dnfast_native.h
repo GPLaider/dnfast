@@ -74,6 +74,19 @@ typedef struct dnfast_repo_input {
     uint8_t installed;
 } dnfast_repo_input;
 
+typedef struct dnfast_repo_package {
+    const char *name;
+    const char *arch;
+    const char *evr;
+    const char *vendor;
+    uint64_t package_size;
+    uint64_t installed_size;
+    size_t checksum_size;
+    size_t location_size;
+    size_t relation_counts[4];
+    size_t relation_bytes[4];
+} dnfast_repo_package;
+
 typedef struct dnfast_solve_request {
     uint32_t abi_version;
     const char *const *names;
@@ -135,6 +148,27 @@ dnfast_status dnfast_solver_add_repo(dnfast_context *context,
 dnfast_status dnfast_solver_add_repo_primary(dnfast_context *context,
                                              const dnfast_repo_input *input,
                                              dnfast_error *out_error);
+dnfast_status dnfast_solver_add_repo_solv(
+    dnfast_context *context, const dnfast_repo_input *input, int retained_fd,
+    const uint8_t *expected_userdata, size_t expected_userdata_size,
+    dnfast_error *out_error);
+dnfast_status dnfast_solver_write_repo_solv(
+    dnfast_context *context, const char *repository_id, int retained_fd,
+    const uint8_t *userdata, size_t userdata_size, dnfast_error *out_error);
+size_t dnfast_solver_repo_package_count(const dnfast_context *context,
+                                        const char *repository_id);
+dnfast_status dnfast_solver_repo_package_get(
+    dnfast_context *context, const char *repository_id, size_t ordinal,
+    dnfast_repo_package *package, dnfast_error *out_error);
+dnfast_status dnfast_solver_repo_package_payload(
+    dnfast_context *context, const char *repository_id, size_t ordinal,
+    uint8_t *payload, size_t payload_size, dnfast_error *out_error);
+dnfast_status dnfast_solver_repo_package_relations(
+    dnfast_context *context, const char *repository_id, size_t ordinal,
+    uint8_t kind, uint8_t *relations, size_t relation_size,
+    dnfast_error *out_error);
+uint8_t dnfast_solver_has_provider(const dnfast_context *context,
+                                   const char *capability);
 dnfast_status dnfast_solver_add_rpmdb(dnfast_context *context,
                                       const char *root,
                                       dnfast_error *out_error);

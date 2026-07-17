@@ -4,6 +4,7 @@ fn main() {
     for file in [
         "common.c",
         "solver.c",
+        "solver_cache.c",
         "solver_state.c",
         "decisions.c",
         "actions.c",
@@ -58,6 +59,7 @@ fn main() {
         .files([
             "../../native/src/common.c",
             "../../native/src/solver.c",
+            "../../native/src/solver_cache.c",
             "../../native/src/solver_state.c",
             "../../native/src/decisions.c",
             "../../native/src/actions.c",

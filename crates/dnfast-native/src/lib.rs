@@ -57,6 +57,22 @@ pub struct Repository {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RepositoryPackage {
+    pub name: String,
+    pub arch: String,
+    pub evr: String,
+    pub vendor: String,
+    pub checksum_sha256: String,
+    pub location: String,
+    pub package_size: u64,
+    pub installed_size: u64,
+    pub requires: Vec<String>,
+    pub recommends: Vec<String>,
+    pub supplements: Vec<String>,
+    pub enhances: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SolveResult {
     pub actions: Vec<String>,
     pub repositories: Vec<String>,
@@ -177,6 +193,64 @@ impl NativeContext {
                 priority: repository.priority,
                 cost: repository.cost,
             })
+            .map_err(NativeError::from)
+    }
+
+    pub fn add_repository_solv(
+        &mut self,
+        repository_id: &str,
+        priority: i32,
+        cost: i32,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        self.inner
+            .add_repo_solv(repository_id, priority, cost, file, userdata)
+            .map_err(NativeError::from)
+    }
+
+    pub fn write_repository_solv(
+        &mut self,
+        repository_id: &str,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        self.inner
+            .write_repo_solv(repository_id, file, userdata)
+            .map_err(NativeError::from)
+    }
+
+    pub fn repository_packages(
+        &mut self,
+        repository_id: &str,
+    ) -> Result<Vec<RepositoryPackage>, NativeError> {
+        self.inner
+            .repository_packages(repository_id)
+            .map(|packages| {
+                packages
+                    .into_iter()
+                    .map(|package| RepositoryPackage {
+                        name: package.name,
+                        arch: package.arch,
+                        evr: package.evr,
+                        vendor: package.vendor,
+                        checksum_sha256: package.checksum_sha256,
+                        location: package.location,
+                        package_size: package.package_size,
+                        installed_size: package.installed_size,
+                        requires: package.requires,
+                        recommends: package.recommends,
+                        supplements: package.supplements,
+                        enhances: package.enhances,
+                    })
+                    .collect()
+            })
+            .map_err(NativeError::from)
+    }
+
+    pub fn has_provider(&self, capability: &str) -> Result<bool, NativeError> {
+        self.inner
+            .has_provider(capability)
             .map_err(NativeError::from)
     }
 

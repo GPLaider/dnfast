@@ -12,7 +12,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dnfast_cache::{
-    ArtifactCache, ArtifactSpec, Digest as ArtifactDigest, HttpArtifactTransport,
+    ArtifactCache, ArtifactSpec, Digest as ArtifactDigest, HttpArtifactTransport, SolvCache,
     TransactionRequest,
 };
 use dnfast_core::{
@@ -25,7 +25,8 @@ use dnfast_native::{
 };
 use dnfast_planning::{PlanningRepository, PlanningSnapshot, SYSTEM_CACHE_PATH};
 use dnfast_solver::{
-    CandidatePackage, CanonicalSolverPlan, NativePackageEvidence, NativeSolveOutput, PlanBuilder,
+    CandidatePackage, CanonicalSolverPlan, NativePackageEvidence, NativePackageEvidenceParts,
+    NativeSolveOutput, PlanBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -42,7 +43,7 @@ const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 const PLAN_LIFETIME_SECONDS: u64 = 300;
 const PROTOCOL_SCHEMA: &str = "dnfast.daemon.v1";
 type MaterializedPaths = (String, String, String);
-type MaterializedRepository = (MaterializedPaths, Vec<dnfast_metadata::CompletePackage>);
+type MaterializedRepository = MaterializedPaths;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonApproval {
@@ -680,7 +681,6 @@ struct ResidentPool {
     rpmdb_cookie: String,
     candidates: Vec<CandidatePackage>,
     metadata: Vec<(String, NativePackageEvidence)>,
-    primary_paths: Vec<String>,
     primary_identities: Vec<(String, Vec<String>)>,
     last_solve: Option<CachedResidentSolve>,
 }
@@ -729,14 +729,23 @@ impl ResidentPlanner {
         }
         self.ensure(repositories)?;
         let cached = self.cached.as_ref().expect("resident pool");
-        Ok(
-            paths_require_full_filelists(packages, &cached.primary_paths)
-                && (action != Action::Install
-                    || cached
-                        .repositories
-                        .iter()
-                        .any(|repository| repository.file_provides.is_none())),
-        )
+        let missing_from_primary = packages.iter().try_fold(false, |missing, selector| {
+            if missing || !selector.starts_with('/') {
+                Ok(missing)
+            } else {
+                cached
+                    .context
+                    .has_provider(selector)
+                    .map(|provided| !provided)
+                    .map_err(planning)
+            }
+        })?;
+        Ok(missing_from_primary
+            && (action != Action::Install
+                || cached
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.file_provides.is_none())))
     }
 
     fn solve(
@@ -958,8 +967,11 @@ fn build_pool(
     integrity: dnfast_core::PlanIntegrity,
     verified_rpmdb_cookie: Option<&str>,
 ) -> Result<(ResidentPool, String), DaemonError> {
+    let trace = std::env::var_os("DNFASTD_TRACE").is_some();
+    let started = Instant::now();
     let policy = snapshot.payload().policy.solver.clone();
     let mut context = NativeContext::open(policy.base_arch(), || false).map_err(planning)?;
+    trace_phase(trace, started, "resident-build-context-open");
     context.add_installed_rpmdb("/").map_err(planning)?;
     let mut current = context
         .read_installed_inventory_snapshot()
@@ -976,6 +988,7 @@ fn build_pool(
             ));
         }
     }
+    trace_phase(trace, started, "resident-build-rpmdb-verified");
     let InventorySnapshot {
         inventory,
         rpmdb_cookie,
@@ -992,24 +1005,73 @@ fn build_pool(
         ));
     }
     let selected = selected_repositories(&snapshot, &integrity)?;
+    trace_phase(trace, started, "resident-build-repositories-selected");
     let workspace = tempfile::tempdir().map_err(|error| DaemonError::Io(error.to_string()))?;
+    let solv_cache = SolvCache::new(SYSTEM_CACHE_PATH);
     let mut candidates = Vec::new();
     let mut metadata = Vec::new();
-    let mut primary_paths = Vec::new();
     let mut primary_identities = Vec::new();
     for (index, repository) in selected.iter().enumerate() {
-        let (paths, solver_inputs) = materialize(&snapshot, workspace.path(), index, repository)?;
-        context
-            .add_repository_primary(Repository {
-                id: repository.id.clone(),
-                repomd_path: paths.0,
-                primary_path: paths.1,
-                filelists_path: paths.2,
-                priority: i32::try_from(repository.priority).map_err(planning)?,
-                cost: i32::try_from(repository.cost).map_err(planning)?,
-            })
+        let priority = i32::try_from(repository.priority).map_err(planning)?;
+        let cost = i32::try_from(repository.cost).map_err(planning)?;
+        let (binding, binding_sha256) = solv_cache_binding(repository, policy.base_arch())?;
+        match solv_cache.open(&binding_sha256).map_err(planning)? {
+            Some(cache) => {
+                context
+                    .add_repository_solv(&repository.id, priority, cost, cache.file(), &binding)
+                    .map_err(planning)?;
+                trace_phase(
+                    trace,
+                    started,
+                    &format!("resident-build-{index}-solv-cache-hit"),
+                );
+            }
+            None => {
+                let paths = materialize(&snapshot, workspace.path(), index, repository)?;
+                trace_phase(
+                    trace,
+                    started,
+                    &format!("resident-build-{index}-materialized"),
+                );
+                context
+                    .add_repository_primary(Repository {
+                        id: repository.id.clone(),
+                        repomd_path: paths.0,
+                        primary_path: paths.1,
+                        filelists_path: paths.2,
+                        priority,
+                        cost,
+                    })
+                    .map_err(planning)?;
+                let staged = solv_cache.stage(&binding_sha256).map_err(planning)?;
+                context
+                    .write_repository_solv(&repository.id, staged.file(), &binding)
+                    .map_err(planning)?;
+                let published = staged.commit().map_err(planning)?;
+                if trace {
+                    eprintln!(
+                        "dnfastd_trace solv_cache_repo={} sha256={} size={}",
+                        repository.id,
+                        published.sha256(),
+                        published.size()
+                    );
+                }
+            }
+        }
+        trace_phase(
+            trace,
+            started,
+            &format!("resident-build-{index}-native-loaded"),
+        );
+        let packages = context
+            .repository_packages(&repository.id)
             .map_err(planning)?;
-        let records = resident_records_for(repository, solver_inputs, policy.base_arch())?;
+        let records = resident_records_for(repository, packages, policy.base_arch())?;
+        trace_phase(
+            trace,
+            started,
+            &format!("resident-build-{index}-records-built"),
+        );
         candidates.extend(records.candidates);
         metadata.extend(
             records
@@ -1017,12 +1079,10 @@ fn build_pool(
                 .into_iter()
                 .map(|package| (repository.id.clone(), package)),
         );
-        primary_paths.extend(records.primary_paths);
         primary_identities.push((repository.id.clone(), records.primary_identities));
     }
-    primary_paths.sort();
-    primary_paths.dedup();
     context.prepare_solver().map_err(planning)?;
+    trace_phase(trace, started, "resident-build-solver-prepared");
     dnfast_native::release_unused_memory();
     let verified_cookie = rpmdb_cookie.clone();
     let repositories = selected.into_iter().cloned().collect();
@@ -1038,7 +1098,6 @@ fn build_pool(
             rpmdb_cookie,
             candidates,
             metadata,
-            primary_paths,
             primary_identities,
             last_solve: None,
         },
@@ -1223,6 +1282,29 @@ fn selected_repositories<'a>(
         .collect()
 }
 
+fn solv_cache_binding(
+    repository: &PlanningRepository,
+    architecture: Architecture,
+) -> Result<(Vec<u8>, String), DaemonError> {
+    let binding = format!(
+        "dnfast-solv-cache-v1\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrepository={}\ngeneration_sha256={}\nprimary_sha256={}\nprimary_size={}\n",
+        dnfast_native_sys::ABI_VERSION,
+        architecture.as_rpm_arch(),
+        repository.id,
+        repository.generation_sha256,
+        repository.primary.sha256,
+        repository.primary.size,
+    )
+    .into_bytes();
+    if binding.len() > 4096 {
+        return Err(DaemonError::Planning(
+            "solv cache binding exceeds native limit".into(),
+        ));
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&binding));
+    Ok((binding, sha256))
+}
+
 fn materialize(
     snapshot: &PlanningSnapshot,
     root: &Path,
@@ -1231,19 +1313,12 @@ fn materialize(
 ) -> Result<MaterializedRepository, DaemonError> {
     let prefix = format!("repository-{index}");
     let metadata = snapshot
-        .materialize_native_primary(repository)
+        .materialize_native_primary_unparsed(repository)
         .map_err(planning)?;
     let repomd = write_temp(root, &format!("{prefix}-repomd.xml"), metadata.repomd())?;
     let primary = write_temp(root, &format!("{prefix}-primary.xml"), metadata.primary())?;
-    let filelists = write_temp(
-        root,
-        &format!("{prefix}-filelists.xml"),
-        metadata.filelists(),
-    )?;
-    Ok((
-        (display(&repomd)?, display(&primary)?, display(&filelists)?),
-        metadata.solver_inputs().to_vec(),
-    ))
+    let filelists = write_temp(root, &format!("{prefix}-filelists.xml"), &[])?;
+    Ok((display(&repomd)?, display(&primary)?, display(&filelists)?))
 }
 
 fn write_temp(root: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, DaemonError> {
@@ -1261,23 +1336,22 @@ fn display(path: &Path) -> Result<String, DaemonError> {
 struct ResidentRepositoryRecords {
     candidates: Vec<CandidatePackage>,
     metadata: Vec<NativePackageEvidence>,
-    primary_paths: Vec<String>,
     primary_identities: Vec<String>,
 }
 
 fn resident_records_for(
     repository: &PlanningRepository,
-    solver_inputs: Vec<dnfast_metadata::CompletePackage>,
+    solver_inputs: Vec<dnfast_native::RepositoryPackage>,
     base_architecture: Architecture,
 ) -> Result<ResidentRepositoryRecords, DaemonError> {
     let mut candidates = Vec::new();
     let mut metadata = Vec::new();
-    let mut primary_paths = Vec::new();
     let mut primary_identities = Vec::with_capacity(solver_inputs.len());
-    for mut item in solver_inputs {
+    for item in solver_inputs {
+        let (epoch, version, release) = parse_native_evr(&item.evr)?;
         primary_identities.push(format!(
             "{}-{}:{}-{}.{}",
-            item.name, item.epoch, item.version, item.release, item.arch
+            item.name, epoch, version, release, item.arch
         ));
         let architecture = match item.arch.as_str() {
             "aarch64" => Architecture::Aarch64,
@@ -1290,19 +1364,19 @@ fn resident_records_for(
                 ));
             }
         };
-        let epoch = item
-            .epoch
-            .parse()
-            .map_err(|_| DaemonError::Planning("invalid metadata epoch".into()))?;
-        primary_paths.extend(std::mem::take(&mut item.files));
+        if item.checksum_sha256.len() != 64
+            || !item
+                .checksum_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DaemonError::Planning(
+                "native package checksum is not canonical SHA-256".into(),
+            ));
+        }
         candidates.push(CandidatePackage {
             name: item.name.clone(),
-            evra: Evra::new(
-                epoch,
-                item.version.clone(),
-                item.release.clone(),
-                architecture,
-            ),
+            evra: Evra::new(epoch, version.clone(), release.clone(), architecture),
             vendor: if item.vendor.is_empty() {
                 "unknown".into()
             } else {
@@ -1313,19 +1387,48 @@ fn resident_records_for(
             cost: repository.cost,
             package_size: item.package_size,
             installed_size: item.installed_size,
-            checksum_sha256: item.checksum.clone(),
+            checksum_sha256: item.checksum_sha256.clone(),
             location: item.location.clone(),
             excluded: false,
             modular: false,
         });
-        metadata.push(NativePackageEvidence::from_complete(item));
+        metadata.push(NativePackageEvidence::from_native(
+            NativePackageEvidenceParts {
+                name: item.name,
+                arch: item.arch,
+                epoch: epoch.to_string(),
+                version,
+                release,
+                requires: item.requires,
+                recommends: item.recommends,
+                supplements: item.supplements,
+                enhances: item.enhances,
+            },
+        ));
     }
     Ok(ResidentRepositoryRecords {
         candidates,
         metadata,
-        primary_paths,
         primary_identities,
     })
+}
+
+fn parse_native_evr(evr: &str) -> Result<(u32, String, String), DaemonError> {
+    let (epoch, version_release) = evr
+        .split_once(':')
+        .map_or(("0", evr), |(epoch, rest)| (epoch, rest));
+    let epoch = epoch
+        .parse()
+        .map_err(|_| DaemonError::Planning("invalid native package epoch".into()))?;
+    let (version, release) = version_release
+        .rsplit_once('-')
+        .ok_or_else(|| DaemonError::Planning("native package EVR has no release".into()))?;
+    if version.is_empty() || release.is_empty() {
+        return Err(DaemonError::Planning(
+            "native package EVR is incomplete".into(),
+        ));
+    }
+    Ok((epoch, version.into(), release.into()))
 }
 
 fn mapped_file_selectors(
@@ -1334,12 +1437,7 @@ fn mapped_file_selectors(
 ) -> Result<Vec<MappedSelector>, DaemonError> {
     let mut mapped = Vec::new();
     for (selector_index, selector) in names.iter().enumerate() {
-        if !selector.starts_with('/')
-            || cached
-                .primary_paths
-                .binary_search_by(|path| path.as_str().cmp(selector))
-                .is_ok()
-        {
+        if !selector.starts_with('/') || cached.context.has_provider(selector).map_err(planning)? {
             continue;
         }
         let mut providers = Vec::new();
@@ -1470,14 +1568,7 @@ fn canonical_repository_ids(repositories: &[String]) -> Result<(), DaemonError> 
     }
 }
 
-fn paths_require_full_filelists(packages: &[String], primary_paths: &[String]) -> bool {
-    paths_require_full_filelists_by(packages, |selector| {
-        primary_paths
-            .binary_search_by(|path| path.as_str().cmp(selector))
-            .is_ok()
-    })
-}
-
+#[cfg(test)]
 fn paths_require_full_filelists_by(
     packages: &[String],
     primary_contains: impl Fn(&str) -> bool,

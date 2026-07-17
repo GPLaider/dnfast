@@ -10,6 +10,22 @@ pub struct NativeRepositoryXml {
     solver_inputs: Vec<dnfast_metadata::CompletePackage>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeRepositoryPrimary {
+    repomd: Vec<u8>,
+    primary: Vec<u8>,
+}
+
+impl NativeRepositoryPrimary {
+    pub fn repomd(&self) -> &[u8] {
+        &self.repomd
+    }
+
+    pub fn primary(&self) -> &[u8] {
+        &self.primary
+    }
+}
+
 impl NativeRepositoryXml {
     pub fn repomd(&self) -> &[u8] {
         &self.repomd
@@ -53,6 +69,25 @@ impl PlanningSnapshot {
         repository: &PlanningRepository,
     ) -> Result<NativeRepositoryXml, PlanningError> {
         materialize(repository, self.storage(), false)
+    }
+
+    pub fn materialize_native_primary_unparsed(
+        &self,
+        repository: &PlanningRepository,
+    ) -> Result<NativeRepositoryPrimary, PlanningError> {
+        let repomd = repository
+            .repomd
+            .decode_verified(self.storage())
+            .map_err(|error| materialization_error("repomd", error))?;
+        let records = dnfast_metadata::parse_repomd_records(&repomd)
+            .map_err(|error| materialization_error("repomd", error))?;
+        let primary_payload = repository
+            .primary
+            .decode_verified(self.storage())
+            .map_err(|error| materialization_error("primary", error))?;
+        let primary = dnfast_metadata::decode_record(&primary_payload, &records.primary)
+            .map_err(|error| materialization_error("primary", error))?;
+        Ok(NativeRepositoryPrimary { repomd, primary })
     }
 }
 

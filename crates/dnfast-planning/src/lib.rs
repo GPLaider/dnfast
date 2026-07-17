@@ -15,7 +15,7 @@ pub use model::{
     PlanningBytes, PlanningConfiguration, PlanningKey, PlanningOrigin, PlanningPayload,
     PlanningPolicy, PlanningRepository, PlanningSnapshot,
 };
-pub use native_xml::NativeRepositoryXml;
+pub use native_xml::{NativeRepositoryPrimary, NativeRepositoryXml};
 pub use publisher::{
     PlanningRoots, RootPlanningPublisher, SYSTEM_CACHE_PATH, SYSTEM_PLANNING_PATH,
     host_rpm_architecture,

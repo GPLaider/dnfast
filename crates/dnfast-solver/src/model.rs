@@ -37,6 +37,18 @@ pub struct NativePackageEvidence {
     pub(crate) enhances: Vec<String>,
 }
 
+pub struct NativePackageEvidenceParts {
+    pub name: String,
+    pub arch: String,
+    pub epoch: String,
+    pub version: String,
+    pub release: String,
+    pub requires: Vec<String>,
+    pub recommends: Vec<String>,
+    pub supplements: Vec<String>,
+    pub enhances: Vec<String>,
+}
+
 impl NativePackageEvidence {
     pub fn from_complete(package: dnfast_metadata::CompletePackage) -> Self {
         Self {
@@ -49,6 +61,20 @@ impl NativePackageEvidence {
             recommends: package.recommends.iter().map(compact_relation).collect(),
             supplements: package.supplements.iter().map(compact_relation).collect(),
             enhances: package.enhances.iter().map(compact_relation).collect(),
+        }
+    }
+
+    pub fn from_native(parts: NativePackageEvidenceParts) -> Self {
+        Self {
+            name: parts.name,
+            arch: parts.arch,
+            epoch: parts.epoch,
+            version: parts.version,
+            release: parts.release,
+            requires: parts.requires,
+            recommends: parts.recommends,
+            supplements: parts.supplements,
+            enhances: parts.enhances,
         }
     }
 }

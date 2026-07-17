@@ -45,7 +45,7 @@ dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
     const char *paths[] = {input->repomd_path, input->primary_path,
                            input->filelists_path};
     int current_fds[3] = {-1, -1, -1};
-    uint64_t metadata = context->metadata_bytes;
+    uint64_t metadata = 0;
     for (size_t index = 0; index < metadata_count; ++index) {
         struct stat retained;
         struct stat current;
@@ -58,16 +58,40 @@ dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
             current.st_dev != identity[index].st_dev ||
             current.st_ino != identity[index].st_ino ||
             current.st_size != identity[index].st_size;
-        if (changed || UINT64_MAX - metadata < (uint64_t)identity[index].st_size ||
-            metadata + (uint64_t)identity[index].st_size > context->limits.max_metadata_bytes) {
+        if (changed || UINT64_MAX - metadata < (uint64_t)identity[index].st_size) {
             for (size_t close_index = 0; close_index < metadata_count; ++close_index)
                 if (current_fds[close_index] >= 0) (void)close(current_fds[close_index]);
             return dnfast_set_error(error, changed ? DNFAST_STATUS_NATIVE_FAILURE : DNFAST_STATUS_LIMIT_EXCEEDED,
                                     "solver", changed ? "fstat" : NULL,
-                                    changed ? "metadata changed during parse" : "metadata byte limit exceeded");
+                                    changed ? "metadata changed during parse" : "metadata byte count overflow");
         }
         metadata += (uint64_t)identity[index].st_size;
     }
+    for (size_t index = 0; index < metadata_count; ++index)
+        (void)close(current_fds[index]);
+    return dnfast_limits_finalize_loaded_repo(context, repo, metadata, error);
+#else
+    (void)context;
+    (void)opaque;
+    (void)input;
+    (void)streams;
+    (void)identity;
+    (void)metadata_count;
+    (void)error;
+    return DNFAST_STATUS_UNSUPPORTED_ABI;
+#endif
+}
+
+dnfast_status dnfast_limits_finalize_loaded_repo(dnfast_context *context,
+                                                 struct s_Repo *opaque,
+                                                 uint64_t metadata_bytes,
+                                                 dnfast_error *error) {
+#ifdef DNFAST_NATIVE_REAL
+    Repo *repo = opaque;
+    if (UINT64_MAX - context->metadata_bytes < metadata_bytes ||
+        context->metadata_bytes + metadata_bytes > context->limits.max_metadata_bytes)
+        return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
+                                "solver", NULL, "metadata byte limit exceeded");
     uint32_t packages = (uint32_t)(repo->end - repo->start);
     if (UINT32_MAX - context->package_count < packages ||
         context->package_count + packages > context->limits.max_packages)
@@ -88,23 +112,18 @@ dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
             goto relation_limit;
     }
     context->package_count += packages;
-    context->metadata_bytes = metadata;
-    for (size_t index = 0; index < metadata_count; ++index) (void)close(current_fds[index]);
+    context->metadata_bytes += metadata_bytes;
     return DNFAST_STATUS_OK;
 package_limit:
-    for (size_t index = 0; index < metadata_count; ++index) (void)close(current_fds[index]);
     return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
                             "solver", NULL, "package limit exceeded");
 relation_limit:
-    for (size_t index = 0; index < metadata_count; ++index) (void)close(current_fds[index]);
     return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
                             "solver", NULL, "relation limit exceeded");
 #else
     (void)context;
     (void)opaque;
-    (void)input;
-    (void)streams;
-    (void)identity;
+    (void)metadata_bytes;
     (void)error;
     return DNFAST_STATUS_UNSUPPORTED_ABI;
 #endif

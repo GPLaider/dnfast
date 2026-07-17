@@ -1,5 +1,6 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::marker::PhantomData;
+use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -65,6 +66,20 @@ struct RawRepoInput {
 }
 
 #[repr(C)]
+struct RawRepoPackage {
+    name: *const c_char,
+    arch: *const c_char,
+    evr: *const c_char,
+    vendor: *const c_char,
+    package_size: u64,
+    installed_size: u64,
+    checksum_size: usize,
+    location_size: usize,
+    relation_counts: [usize; 4],
+    relation_bytes: [usize; 4],
+}
+
+#[repr(C)]
 struct RawSolveRequest {
     abi_version: u32,
     names: *const *const c_char,
@@ -116,6 +131,51 @@ unsafe extern "C" {
         input: *const RawRepoInput,
         error: *mut RawError,
     ) -> i32;
+    fn dnfast_solver_add_repo_solv(
+        context: *mut RawContext,
+        input: *const RawRepoInput,
+        retained_fd: i32,
+        expected_userdata: *const u8,
+        expected_userdata_size: usize,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_write_repo_solv(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        retained_fd: i32,
+        userdata: *const u8,
+        userdata_size: usize,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_repo_package_count(
+        context: *const RawContext,
+        repository_id: *const c_char,
+    ) -> usize;
+    fn dnfast_solver_repo_package_get(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        ordinal: usize,
+        package: *mut RawRepoPackage,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_repo_package_payload(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        ordinal: usize,
+        payload: *mut u8,
+        payload_size: usize,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_repo_package_relations(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        ordinal: usize,
+        kind: u8,
+        relations: *mut u8,
+        relation_size: usize,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_has_provider(context: *const RawContext, capability: *const c_char) -> u8;
     fn dnfast_solver_add_rpmdb(
         context: *mut RawContext,
         root: *const c_char,
@@ -293,6 +353,201 @@ impl Context {
 
     pub fn add_repo_primary(&mut self, repo: &RepoInput) -> Result<(), NativeError> {
         self.add_repo_kind(repo, false, false)
+    }
+
+    pub fn add_repo_solv(
+        &mut self,
+        repository_id: &str,
+        priority: i32,
+        cost: i32,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        let id = c_string(repository_id)?;
+        let empty = c_string("")?;
+        let input = RawRepoInput {
+            abi_version: ABI_VERSION,
+            id: id.as_ptr(),
+            repomd_path: empty.as_ptr(),
+            primary_path: empty.as_ptr(),
+            filelists_path: empty.as_ptr(),
+            priority,
+            cost,
+            installed: 0,
+        };
+        let mut error = empty_error();
+        // SAFETY: the input strings, userdata, retained file, and uniquely
+        // borrowed context remain live for the synchronous native load.
+        let status = unsafe {
+            dnfast_solver_add_repo_solv(
+                self.raw.as_ptr(),
+                &input,
+                file.as_raw_fd(),
+                userdata.as_ptr(),
+                userdata.len(),
+                &mut error,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status_error(status, &mut error))
+        }
+    }
+
+    pub fn write_repo_solv(
+        &mut self,
+        repository_id: &str,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        let id = c_string(repository_id)?;
+        let mut error = empty_error();
+        // SAFETY: the native writer only duplicates the retained descriptor;
+        // all pointers and unique context access remain valid synchronously.
+        let status = unsafe {
+            dnfast_solver_write_repo_solv(
+                self.raw.as_ptr(),
+                id.as_ptr(),
+                file.as_raw_fd(),
+                userdata.as_ptr(),
+                userdata.len(),
+                &mut error,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status_error(status, &mut error))
+        }
+    }
+
+    pub fn repository_packages(
+        &mut self,
+        repository_id: &str,
+    ) -> Result<Vec<RepositoryPackage>, NativeError> {
+        let id = c_string(repository_id)?;
+        // SAFETY: the repository identifier and context are live and the
+        // scalar count call does not mutate native storage.
+        let count = unsafe { dnfast_solver_repo_package_count(self.raw.as_ptr(), id.as_ptr()) };
+        let mut packages = Vec::with_capacity(count);
+        for ordinal in 0..count {
+            let mut raw = RawRepoPackage {
+                name: std::ptr::null(),
+                arch: std::ptr::null(),
+                evr: std::ptr::null(),
+                vendor: std::ptr::null(),
+                package_size: 0,
+                installed_size: 0,
+                checksum_size: 0,
+                location_size: 0,
+                relation_counts: [0; 4],
+                relation_bytes: [0; 4],
+            };
+            let mut error = empty_error();
+            // SAFETY: ordinal is bounded by the native count; output is live
+            // and native strings remain pool-owned while the context lives.
+            let status = unsafe {
+                dnfast_solver_repo_package_get(
+                    self.raw.as_ptr(),
+                    id.as_ptr(),
+                    ordinal,
+                    &mut raw,
+                    &mut error,
+                )
+            };
+            if status != 0 {
+                return Err(status_error(status, &mut error));
+            }
+            let payload_size = raw
+                .checksum_size
+                .checked_add(raw.location_size)
+                .ok_or_else(|| invalid_repository_evidence("package_payload"))?;
+            let mut payload = vec![0_u8; payload_size];
+            let mut error = empty_error();
+            // SAFETY: the byte buffer is live with the exact size reported by
+            // the bounded package getter and context access is unique.
+            let status = unsafe {
+                dnfast_solver_repo_package_payload(
+                    self.raw.as_ptr(),
+                    id.as_ptr(),
+                    ordinal,
+                    payload.as_mut_ptr(),
+                    payload.len(),
+                    &mut error,
+                )
+            };
+            if status != 0 {
+                return Err(status_error(status, &mut error));
+            }
+            let checksum_sha256 = std::str::from_utf8(&payload[..raw.checksum_size])
+                .map_err(|_| invalid_repository_evidence("package_checksum"))?
+                .to_owned();
+            let location = std::str::from_utf8(&payload[raw.checksum_size..])
+                .map_err(|_| invalid_repository_evidence("package_location"))?
+                .to_owned();
+            let mut relations: [Vec<String>; 4] =
+                std::array::from_fn(|kind| Vec::with_capacity(raw.relation_counts[kind]));
+            for (kind, output) in relations.iter_mut().enumerate() {
+                let mut bytes = vec![0_u8; raw.relation_bytes[kind]];
+                let mut error = empty_error();
+                // SAFETY: the output byte buffer has the exact capacity
+                // reported for this package and remains live synchronously.
+                let status = unsafe {
+                    dnfast_solver_repo_package_relations(
+                        self.raw.as_ptr(),
+                        id.as_ptr(),
+                        ordinal,
+                        kind as u8,
+                        bytes.as_mut_ptr(),
+                        bytes.len(),
+                        &mut error,
+                    )
+                };
+                if status != 0 {
+                    return Err(status_error(status, &mut error));
+                }
+                let mut start = 0;
+                for _ in 0..raw.relation_counts[kind] {
+                    let relative = bytes[start..]
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .ok_or_else(|| invalid_repository_evidence("package_relation"))?;
+                    let end = start + relative;
+                    output.push(
+                        std::str::from_utf8(&bytes[start..end])
+                            .map_err(|_| invalid_repository_evidence("package_relation"))?
+                            .to_owned(),
+                    );
+                    start = end + 1;
+                }
+                if start != bytes.len() {
+                    return Err(invalid_repository_evidence("package_relation"));
+                }
+            }
+            packages.push(RepositoryPackage {
+                name: copy_native_text(raw.name, "package_name")?,
+                arch: copy_native_text(raw.arch, "package_arch")?,
+                evr: copy_native_text(raw.evr, "package_evr")?,
+                vendor: copy_native_text(raw.vendor, "package_vendor")?,
+                checksum_sha256,
+                location,
+                package_size: raw.package_size,
+                installed_size: raw.installed_size,
+                requires: std::mem::take(&mut relations[0]),
+                recommends: std::mem::take(&mut relations[1]),
+                supplements: std::mem::take(&mut relations[2]),
+                enhances: std::mem::take(&mut relations[3]),
+            });
+        }
+        Ok(packages)
+    }
+
+    pub fn has_provider(&self, capability: &str) -> Result<bool, NativeError> {
+        let capability = c_string(capability)?;
+        // SAFETY: the immutable native query only reads the prepared pool and
+        // the C string remains live for the synchronous call.
+        Ok(unsafe { dnfast_solver_has_provider(self.raw.as_ptr(), capability.as_ptr()) == 1 })
     }
 
     pub fn add_installed_repo(&mut self, repo: &RepoInput) -> Result<(), NativeError> {
@@ -535,6 +790,22 @@ pub struct RepoInput {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RepositoryPackage {
+    pub name: String,
+    pub arch: String,
+    pub evr: String,
+    pub vendor: String,
+    pub checksum_sha256: String,
+    pub location: String,
+    pub package_size: u64,
+    pub installed_size: u64,
+    pub requires: Vec<String>,
+    pub recommends: Vec<String>,
+    pub supplements: Vec<String>,
+    pub enhances: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SolvableReference {
     pub repository_id: String,
     pub package_ordinal: u32,
@@ -598,6 +869,37 @@ pub(crate) fn c_string(value: &str) -> Result<CString, NativeError> {
         symbol: String::new(),
         message: "string contains NUL".into(),
     })
+}
+
+fn copy_native_text(pointer: *const c_char, symbol: &str) -> Result<String, NativeError> {
+    if pointer.is_null() {
+        return Err(NativeError {
+            status: 7,
+            component: "dnfast".into(),
+            symbol: symbol.into(),
+            message: format!("native repository evidence {symbol} was null"),
+        });
+    }
+    // SAFETY: package evidence pointers are pool-owned NUL strings and callers
+    // copy them before any mutation of the uniquely borrowed context.
+    unsafe { CStr::from_ptr(pointer) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| NativeError {
+            status: 7,
+            component: "dnfast".into(),
+            symbol: symbol.into(),
+            message: format!("native repository evidence {symbol} is not UTF-8"),
+        })
+}
+
+fn invalid_repository_evidence(symbol: &str) -> NativeError {
+    NativeError {
+        status: 7,
+        component: "dnfast".into(),
+        symbol: symbol.into(),
+        message: format!("native repository evidence {symbol} is invalid"),
+    }
 }
 
 fn copy_items(raw: NonNull<RawContext>, mode: u8) -> Result<Vec<String>, NativeError> {

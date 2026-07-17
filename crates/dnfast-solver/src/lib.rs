@@ -8,8 +8,8 @@ mod validation;
 
 pub use model::{
     ActionProvenance, ArtifactRecord, CandidatePackage, DependencyEdge, DependencyKind,
-    ExplainedAction, IntegritySnapshots, NativePackageEvidence, PlanProtection, RequestedRelation,
-    ResolvedAction, ResolvedOperation,
+    ExplainedAction, IntegritySnapshots, NativePackageEvidence, NativePackageEvidenceParts,
+    PlanProtection, RequestedRelation, ResolvedAction, ResolvedOperation,
 };
 pub use native_adapter::{NativeAction, NativeDecision, NativeSolveOutput};
 pub use plan::{CanonicalSolverPlan, PlanBuilder, PlanDigest, ReSolveContract};

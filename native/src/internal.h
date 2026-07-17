@@ -158,5 +158,9 @@ dnfast_status dnfast_limits_finalize_repo(dnfast_context *context,
                                           const struct stat identity[3],
                                           size_t metadata_count,
                                           dnfast_error *error);
+dnfast_status dnfast_limits_finalize_loaded_repo(dnfast_context *context,
+                                                 struct s_Repo *repo,
+                                                 uint64_t metadata_bytes,
+                                                 dnfast_error *error);
 
 #endif

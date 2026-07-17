@@ -8,6 +8,7 @@ mod fs_safety;
 mod loading;
 mod model;
 mod publication;
+mod solv_cache;
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,7 @@ pub use model::{
     CacheError, CompleteSnapshot, OriginError, RepomdAuthentication, SelectedOrigin, Snapshot,
     SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration,
 };
+pub use solv_cache::{CachedSolv, SolvCache, StagedSolv};
 
 #[derive(Debug)]
 pub struct Cache {
