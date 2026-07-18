@@ -154,6 +154,9 @@ dnfast_status dnfast_context_open(const dnfast_limits *limits,
                                   dnfast_context **out_context,
                                   dnfast_error *out_error);
 int dnfast_executor_exec_fixed(int plan_fd, uint8_t approval);
+int dnfast_executor_exec_compact(int plan_fd, int manifest_fd,
+                                 const int *artifact_fds,
+                                 size_t artifact_count, uint8_t approval);
 dnfast_status dnfast_context_check(dnfast_context *context,
                                    dnfast_error *out_error);
 const char *dnfast_context_pool_architecture(const dnfast_context *context);
@@ -364,6 +367,8 @@ void dnfast_context_free(dnfast_context *context);
 uint64_t dnfast_context_allocation_count(void);
 void dnfast_error_free(dnfast_error *error);
 int dnfast_executor_take_plan_fd(void);
+int dnfast_executor_take_compact_fd(void);
+int dnfast_executor_take_artifact_fd(size_t index);
 
 #ifdef __cplusplus
 }

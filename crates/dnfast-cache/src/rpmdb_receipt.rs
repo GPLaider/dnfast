@@ -15,7 +15,11 @@ use crate::{CacheError, fs_safety::create_private_tree, model::io_error};
 
 const RECEIPT_DIRECTORY: &str = "rpmdb-verify-v1";
 const RECEIPT_VERSION: &str = "dnfast-rpmdb-verified-generation-v1";
+const CURRENT_RECEIPT_VERSION: &str = "dnfast-rpmdb-current-generation-v1";
+const CURRENT_RECEIPT_NAME: &str = "current.verified";
 const MAX_RECEIPT_BYTES: u64 = 512;
+const MAX_CURRENT_RECEIPT_BYTES: u64 = 16 * 1024;
+const MAX_CURRENT_STATE_BYTES: usize = 4 * 1024;
 const MAX_DATABASE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 
@@ -40,6 +44,29 @@ pub enum RpmDbReceiptCheck {
         generation: RpmDbVerifiedGeneration,
         corrupted: bool,
     },
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RpmDbCurrentReceipt {
+    state: String,
+    generation: RpmDbVerifiedGeneration,
+}
+
+impl RpmDbCurrentReceipt {
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    pub fn generation(&self) -> &RpmDbVerifiedGeneration {
+        &self.generation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RpmDbCurrentCheck {
+    Hit(RpmDbCurrentReceipt),
+    Miss { corrupted: bool },
     Unsupported,
 }
 
@@ -113,6 +140,99 @@ impl RpmDbReceiptCache {
         create_private_tree(&self.root, &path)?;
         let directory = open_directory(&path)?;
         publish_receipt(&directory, &current.receipt_name, &current.descriptor)
+    }
+
+    /// Opens the atomically published current-generation receipt without first
+    /// opening librpm. The opaque state is accepted only when the protected
+    /// RPMDB generation and its independently named verification receipt still
+    /// match exactly.
+    pub fn current(&self) -> Result<RpmDbCurrentCheck, CacheError> {
+        let path = self.root.join(RECEIPT_DIRECTORY);
+        let Some(directory) = open_directory_if_present(&path)? else {
+            return Ok(RpmDbCurrentCheck::Miss { corrupted: false });
+        };
+        let value = match read_limited_receipt(
+            &directory,
+            CURRENT_RECEIPT_NAME,
+            MAX_CURRENT_RECEIPT_BYTES,
+            "RPMDB current-generation receipt",
+        ) {
+            Ok(Some(value)) => value,
+            Ok(None) => return Ok(RpmDbCurrentCheck::Miss { corrupted: false }),
+            Err(CacheError::Corrupt(_)) => {
+                return Ok(RpmDbCurrentCheck::Miss { corrupted: true });
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((binding, state, descriptor)) = parse_current_receipt(&value) else {
+            return Ok(RpmDbCurrentCheck::Miss { corrupted: true });
+        };
+        let Some(generation) = self.describe(&binding)? else {
+            return Ok(RpmDbCurrentCheck::Unsupported);
+        };
+        if generation.descriptor != descriptor {
+            return Ok(RpmDbCurrentCheck::Miss { corrupted: false });
+        }
+        match read_receipt(&directory, &generation.receipt_name) {
+            Ok(Some(value)) if value == generation.descriptor => {
+                Ok(RpmDbCurrentCheck::Hit(RpmDbCurrentReceipt {
+                    state,
+                    generation,
+                }))
+            }
+            Ok(None) => Ok(RpmDbCurrentCheck::Miss { corrupted: false }),
+            Ok(Some(_)) | Err(CacheError::Corrupt(_)) => {
+                Ok(RpmDbCurrentCheck::Miss { corrupted: true })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Publishes a small opaque state record for the fully verified generation.
+    /// The generation receipt is durable before the replaceable current pointer
+    /// becomes visible, so interruption can only produce a conservative miss.
+    pub fn publish_current(
+        &self,
+        expected: &RpmDbVerifiedGeneration,
+        state: &str,
+    ) -> Result<(), CacheError> {
+        if state.is_empty() || state.len() > MAX_CURRENT_STATE_BYTES || state.contains('\0') {
+            return Err(CacheError::Corrupt(
+                "invalid RPMDB current-generation state".into(),
+            ));
+        }
+        self.publish(expected)?;
+        let Some(current) = self.describe(&expected.binding)? else {
+            return Err(CacheError::Corrupt(
+                "RPMDB lost checksum protection before current receipt publication".into(),
+            ));
+        };
+        if &current != expected {
+            return Err(CacheError::Corrupt(
+                "RPMDB changed before current receipt publication".into(),
+            ));
+        }
+        let value = format!(
+            "{CURRENT_RECEIPT_VERSION}\nbinding={}\nstate={}\ndescriptor={}\n",
+            current.binding,
+            hex::encode(state.as_bytes()),
+            hex::encode(current.descriptor.as_bytes()),
+        );
+        if value.len() as u64 > MAX_CURRENT_RECEIPT_BYTES {
+            return Err(CacheError::Corrupt(
+                "RPMDB current-generation receipt exceeds limit".into(),
+            ));
+        }
+        let path = self.root.join(RECEIPT_DIRECTORY);
+        create_private_tree(&self.root, &path)?;
+        let directory = open_directory(&path)?;
+        publish_limited_receipt(
+            &directory,
+            CURRENT_RECEIPT_NAME,
+            &value,
+            MAX_CURRENT_RECEIPT_BYTES,
+            "RPMDB current-generation receipt",
+        )
     }
 
     fn describe(&self, binding: &str) -> Result<Option<RpmDbVerifiedGeneration>, CacheError> {
@@ -256,6 +376,20 @@ fn same_generation(before: &rustix::fs::Stat, after: &rustix::fs::Stat) -> bool 
 }
 
 fn read_receipt(directory: &OwnedFd, name: &str) -> Result<Option<String>, CacheError> {
+    read_limited_receipt(
+        directory,
+        name,
+        MAX_RECEIPT_BYTES,
+        "RPMDB verification receipt",
+    )
+}
+
+fn read_limited_receipt(
+    directory: &OwnedFd,
+    name: &str,
+    maximum: u64,
+    role: &str,
+) -> Result<Option<String>, CacheError> {
     let receipt = match openat(
         directory,
         name,
@@ -272,16 +406,14 @@ fn read_receipt(directory: &OwnedFd, name: &str) -> Result<Option<String>, Cache
         || before.st_uid != rustix::process::geteuid().as_raw()
         || before.st_nlink != 1
         || before.st_size <= 0
-        || before.st_size as u64 > MAX_RECEIPT_BYTES
+        || before.st_size as u64 > maximum
     {
-        return Err(CacheError::Corrupt(
-            "unsafe RPMDB verification receipt".into(),
-        ));
+        return Err(CacheError::Corrupt(format!("unsafe {role}")));
     }
     let mut file = File::from(receipt);
     let mut value = String::new();
     Read::by_ref(&mut file)
-        .take(MAX_RECEIPT_BYTES + 1)
+        .take(maximum + 1)
         .read_to_string(&mut value)
         .map_err(io_error)?;
     let after = fstat(&file).map_err(errno)?;
@@ -289,14 +421,50 @@ fn read_receipt(directory: &OwnedFd, name: &str) -> Result<Option<String>, Cache
         || value.len() as i64 != before.st_size
         || !value.ends_with('\n')
     {
-        return Err(CacheError::Corrupt(
-            "RPMDB verification receipt changed while reading".into(),
-        ));
+        return Err(CacheError::Corrupt(format!("{role} changed while reading")));
     }
     Ok(Some(value))
 }
 
+fn parse_current_receipt(value: &str) -> Option<(String, String, String)> {
+    let mut lines = value.lines();
+    if lines.next()? != CURRENT_RECEIPT_VERSION {
+        return None;
+    }
+    let binding = lines.next()?.strip_prefix("binding=")?.to_owned();
+    validate_digest(&binding, "RPMDB verification binding").ok()?;
+    let state = String::from_utf8(hex::decode(lines.next()?.strip_prefix("state=")?).ok()?).ok()?;
+    if state.is_empty() || state.len() > MAX_CURRENT_STATE_BYTES || state.contains('\0') {
+        return None;
+    }
+    let descriptor =
+        String::from_utf8(hex::decode(lines.next()?.strip_prefix("descriptor=")?).ok()?).ok()?;
+    if descriptor.len() as u64 > MAX_RECEIPT_BYTES
+        || !descriptor.ends_with('\n')
+        || lines.next().is_some()
+    {
+        return None;
+    }
+    Some((binding, state, descriptor))
+}
+
 fn publish_receipt(directory: &OwnedFd, name: &str, descriptor: &str) -> Result<(), CacheError> {
+    publish_limited_receipt(
+        directory,
+        name,
+        descriptor,
+        MAX_RECEIPT_BYTES,
+        "RPMDB verification receipt",
+    )
+}
+
+fn publish_limited_receipt(
+    directory: &OwnedFd,
+    name: &str,
+    descriptor: &str,
+    maximum: u64,
+    role: &str,
+) -> Result<(), CacheError> {
     let mut temporary = File::from(
         openat(
             directory,
@@ -312,7 +480,8 @@ fn publish_receipt(directory: &OwnedFd, name: &str, descriptor: &str) -> Result<
     temporary.sync_all().map_err(io_error)?;
     match linkat(&temporary, "", directory, name, AtFlags::EMPTY_PATH) {
         Ok(()) => {}
-        Err(rustix::io::Errno::EXIST) => match read_receipt(directory, name) {
+        Err(rustix::io::Errno::EXIST) => match read_limited_receipt(directory, name, maximum, role)
+        {
             Ok(Some(value)) if value == descriptor => return Ok(()),
             _ => {
                 let repair = format!(".{name}.repair-{}", std::process::id());
@@ -417,6 +586,50 @@ mod tests {
         };
         cache.publish(&generation).expect("publish");
         assert!(cache.is_current(&generation).expect("revalidate"));
+    }
+
+    #[test]
+    fn current_receipt_round_trip_binds_opaque_state_to_generation() {
+        let (_root, cache, _database) = fixture();
+        let generation = match cache.check(&binding()).expect("check") {
+            RpmDbReceiptCheck::Miss { generation, .. } => generation,
+            RpmDbReceiptCheck::Unsupported => return,
+            RpmDbReceiptCheck::Hit(_) => panic!("receipt unexpectedly present"),
+        };
+        cache
+            .publish_current(&generation, "verified startup state")
+            .expect("publish current");
+        match cache.current().expect("open current") {
+            RpmDbCurrentCheck::Hit(current) => {
+                assert_eq!(current.state(), "verified startup state");
+                assert_eq!(current.generation(), &generation);
+            }
+            other => panic!("unexpected current receipt: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changed_generation_never_accepts_current_state() {
+        let (_root, cache, database) = fixture();
+        let generation = match cache.check(&binding()).expect("check") {
+            RpmDbReceiptCheck::Miss { generation, .. } => generation,
+            RpmDbReceiptCheck::Unsupported => return,
+            RpmDbReceiptCheck::Hit(_) => panic!("receipt unexpectedly present"),
+        };
+        cache
+            .publish_current(&generation, "verified startup state")
+            .expect("publish current");
+        let mut database = std::fs::OpenOptions::new()
+            .write(true)
+            .open(database)
+            .expect("open database");
+        database.seek(SeekFrom::Start(0)).expect("seek");
+        database.write_all(b"changed").expect("modify");
+        database.sync_all().expect("sync");
+        assert!(!matches!(
+            cache.current().expect("current after change"),
+            RpmDbCurrentCheck::Hit(_)
+        ));
     }
 
     #[test]

@@ -88,14 +88,6 @@ dnfast_status dnfast_limits_finalize_loaded_repo(dnfast_context *context,
                                                  dnfast_error *error) {
 #ifdef DNFAST_NATIVE_REAL
     Repo *repo = opaque;
-    if (UINT64_MAX - context->metadata_bytes < metadata_bytes ||
-        context->metadata_bytes + metadata_bytes > context->limits.max_metadata_bytes)
-        return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
-                                "solver", NULL, "metadata byte limit exceeded");
-    uint32_t packages = (uint32_t)(repo->end - repo->start);
-    if (UINT32_MAX - context->package_count < packages ||
-        context->package_count + packages > context->limits.max_packages)
-        goto package_limit;
     static const Id keys[] = {SOLVABLE_PROVIDES, SOLVABLE_REQUIRES,
         SOLVABLE_RECOMMENDS, SOLVABLE_SUGGESTS, SOLVABLE_SUPPLEMENTS,
         SOLVABLE_ENHANCES, SOLVABLE_CONFLICTS, SOLVABLE_OBSOLETES};
@@ -111,15 +103,42 @@ dnfast_status dnfast_limits_finalize_loaded_repo(dnfast_context *context,
         if (relations > context->limits.max_relations_per_package)
             goto relation_limit;
     }
-    context->package_count += packages;
-    context->metadata_bytes += metadata_bytes;
-    return DNFAST_STATUS_OK;
-package_limit:
-    return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
-                            "solver", NULL, "package limit exceeded");
+    return dnfast_limits_accept_validated_repo(context, repo, metadata_bytes,
+                                               error);
 relation_limit:
     return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
                             "solver", NULL, "relation limit exceeded");
+#else
+    (void)context;
+    (void)opaque;
+    (void)metadata_bytes;
+    (void)error;
+    return DNFAST_STATUS_UNSUPPORTED_ABI;
+#endif
+}
+
+dnfast_status dnfast_limits_accept_validated_repo(dnfast_context *context,
+                                                  struct s_Repo *opaque,
+                                                  uint64_t metadata_bytes,
+                                                  dnfast_error *error) {
+#ifdef DNFAST_NATIVE_REAL
+    Repo *repo = opaque;
+    if (UINT64_MAX - context->metadata_bytes < metadata_bytes ||
+        context->metadata_bytes + metadata_bytes > context->limits.max_metadata_bytes)
+        return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
+                                "solver", NULL, "metadata byte limit exceeded");
+    Id package_ids = repo->end - repo->start;
+    if (package_ids < 0 || (uint64_t)package_ids > UINT32_MAX)
+        return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
+                                "solver", NULL, "package limit exceeded");
+    uint32_t packages = (uint32_t)package_ids;
+    if (UINT32_MAX - context->package_count < packages ||
+        context->package_count + packages > context->limits.max_packages)
+        return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
+                                "solver", NULL, "package limit exceeded");
+    context->package_count += packages;
+    context->metadata_bytes += metadata_bytes;
+    return DNFAST_STATUS_OK;
 #else
     (void)context;
     (void)opaque;

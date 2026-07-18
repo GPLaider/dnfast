@@ -18,7 +18,7 @@ impl InheritedPlan {
     pub fn read() -> Result<Self, ExecutorError> {
         let fd = dnfast_native_sys::take_inherited_plan_fd()
             .map_err(|error| ExecutorError::Read(error.to_string()))?;
-        validate_fd(&fd)?;
+        validate_inherited_fd(&fd)?;
         let mut file = File::from(fd);
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
@@ -38,7 +38,7 @@ impl InheritedPlan {
 
 pub fn validate_plan_path(path: &Path) -> Result<(), ExecutorError> {
     let fd = open_plan(path)?;
-    validate_fd(&fd)
+    validate_path_fd(&fd)
 }
 
 pub fn open_plan(path: &Path) -> Result<OwnedFd, ExecutorError> {
@@ -69,11 +69,11 @@ pub fn open_plan(path: &Path) -> Result<OwnedFd, ExecutorError> {
         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|_| ExecutorError::UnsafePlan)?;
-    validate_fd(&fd)?;
+    validate_path_fd(&fd)?;
     Ok(fd)
 }
 
-fn validate_fd(fd: &impl rustix::fd::AsFd) -> Result<(), ExecutorError> {
+fn validate_path_fd(fd: &impl rustix::fd::AsFd) -> Result<(), ExecutorError> {
     let metadata = fstat(fd).map_err(|_| ExecutorError::UnsafePlan)?;
     if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
         || metadata.st_nlink != 1
@@ -84,6 +84,14 @@ fn validate_fd(fd: &impl rustix::fd::AsFd) -> Result<(), ExecutorError> {
         return Err(ExecutorError::UnsafePlan);
     }
     Ok(())
+}
+
+fn validate_inherited_fd(fd: &impl rustix::fd::AsFd) -> Result<(), ExecutorError> {
+    match validate_path_fd(fd) {
+        Ok(()) => Ok(()),
+        Err(_) => crate::compact_inputs::validate_sealed_memfd(fd, MAX_PLAN_BYTES)
+            .map_err(|_| ExecutorError::UnsafePlan),
+    }
 }
 
 #[cfg(test)]

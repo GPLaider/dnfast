@@ -14,8 +14,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dnfast_cache::{
-    ArtifactCache, ArtifactSpec, Digest as ArtifactDigest, HttpArtifactTransport,
-    RpmDbReceiptCache, RpmDbReceiptCheck, RpmDbVerifiedGeneration, SolvCache, TransactionRequest,
+    ArtifactCache, ArtifactSpec, CacheError, Digest as ArtifactDigest, HttpArtifactTransport,
+    RpmDbCurrentCheck, RpmDbReceiptCache, RpmDbReceiptCheck, RpmDbVerifiedGeneration, SolvCache,
+    TransactionRequest,
 };
 use dnfast_core::{
     Action, Architecture, CanonicalDocument, Evra, InstalledInventory, PackageSpec, SolverPolicy,
@@ -35,7 +36,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ExecutorError, MountRoot, StagedArtifact, StagedInputs, Staging,
+    CompactExecution, ExecutorError, MountRoot, StagedArtifact, StagedInputs, Staging,
     execute::run_token_bound,
     recover_pending_transactions,
     staged_inputs::{StagedRepository, apply_module_artifact_policy},
@@ -74,6 +75,29 @@ pub struct DaemonOutcome {
 
 pub struct DaemonPlan {
     pub plan: CanonicalSolverPlan,
+}
+
+pub struct DaemonlessPlan {
+    solved: SolvedPlan,
+}
+
+impl DaemonlessPlan {
+    pub fn plan(&self) -> &CanonicalSolverPlan {
+        &self.solved.plan
+    }
+
+    pub fn prepare_compact(self) -> Result<CompactExecution, DaemonError> {
+        revalidate_solved(&self.solved)?;
+        let staged = direct_staged_inputs(&self.solved)?;
+        CompactExecution::create(
+            &self.solved.plan,
+            self.solved.integrity.planning_snapshot_sha256().as_str(),
+            self.solved.inventory,
+            self.solved.rpmdb_cookie,
+            staged,
+        )
+        .map_err(executor)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,6 +305,22 @@ pub fn plan_without_daemon(
     packages: &[String],
     repositories: &[String],
 ) -> Result<Option<DaemonPlan>, DaemonError> {
+    Ok(
+        plan_transaction_without_daemon(action, packages, repositories)?.map(|transaction| {
+            DaemonPlan {
+                plan: transaction.solved.plan,
+            }
+        }),
+    )
+}
+
+/// Builds a one-shot plan plus the state needed for a sealed compact executor
+/// handoff. No process or solver pool survives this call.
+pub fn plan_transaction_without_daemon(
+    action: Action,
+    packages: &[String],
+    repositories: &[String],
+) -> Result<Option<DaemonlessPlan>, DaemonError> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(DaemonError::NotRoot);
     }
@@ -292,7 +332,7 @@ pub fn plan_without_daemon(
     } else {
         let solved = planner.solve(action, packages.to_vec(), repositories)?;
         revalidate_solved(&solved)?;
-        Ok(Some(DaemonPlan { plan: solved.plan }))
+        Ok(Some(DaemonlessPlan { solved }))
     };
     drop(planner);
     dnfast_native::release_unused_memory();
@@ -782,6 +822,16 @@ struct PendingInstalled {
     receipt_generation: Option<RpmDbVerifiedGeneration>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RpmDbStartupState {
+    schema: String,
+    native_abi: u32,
+    architecture: String,
+    rpmdb_cookie: String,
+    inventory_sha256: String,
+}
+
 struct ResidentPool {
     snapshot: PlanningSnapshot,
     repository_ids: Vec<String>,
@@ -816,16 +866,80 @@ impl ResidentPlanner {
     fn verify_startup(&mut self, architecture: Architecture) -> Result<(), DaemonError> {
         let trace = std::env::var_os("DNFASTD_TRACE").is_some();
         let started = Instant::now();
+        let receipts =
+            RpmDbReceiptCache::new(SYSTEM_CACHE_PATH, SYSTEM_RPMDB_PATH, SYSTEM_RPMDB_WAL_PATH);
+        let published = PlanningSnapshot::open_system().map_err(planning)?;
+        if published.payload().policy.solver.base_arch() != architecture {
+            return Err(DaemonError::Planning(
+                "root-published architecture differs from the native process".into(),
+            ));
+        }
+        match receipts.current().map_err(planning)? {
+            RpmDbCurrentCheck::Hit(current) => {
+                if let Ok(state) = serde_json::from_str::<RpmDbStartupState>(current.state()) {
+                    let inventory = published.payload().inventory.clone();
+                    let inventory_sha256 = inventory.canonical_sha256().map_err(planning)?;
+                    let candidate = InventorySnapshot {
+                        inventory,
+                        rpmdb_cookie: state.rpmdb_cookie.clone(),
+                    };
+                    let binding = rpmdb_receipt_binding(&candidate, architecture)?;
+                    let current_binding = receipts.check(&binding).map_err(planning)?;
+                    if state.schema == "dnfast-rpmdb-startup-state-v1"
+                        && state.native_abi == dnfast_native_sys::ABI_VERSION
+                        && state.architecture == architecture.as_rpm_arch()
+                        && !state.rpmdb_cookie.is_empty()
+                        && state.rpmdb_cookie.len() <= 4096
+                        && state.inventory_sha256 == inventory_sha256.as_str()
+                        && matches!(
+                            current_binding,
+                            RpmDbReceiptCheck::Hit(ref generation)
+                                if generation == current.generation()
+                        )
+                    {
+                        let mut context =
+                            NativeContext::open(architecture, || false).map_err(planning)?;
+                        trace_phase(trace, started, "startup-rpmdb-generation-receipt-hit");
+                        load_installed_solv_cache(
+                            &mut context,
+                            &candidate,
+                            architecture,
+                            trace,
+                            started,
+                        )?;
+                        self.verified_rpmdb_cookie = Some(candidate.rpmdb_cookie.clone());
+                        self.pending_installed = Some(PendingInstalled {
+                            architecture,
+                            context,
+                            snapshot: candidate,
+                            receipt_generation: Some(current.generation().clone()),
+                        });
+                        return Ok(());
+                    }
+                }
+                if trace {
+                    eprintln!("dnfastd_trace rpmdb_current_receipt_corrupted=true");
+                }
+            }
+            RpmDbCurrentCheck::Miss { corrupted } => {
+                if trace {
+                    eprintln!("dnfastd_trace rpmdb_current_receipt_corrupted={corrupted}");
+                }
+            }
+            RpmDbCurrentCheck::Unsupported => {}
+        }
         let mut context = NativeContext::open(architecture, || false).map_err(planning)?;
         let before = context
             .read_installed_inventory_snapshot()
             .map_err(planning)?;
         trace_phase(trace, started, "startup-rpmdb-opened");
         let binding = rpmdb_receipt_binding(&before, architecture)?;
-        let receipts =
-            RpmDbReceiptCache::new(SYSTEM_CACHE_PATH, SYSTEM_RPMDB_PATH, SYSTEM_RPMDB_WAL_PATH);
         let (snapshot, receipt_generation) = match receipts.check(&binding).map_err(planning)? {
             RpmDbReceiptCheck::Hit(generation) => {
+                let state = rpmdb_startup_state(&before, architecture)?;
+                receipts
+                    .publish_current(&generation, &state)
+                    .map_err(planning)?;
                 trace_phase(trace, started, "startup-rpmdb-receipt-hit");
                 (before, Some(generation))
             }
@@ -837,7 +951,10 @@ impl ResidentPlanner {
                     eprintln!("dnfastd_trace rpmdb_receipt_corrupted={corrupted}");
                 }
                 let snapshot = verify_rpmdb_unchanged(&mut context, before)?;
-                receipts.publish(&generation).map_err(planning)?;
+                let state = rpmdb_startup_state(&snapshot, architecture)?;
+                receipts
+                    .publish_current(&generation, &state)
+                    .map_err(planning)?;
                 trace_phase(trace, started, "startup-rpmdb-receipt-published");
                 (snapshot, Some(generation))
             }
@@ -1142,6 +1259,25 @@ impl ResidentPlanner {
     }
 }
 
+fn rpmdb_startup_state(
+    snapshot: &InventorySnapshot,
+    architecture: Architecture,
+) -> Result<String, DaemonError> {
+    serde_json::to_string(&RpmDbStartupState {
+        schema: "dnfast-rpmdb-startup-state-v1".into(),
+        native_abi: dnfast_native_sys::ABI_VERSION,
+        architecture: architecture.as_rpm_arch().into(),
+        rpmdb_cookie: snapshot.rpmdb_cookie.clone(),
+        inventory_sha256: snapshot
+            .inventory
+            .canonical_sha256()
+            .map_err(planning)?
+            .as_str()
+            .into(),
+    })
+    .map_err(|error| DaemonError::Planning(error.to_string()))
+}
+
 fn build_pool(
     snapshot: PlanningSnapshot,
     repository_ids: Vec<String>,
@@ -1224,7 +1360,20 @@ fn build_pool(
         let priority = i32::try_from(repository.priority).map_err(planning)?;
         let cost = i32::try_from(repository.cost).map_err(planning)?;
         let (binding, binding_sha256) = solv_cache_binding(repository, policy.base_arch())?;
-        match solv_cache.open(&binding_sha256).map_err(planning)? {
+        let cached = match solv_cache.open(&binding_sha256) {
+            Ok(cached) => cached,
+            Err(CacheError::Corrupt(message)) => {
+                if trace {
+                    eprintln!(
+                        "dnfastd_trace solv_cache_repo={} corrupted={message:?}",
+                        repository.id
+                    );
+                }
+                None
+            }
+            Err(error) => return Err(planning(error)),
+        };
+        match cached {
             Some(cache) => {
                 context
                     .add_repository_solv(&repository.id, priority, cost, cache.file(), &binding)
@@ -1357,7 +1506,7 @@ fn rpmdb_receipt_binding(
 ) -> Result<String, DaemonError> {
     let inventory = snapshot.inventory.canonical_sha256().map_err(planning)?;
     let value = format!(
-        "dnfast-rpmdb-verification-receipt-v1\nnative_abi={}\narchitecture={}\nrpmdb_cookie={}\ninventory_sha256={}\n",
+        "dnfast-rpmdb-verification-receipt-v2\nnative_abi={}\narchitecture={}\nrpmdb_cookie={}\ninventory_sha256={}\n",
         dnfast_native_sys::ABI_VERSION,
         architecture.as_rpm_arch(),
         snapshot.rpmdb_cookie,
@@ -1375,7 +1524,17 @@ fn load_installed_solv_cache(
 ) -> Result<(), DaemonError> {
     let (binding, binding_sha256) = installed_solv_cache_binding(snapshot, architecture)?;
     let cache = SolvCache::new(SYSTEM_CACHE_PATH);
-    match cache.open(&binding_sha256).map_err(planning)? {
+    let cached = match cache.open(&binding_sha256) {
+        Ok(cached) => cached,
+        Err(CacheError::Corrupt(message)) => {
+            if trace {
+                eprintln!("dnfastd_trace installed_solv_cache_corrupted={message:?}");
+            }
+            None
+        }
+        Err(error) => return Err(planning(error)),
+    };
+    match cached {
         Some(cached) => {
             context
                 .add_installed_repository_solv(cached.file(), &binding)
@@ -1416,7 +1575,7 @@ fn installed_solv_cache_binding(
 ) -> Result<(Vec<u8>, String), DaemonError> {
     let inventory = snapshot.inventory.canonical_sha256().map_err(planning)?;
     let binding = format!(
-        "dnfast-installed-solv-cache-v1\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrpmdb_cookie={}\ninventory_sha256={}\n",
+        "dnfast-installed-solv-cache-v2\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrpmdb_cookie={}\ninventory_sha256={}\nlimits_validated=true\n",
         dnfast_native_sys::ABI_VERSION,
         architecture.as_rpm_arch(),
         snapshot.rpmdb_cookie,
@@ -1614,7 +1773,7 @@ fn solv_cache_binding(
     architecture: Architecture,
 ) -> Result<(Vec<u8>, String), DaemonError> {
     let binding = format!(
-        "dnfast-solv-cache-v1\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrepository={}\ngeneration_sha256={}\nprimary_sha256={}\nprimary_size={}\n",
+        "dnfast-solv-cache-v2\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrepository={}\ngeneration_sha256={}\nprimary_sha256={}\nprimary_size={}\nlimits_validated=true\n",
         dnfast_native_sys::ABI_VERSION,
         architecture.as_rpm_arch(),
         repository.id,

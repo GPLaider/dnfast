@@ -30,19 +30,19 @@ sudo dnfast daemon warm --repo fedora
 `repo refresh` and package-changing commands require root. `plan` writes a solved, reviewable,
 canonical plan to the mandatory absolute `--output` path. Plans are bound to the exact RPMDB,
 metadata, repository policy, package digests, and trust material and expire after five minutes.
-The convenience mutation commands normally use the root-only `dnfastd` service. The daemon keeps
-one libsolv pool resident, returns the exact solved action set for approval, and accepts an
-approval token only on the same connection and unchanged RPMDB/repository generation. If the
-socket is absent because the installed systemd service is stopped, the root CLI requests one
-non-blocking activation through the fixed root-owned `/usr/bin/systemctl` path and reconnects to
-the same token-bound protocol. If systemd or the service is unavailable, the CLI retains the
-fixed-executor path as a safe compatibility fallback; protocol and integrity failures never fall
-back. Root `plan` also uses the resident solve when the service is available.
+The convenience mutation commands and root `plan` are daemonless by default. Each command opens
+the generation-bound immutable `.solv` cache through `mmap`, builds one libsolv pool, and releases
+it after the result. A Btrfs-protected RPMDB generation receipt can reuse the exact published
+inventory and installed `.solv` input without a redundant librpm walk; any WAL, file-generation,
+ABI, architecture, cookie, inventory, or receipt mismatch takes the full verification path.
+Approved local mutations pass a sealed plan, a sealed compact manifest, and retained verified RPM
+artifact descriptors to the fixed executor. Repository XML, filelists, provider tables, and
+relation evidence are neither copied nor decompressed again at that boundary.
 
-Install `dnfastd` at `/usr/libexec/dnfastd`, install
-[`packaging/dnfastd.service`](packaging/dnfastd.service) as a system service, and enable it before
-benchmarking the resident path. `dnfast daemon status` reports protocol readiness, while
-`dnfast daemon warm` loads the exact selected repository generation outside a timed mutation.
+`dnfastd` remains an explicit opt-in for controlled workloads that prefer a resident solver pool;
+ordinary commands neither enable nor start it. Install it at `/usr/libexec/dnfastd` with
+[`packaging/dnfastd.service`](packaging/dnfastd.service), then explicitly start the service before
+using `dnfast daemon warm`. `dnfast daemon status` only reports protocol readiness.
 
 The daemon caches only an exact canonical intent for the unchanged planning generation and RPMDB
 cookie. Its libsolv pool stays primary-only. During refresh, verified filelists are streamed into

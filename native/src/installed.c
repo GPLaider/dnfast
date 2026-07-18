@@ -29,6 +29,11 @@ dnfast_status dnfast_solver_add_rpmdb(dnfast_context *context,
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                 "libsolv", "repo_add_rpmdb", "rpmdb load failed");
     }
+    status = dnfast_limits_finalize_loaded_repo(context, repo, 0, error);
+    if (status != DNFAST_STATUS_OK) {
+        repo_free(repo, 1);
+        return status;
+    }
     repo->priority = INT_MIN;
     repo_internalize(repo);
     pool_set_installed(context->pool, repo);

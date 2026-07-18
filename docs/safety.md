@@ -6,9 +6,9 @@ Read-only `repo list`, `search`, `doctor`, and `plan` do not change RPMDB state.
 an unprivileged user when it can read the root-published snapshots and write the requested output
 path. Comps `group list` and `group info` are also read-only. `repo refresh`, `apply`, `install`,
 `remove`, `upgrade`, and `group install` require root because they publish system state or can
-change packages. Modulemd interpretation is not implemented: absence is reported exactly and
-present module metadata fails closed before module state can change. Unsupported commands fail
-closed.
+change packages. Module list/info and enable/reset/disable consume only checksum-bound modulemd;
+absence is reported exactly, while malformed or unbound metadata fails closed before module state
+can change. Unsupported commands fail closed.
 
 A valid plan is a solved proposal, not proof that a later transaction must succeed. It is bound to
 the exact repository snapshots, root-published policy, RPMDB inventory, action graph, artifacts,
@@ -37,16 +37,24 @@ cannot publish an incomplete current generation. The cache corruption model cove
 and independent corruption, not a hostile process already able to rewrite all files as the same
 trusted UID. Custom cache roots must not be shared with an untrusted writer.
 
+Serialized libsolv inputs are content addressed and ABI/repository/architecture bound. On Btrfs,
+their integrity cookie binds the content digest to the checksum-protected inode generation, so a
+normal process-cold open does not reread the whole file for SHA-256; cache misses and cookie misses
+still perform the full hash. Libsolv reads the verified bytes from a read-only private `mmap`.
+Detected content, reference, or cookie corruption is never consumed: trusted metadata rebuilds a
+replacement off-path and atomically replaces the damaged cache object before reuse.
+
 Implementation ceilings are 2 MiB for Metalink, 16 MiB for repomd, 512 MiB for compressed
 metadata, 1 GiB for opened metadata, 32 Metalink resources, and 2,000,000 packages. Arithmetic is
 overflow checked and declared oversize input fails before download or allocation.
 
-Schema-v5 planning snapshots refer to content-addressed payloads instead of embedding base64 and
+Schema-v6 planning snapshots refer to content-addressed payloads instead of embedding base64 and
 bind optional comps/module payloads plus the compact file-provides index into each repository.
 Materialization is permitted only for a snapshot read from its trusted, root-owned planning store;
 each blob is opened beneath that store without following an attacker-selected path and its exact
-size and SHA-256 are checked. The executor stages both compressed evidence and decoded native XML
-from that one validated result. Legacy schema-v3/v4 snapshots remain compatible only within their
+size and SHA-256 are checked. The daemonless compact executor does not restage repository metadata;
+the legacy external-plan executor stages compressed evidence and decoded native XML from that one
+validated result. Legacy schema-v3/v4 snapshots remain compatible only within their
 original, narrower authenticated field set; extended fields on an older schema are rejected.
 
 ## Configuration, package, and key trust
@@ -77,7 +85,16 @@ the future is always rejected.
 
 ## Execution and recovery
 
-The resident socket directory is root-owned mode 0700, the socket is mode 0600, frames are bounded,
+The default mutation path is one-shot and does not contact or activate `dnfastd`. The local solve
+is bound to the exact planning snapshot and RPMDB generation, then transferred as a sealed memfd
+plan plus a sealed compact manifest. Only already verified artifact descriptors survive `execve`;
+ambient descriptors are closed. The fixed executor reopens the current planning generation and
+runtime bindings, verifies every repository/trust/key/artifact coordinate, and checks the RPMDB
+cookie under the final librpm write lock before writes. A mismatch aborts. The legacy external
+`apply` path retains its independent root re-solve for plans that were not produced by this
+one-shot boundary.
+
+The optional resident socket directory is root-owned mode 0700, the socket is mode 0600, frames are bounded,
 and `SO_PEERCRED` restricts clients to EUID 0. A stale socket is removed only when it is a
 single-link root-owned socket. The sequential daemon has no general command runner. A prepared
 token binds one canonical solve, RPMDB cookie, planning/trust/policy generation, expiry, daemon
@@ -95,18 +112,19 @@ resident primary-only pool. A missing path, empty candidate set, malformed index
 mismatch fails closed; full filelists are never opened during solve. Integrity or protocol errors
 never trigger a compatibility fallback.
 
-The compatibility fallback can launch only `/usr/libexec/dnfast-executor` with a retained plan
-descriptor and a fixed argument shape. Both paths require root, reject ambient path substitution,
-stage inputs under root-owned directories, revalidate bound state, and ask for approval before
-allowing writes. Librpm performs transaction check, ordering, and execution on one owner thread.
+The executor launcher can launch only `/usr/libexec/dnfast-executor` with fixed descriptor numbers
+and argument shapes. All mutation paths require root, reject ambient path substitution, revalidate
+bound state, and ask for approval before allowing writes. Librpm performs transaction check,
+ordering, and execution on one owner thread.
 
 The daemon verifies the full RPMDB before exposing the socket, again after any external cookie
 change, and on every stateful failure. A successful daemon-owned transaction must change the
 cookie and must exactly match the approved post-transaction identities for every changed package
 name while the write lock is still held. This incremental integrity proof replaces an otherwise
 redundant full verify on the hot success path; it does not bypass TEST, artifact/signature checks,
-cookie validation, exact identity validation, journaling, or failure verification. The fixed
-fallback continues to perform a full post-transaction RPMDB verification.
+cookie validation, exact identity validation, journaling, or failure verification. The daemonless
+compact path uses the same final cookie and incremental identity proof; the legacy external-plan
+path continues to perform a full post-transaction RPMDB verification.
 
 RPM transactions cannot promise atomic rollback once payload or scriptlet execution begins.
 Dnfast writes a durable journal before the real transaction, records callbacks/results, publishes

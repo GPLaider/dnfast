@@ -7,6 +7,7 @@ use std::{
 
 use rustix::fs::{
     AtFlags, IFlags, Mode, OFlags, fstat, fstatfs, fsync, ioctl_getflags, linkat, open, openat,
+    renameat, unlinkat,
 };
 use sha2::{Digest, Sha256};
 
@@ -113,12 +114,25 @@ impl StagedSolv {
             content_name.as_str(),
             AtFlags::EMPTY_PATH,
         ) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Ok(()) => {}
+            Err(rustix::io::Errno::EXIST) => {
+                if !content_matches(&self.directory, &content_name, &sha256, size)? {
+                    replace_from_unnamed(&self.directory, &self.file, &content_name)?;
+                }
+            }
             Err(error) => return Err(errno(error)),
         }
         // Enabling fs-verity requires that no writable descriptor remains open.
         // The linked inode is durable and can now be reopened read-only below.
         drop(self.file);
+        // A rebuild is also the atomic repair boundary for a damaged or stale
+        // generation cookie. Removing only this derived receipt is safe: the
+        // content is fully SHA-256 checked again before a new cookie appears.
+        let cookie_name = format!("{}-{sha256}.integrity", self.binding);
+        match unlinkat(&self.directory, cookie_name.as_str(), AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(errno(error)),
+        }
         let existing = open_content(&self.directory, &self.binding, &content_name, &sha256)?;
         if existing.size != size {
             return Err(CacheError::Corrupt(
@@ -148,11 +162,17 @@ impl StagedSolv {
         ) {
             Ok(()) => {}
             Err(rustix::io::Errno::EXIST) => {
-                let bound = read_reference(&self.directory, &reference_name)?;
-                if bound != sha256 {
-                    return Err(CacheError::Corrupt(
-                        "solv cache binding is nondeterministic".into(),
-                    ));
+                match read_reference(&self.directory, &reference_name) {
+                    Ok(bound) if bound == sha256 => {}
+                    Ok(_) => {
+                        return Err(CacheError::Corrupt(
+                            "solv cache binding is nondeterministic".into(),
+                        ));
+                    }
+                    Err(CacheError::Corrupt(_)) => {
+                        replace_from_unnamed(&self.directory, &reference, &reference_name)?;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             Err(error) => return Err(errno(error)),
@@ -161,6 +181,52 @@ impl StagedSolv {
         open_cached(&self.directory, &self.binding)?
             .ok_or_else(|| CacheError::Corrupt("committed solv cache disappeared".into()))
     }
+}
+
+fn content_matches(
+    directory: &OwnedFd,
+    name: &str,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<bool, CacheError> {
+    let descriptor = match openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(false),
+        Err(error) => return Err(errno(error)),
+    };
+    if validate_regular(&descriptor).is_err() {
+        return Ok(false);
+    }
+    let mut file = File::from(descriptor);
+    Ok(matches!(
+        verify_stream(&mut file, Some(expected_sha256)),
+        Ok((_, size)) if size == expected_size
+    ))
+}
+
+fn replace_from_unnamed(
+    directory: &OwnedFd,
+    source: &File,
+    target: &str,
+) -> Result<(), CacheError> {
+    let identity = fstat(source).map_err(errno)?;
+    let repair = format!(
+        ".{target}.repair-{}-{}",
+        std::process::id(),
+        identity.st_ino
+    );
+    let _ = unlinkat(directory, repair.as_str(), AtFlags::empty());
+    linkat(source, "", directory, repair.as_str(), AtFlags::EMPTY_PATH).map_err(errno)?;
+    if let Err(error) = renameat(directory, repair.as_str(), directory, target) {
+        let _ = unlinkat(directory, repair.as_str(), AtFlags::empty());
+        return Err(errno(error));
+    }
+    fsync(directory).map_err(errno)
 }
 
 fn open_directory(path: &Path) -> Result<OwnedFd, CacheError> {
@@ -706,6 +772,13 @@ mod tests {
         std::fs::remove_file(&path).expect("remove immutable cache entry");
         std::fs::write(path, b"evil payload").expect("replace cache entry");
         assert!(cache.open(&binding()).is_err());
+        let repaired = cache.stage(&binding()).expect("repair stage");
+        repaired
+            .file()
+            .write_all(b"solv payload")
+            .expect("repair write");
+        repaired.commit().expect("atomic content repair");
+        assert_eq!(cache.open(&binding()).unwrap().unwrap().size(), 12);
     }
 
     #[test]
@@ -723,6 +796,13 @@ mod tests {
             std::fs::remove_file(&path).expect("remove integrity cookie");
             std::fs::write(&path, b"corrupt\n").expect("replace integrity cookie");
             assert!(cache.open(&binding()).is_err());
+            let repaired = cache.stage(&binding()).expect("repair stage");
+            repaired
+                .file()
+                .write_all(b"solv payload")
+                .expect("repair write");
+            repaired.commit().expect("atomic cookie repair");
+            assert_eq!(cache.open(&binding()).unwrap().unwrap().size(), 12);
         }
     }
 

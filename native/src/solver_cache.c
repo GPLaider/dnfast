@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include "internal.h"
 
 #include <errno.h>
@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define DNFAST_MAX_PACKAGE_LOCATION_BYTES (UINT64_C(1024) * UINT64_C(1024))
@@ -117,17 +118,27 @@ dnfast_status dnfast_solver_add_repo_solv(
     status = dnfast_callback_check(&context->callbacks, error);
     if (status != DNFAST_STATUS_OK) return status;
 #ifdef DNFAST_NATIVE_REAL
-    FILE *stream = NULL;
     struct stat before;
-    if (!retained_stream(retained_fd, "rb", &stream, &before))
+    if (retained_fd < 0 || fstat(retained_fd, &before) != 0 ||
+        !S_ISREG(before.st_mode) || before.st_size <= 0 ||
+        (uintmax_t)before.st_size > SIZE_MAX)
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
-                                "solver-cache", "fdopen", "solv cache open failed");
-    if (fseek(stream, 0, SEEK_SET) != 0) {
-        (void)fclose(stream);
+                                "solver-cache", "fstat", "solv cache open failed");
+    size_t mapped_size = (size_t)before.st_size;
+    void *mapping = mmap(NULL, mapped_size, PROT_READ, MAP_PRIVATE, retained_fd, 0);
+    if (mapping == MAP_FAILED)
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
-                                "solver-cache", "fseek", "solv cache rewind failed");
+                                "solver-cache", "mmap", "solv cache map failed");
+    if (getenv("DNFAST_NATIVE_TRACE") != NULL)
+        fprintf(stderr, "dnfast_native_trace solv_cache_input=mmap bytes=%zu\n",
+                mapped_size);
+    FILE *stream = fmemopen(mapping, mapped_size, "rb");
+    if (stream == NULL) {
+        (void)munmap(mapping, mapped_size);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "solver-cache", "fmemopen", "solv cache stream failed");
     }
-    int metadata_fds[3] = {fileno(stream), -1, -1};
+    int metadata_fds[3] = {retained_fd, -1, -1};
     status = dnfast_limits_before_repo(context, metadata_fds, 1, error);
     unsigned char *userdata = NULL;
     int userdata_size = 0;
@@ -153,18 +164,22 @@ dnfast_status dnfast_solver_add_repo_solv(
     }
     struct stat after;
     if (status == DNFAST_STATUS_OK &&
-        (fstat(fileno(stream), &after) != 0 || before.st_dev != after.st_dev ||
+        (fstat(retained_fd, &after) != 0 || before.st_dev != after.st_dev ||
          before.st_ino != after.st_ino || before.st_size != after.st_size))
         status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                   "solver-cache", "fstat",
                                   "solv cache changed during load");
     if (status == DNFAST_STATUS_OK)
-        status = dnfast_limits_finalize_loaded_repo(
+        status = dnfast_limits_accept_validated_repo(
             context, repo, (uint64_t)before.st_size, error);
     if (fclose(stream) != 0 && status == DNFAST_STATUS_OK)
         status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                   "solver-cache", "fclose",
                                   "solv cache close failed");
+    if (munmap(mapping, mapped_size) != 0 && status == DNFAST_STATUS_OK)
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "solver-cache", "munmap",
+                                  "solv cache unmap failed");
     if (status != DNFAST_STATUS_OK) {
         if (repo != NULL) repo_free(repo, 1);
         return status;

@@ -23,7 +23,10 @@ pub use model::{
     CacheError, CompleteSnapshot, OriginError, RepomdAuthentication, SelectedOrigin, Snapshot,
     SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration,
 };
-pub use rpmdb_receipt::{RpmDbReceiptCache, RpmDbReceiptCheck, RpmDbVerifiedGeneration};
+pub use rpmdb_receipt::{
+    RpmDbCurrentCheck, RpmDbCurrentReceipt, RpmDbReceiptCache, RpmDbReceiptCheck,
+    RpmDbVerifiedGeneration,
+};
 pub use solv_cache::{CachedSolv, SolvCache, StagedSolv};
 
 #[derive(Debug)]

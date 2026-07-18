@@ -7,7 +7,10 @@ use std::rc::Rc;
 mod authority;
 pub use authority::{Authority, fork_probe as authority_fork_probe};
 mod executor_fd;
-pub use executor_fd::{ExecutorApproval, exec_fixed_executor, take_inherited_plan_fd};
+pub use executor_fd::{
+    ExecutorApproval, exec_fixed_executor, exec_fixed_executor_compact, take_inherited_artifact_fd,
+    take_inherited_compact_fd, take_inherited_plan_fd,
+};
 mod inventory;
 pub use inventory::{
     Inventory, InventoryPackage, InventoryRead, fixture_inventory_counts,

@@ -57,38 +57,6 @@ pub(crate) struct Response {
 }
 
 impl Response {
-    pub(crate) fn from_daemon(outcome: dnfast_executor::DaemonOutcome) -> Self {
-        let status = match outcome.status {
-            dnfast_executor::DaemonStatus::Applied => Status::Applied,
-            dnfast_executor::DaemonStatus::Aborted => Status::Aborted,
-        };
-        Self {
-            schema: CLI_SCHEMA.into(),
-            command: outcome.command,
-            status,
-            exit_code: 0,
-            message: None,
-            plan_digest: Some(outcome.plan_digest),
-            plan_path: None,
-            transaction_id: outcome.transaction_id,
-            actions: outcome
-                .actions
-                .into_iter()
-                .map(|action| Action {
-                    kind: action.kind,
-                    name: action.name,
-                    epoch: action.epoch,
-                    version: action.version,
-                    release: action.release,
-                    arch: action.arch,
-                    repo_id: action.repo_id,
-                    reason: action.reason,
-                })
-                .collect(),
-            errors: Vec::new(),
-        }
-    }
-
     pub(crate) fn failed(
         command: &str,
         exit_code: u8,

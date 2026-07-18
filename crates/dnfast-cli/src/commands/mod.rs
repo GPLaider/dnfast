@@ -163,30 +163,22 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
     let assume_no = arguments.assumeno;
     let native_action = Action::from(action);
     let mut approval = approval(arguments.assumeyes, arguments.assumeno)?;
-    let daemon_approval = daemon_approval(arguments.assumeyes, arguments.assumeno)?;
     let repositories = canonical_repository_ids(arguments.repositories)?;
-    match dnfast_executor::transact_via_daemon(
-        native_action,
-        &arguments.packages,
-        &repositories,
-        daemon_approval,
-    ) {
-        Ok(outcome) => return Ok(Response::from_daemon(outcome)),
-        Err(error) if error.is_unavailable() => {}
-        Err(error) => return Err(AppFailure::new(1, error.to_string())),
-    }
-    // The local fallback reads RPMDB before it execs the fixed executor.
-    // Preserve the inherited terminal for the later approval prompt, but keep
-    // librpm non-interactive while this pre-approval root boundary is open.
-    let mut standard_input = DetachedStandardInput::new()?;
-    let plan = match dnfast_executor::plan_without_daemon(
+    // Mutations are one-shot by default: no service is started and no solver
+    // pool survives the command.  The explicit `dnfast daemon` commands remain
+    // available for operators who intentionally opt into a resident service.
+    let local = dnfast_executor::plan_transaction_without_daemon(
         native_action,
         &arguments.packages,
         &repositories,
     )
-    .map_err(|error| AppFailure::new(1, error.to_string()))?
-    {
-        Some(local) => local.plan,
+    .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    // The local fallback reads RPMDB before it execs the fixed executor.
+    // Preserve the inherited terminal for the later approval prompt, but keep
+    // librpm non-interactive while this pre-approval root boundary is open.
+    let mut standard_input = DetachedStandardInput::new()?;
+    let plan = match &local {
+        Some(local) => local.plan().clone(),
         None => planner::solve(intent(action, arguments.packages)?, &repositories)?,
     };
     if assume_no {
@@ -203,35 +195,55 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
         approval = dnfast_native_sys::ExecutorApproval::Yes;
         standard_input = DetachedStandardInput::new()?;
     }
-    let bytes = plan
-        .canonical_json()
-        .map_err(|error| AppFailure::new(1, error.to_string()))?;
-    let mut temporary = tempfile::NamedTempFile::new_in("/var/lib/dnfast")
-        .map_err(|error| AppFailure::new(1, error.to_string()))?;
-    temporary
-        .as_file()
-        .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .map_err(|error| AppFailure::new(1, error.to_string()))?;
-    std::io::Write::write_all(&mut temporary.as_file(), &bytes)
-        .map_err(|error| AppFailure::new(1, error.to_string()))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| AppFailure::new(1, error.to_string()))?;
-    temporary
-        .as_file_mut()
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| AppFailure::new(1, error.to_string()))?;
-    let plan_fd = temporary
-        .as_file()
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|error| AppFailure::new(1, error.to_string()))?;
-    prepare_locally_solved_before_fixed_executor(&plan_fd)?;
-    standard_input.restore()?;
-    match dnfast_native_sys::exec_fixed_executor(plan_fd, approval) {
-        Ok(()) => Err(AppFailure::new(1, "fixed executor unexpectedly returned")),
-        Err(error) => Err(AppFailure::new(1, error.to_string())),
+    match local {
+        Some(local) => {
+            let compact = local
+                .prepare_compact()
+                .map_err(|error| AppFailure::new(1, error.to_string()))?;
+            let (plan_fd, manifest_fd, artifacts) = compact.into_parts();
+            standard_input.restore()?;
+            match dnfast_native_sys::exec_fixed_executor_compact(
+                plan_fd,
+                manifest_fd,
+                artifacts,
+                approval,
+            ) {
+                Ok(()) => Err(AppFailure::new(1, "fixed executor unexpectedly returned")),
+                Err(error) => Err(AppFailure::new(1, error.to_string())),
+            }
+        }
+        None => {
+            let bytes = plan
+                .canonical_json()
+                .map_err(|error| AppFailure::new(1, error.to_string()))?;
+            let mut temporary = tempfile::NamedTempFile::new_in("/var/lib/dnfast")
+                .map_err(|error| AppFailure::new(1, error.to_string()))?;
+            temporary
+                .as_file()
+                .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .map_err(|error| AppFailure::new(1, error.to_string()))?;
+            std::io::Write::write_all(&mut temporary.as_file(), &bytes)
+                .map_err(|error| AppFailure::new(1, error.to_string()))?;
+            temporary
+                .as_file()
+                .sync_all()
+                .map_err(|error| AppFailure::new(1, error.to_string()))?;
+            temporary
+                .as_file_mut()
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| AppFailure::new(1, error.to_string()))?;
+            let plan_fd = temporary
+                .as_file()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|error| AppFailure::new(1, error.to_string()))?;
+            prepare_locally_solved_before_fixed_executor(&plan_fd)?;
+            standard_input.restore()?;
+            match dnfast_native_sys::exec_fixed_executor(plan_fd, approval) {
+                Ok(()) => Err(AppFailure::new(1, "fixed executor unexpectedly returned")),
+                Err(error) => Err(AppFailure::new(1, error.to_string())),
+            }
+        }
     }
 }
 
@@ -280,18 +292,6 @@ impl Drop for DetachedStandardInput {
         if let Some(inherited) = self.inherited.as_ref() {
             let _ = rustix::stdio::dup2_stdin(inherited);
         }
-    }
-}
-
-fn daemon_approval(
-    assumeyes: bool,
-    assumeno: bool,
-) -> Result<dnfast_executor::DaemonApproval, AppFailure> {
-    match (assumeyes, assumeno) {
-        (false, false) => Ok(dnfast_executor::DaemonApproval::Prompt),
-        (true, false) => Ok(dnfast_executor::DaemonApproval::Yes),
-        (false, true) => Ok(dnfast_executor::DaemonApproval::No),
-        (true, true) => Err(AppFailure::new(2, "--assumeyes and --assumeno conflict")),
     }
 }
 
@@ -444,19 +444,11 @@ fn run_plan(
     output::validate_new_path(&output)?;
     let repositories = canonical_repository_ids(repositories)?;
     let plan = if rustix::process::geteuid().as_raw() == 0 {
-        match dnfast_executor::plan_via_daemon(Action::from(action), &packages, &repositories) {
-            Ok(resident) => resident.plan,
-            Err(error) if error.is_unavailable() => match dnfast_executor::plan_without_daemon(
-                Action::from(action),
-                &packages,
-                &repositories,
-            )
+        match dnfast_executor::plan_without_daemon(Action::from(action), &packages, &repositories)
             .map_err(|error| AppFailure::new(1, error.to_string()))?
-            {
-                Some(local) => local.plan,
-                None => planner::solve(intent(action, packages)?, &repositories)?,
-            },
-            Err(error) => return Err(AppFailure::new(1, error.to_string())),
+        {
+            Some(local) => local.plan,
+            None => planner::solve(intent(action, packages)?, &repositories)?,
         }
     } else {
         planner::solve(intent(action, packages)?, &repositories)?

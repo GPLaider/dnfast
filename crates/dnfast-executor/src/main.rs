@@ -11,8 +11,9 @@ use std::{
 };
 
 use dnfast_executor::{
-    ExecutorError, InheritedPlan, MountRoot, RootInputs, Staging, execute_checked_transaction,
-    recover_pending_transactions, require_root_resolve_equal,
+    CompactTransactionInputs, ExecutorError, InheritedPlan, MountRoot, RootInputs, Staging,
+    execute_checked_transaction, recover_pending_transactions, require_root_resolve_equal,
+    run_token_bound,
 };
 use serde::Serialize;
 
@@ -47,16 +48,7 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(ExecutorError::NotRoot);
     }
-    let approval = match arguments.as_slice() {
-        [flag, fd] if flag == "--plan-fd" && fd == "3" => Approval::Prompt,
-        [flag, fd, value] if flag == "--plan-fd" && fd == "3" && value == "--assumeyes" => {
-            Approval::Yes
-        }
-        [flag, fd, value] if flag == "--plan-fd" && fd == "3" && value == "--assumeno" => {
-            Approval::No
-        }
-        _ => return Err(ExecutorError::Arguments),
-    };
+    let invocation = Invocation::parse(&arguments)?;
     let store = dnfast_state::JournalStore::open_system()
         .map_err(|error| ExecutorError::Plan(error.to_string()))?;
     let plan = InheritedPlan::read()?;
@@ -71,6 +63,46 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
     // inspect RPMDB before approval, so temporarily make that whole boundary
     // non-interactive, then restore the exact inherited stdin for the prompt.
     let mut standard_input = DetachedStandardInput::new()?;
+    if let Some(artifact_count) = invocation.compact_artifacts {
+        let mut compact = CompactTransactionInputs::read(&proposal, artifact_count)?;
+        recover_pending_transactions(&store, compact.staged_mut().policy.base_arch())?;
+        let staging = Staging::create(plan.bytes())?;
+        let mut root = MountRoot::create(&staging)?;
+        standard_input.restore()?;
+        if !invocation.approval.approved()? {
+            root.cleanup()?;
+            staging.cleanup()?;
+            return Ok(Outcome::Aborted(proposal));
+        }
+        detach_standard_input()?;
+        compact.revalidate_runtime(&proposal)?;
+        let id = dnfast_state::TransactionId::parse(staging.id())
+            .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+        let digest = proposal
+            .digest()
+            .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+        let journal = store
+            .create(&id, digest.as_str())
+            .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+        let (mut staged, inventory, rpmdb_cookie) = compact.into_parts();
+        root.allow_writes()?;
+        root.verify_unchanged()?;
+        let execution = run_token_bound(
+            &proposal,
+            &mut staged,
+            &inventory,
+            &rpmdb_cookie,
+            Rc::new(journal),
+            "/",
+            &root,
+        );
+        root.restore_namespace_root()?;
+        staging.cleanup()?;
+        let inventory_after = execution?;
+        republish_planning_inventory_after_transaction(&inventory_after)?;
+        root.cleanup()?;
+        return Ok(Outcome::Executed(proposal, id.as_str().into()));
+    }
     let inputs = RootInputs::open(&proposal)?;
     recover_pending_transactions(&store, inputs.base_arch()?)?;
     let mut staging = Staging::create(plan.bytes())?;
@@ -82,7 +114,7 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
         .ok_or(ExecutorError::Plan("mount root is not UTF-8".into()))?;
     let inventory = require_root_resolve_equal(&proposal, &staged, root_path)?;
     standard_input.restore()?;
-    if !approval.approved()? {
+    if !invocation.approval.approved()? {
         root.cleanup()?;
         staging.cleanup()?;
         return Ok(Outcome::Aborted(proposal));
@@ -112,6 +144,78 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
     republish_planning_inventory_after_transaction(&inventory_after)?;
     root.cleanup()?;
     Ok(Outcome::Executed(proposal, id.as_str().into()))
+}
+
+struct Invocation {
+    approval: Approval,
+    compact_artifacts: Option<usize>,
+}
+
+impl Invocation {
+    fn parse(arguments: &[String]) -> Result<Self, ExecutorError> {
+        let approval = |value: Option<&str>| match value {
+            None => Ok(Approval::Prompt),
+            Some("--assumeyes") => Ok(Approval::Yes),
+            Some("--assumeno") => Ok(Approval::No),
+            _ => Err(ExecutorError::Arguments),
+        };
+        match arguments {
+            [flag, fd] if flag == "--plan-fd" && fd == "3" => Ok(Self {
+                approval: approval(None)?,
+                compact_artifacts: None,
+            }),
+            [flag, fd, value] if flag == "--plan-fd" && fd == "3" => Ok(Self {
+                approval: approval(Some(value))?,
+                compact_artifacts: None,
+            }),
+            [
+                plan_flag,
+                plan_fd,
+                compact_flag,
+                compact_fd,
+                base_flag,
+                base,
+                count_flag,
+                count,
+            ] if plan_flag == "--plan-fd"
+                && plan_fd == "3"
+                && compact_flag == "--compact-fd"
+                && compact_fd == "4"
+                && base_flag == "--artifact-fd-base"
+                && base == "5"
+                && count_flag == "--artifact-count" =>
+            {
+                Ok(Self {
+                    approval: approval(None)?,
+                    compact_artifacts: Some(count.parse().map_err(|_| ExecutorError::Arguments)?),
+                })
+            }
+            [
+                plan_flag,
+                plan_fd,
+                compact_flag,
+                compact_fd,
+                base_flag,
+                base,
+                count_flag,
+                count,
+                value,
+            ] if plan_flag == "--plan-fd"
+                && plan_fd == "3"
+                && compact_flag == "--compact-fd"
+                && compact_fd == "4"
+                && base_flag == "--artifact-fd-base"
+                && base == "5"
+                && count_flag == "--artifact-count" =>
+            {
+                Ok(Self {
+                    approval: approval(Some(value))?,
+                    compact_artifacts: Some(count.parse().map_err(|_| ExecutorError::Arguments)?),
+                })
+            }
+            _ => Err(ExecutorError::Arguments),
+        }
+    }
 }
 
 struct DetachedStandardInput {
