@@ -46,6 +46,16 @@ fn run_inner(
 ) -> Result<dnfast_core::InstalledInventory, ExecutorError> {
     let trace = std::env::var_os("DNFASTD_TRACE").is_some();
     let started = Instant::now();
+    // Open and retain the exact root-owned reason-state directory before any
+    // RPM transaction can become stateful.  A fresh installation may not have
+    // created it yet, and discovering that only after rpmtsRun succeeds would
+    // report a failed command after changing RPMDB.  The retained descriptor
+    // also prevents the post-transaction write from resolving a replacement
+    // path.
+    let reason_store = dnfast_state::ReasonStateStore::open_system().map_err(|error| {
+        ExecutorError::Plan(format!("package reason state preflight failed: {error}"))
+    })?;
+    trace_phase(trace, started, "reason-state-preflight");
     let isolated_keyrings = staged
         .repositories
         .iter()
@@ -250,8 +260,8 @@ fn run_inner(
         .verify_unchanged()
         .map_err(|error| ExecutorError::MountStateful(error.to_string()))?;
     let after = executor.inventory().clone();
-    dnfast_state::ReasonStateStore::open_system()
-        .and_then(|store| store.record_success(inventory, &after, plan.proposal(), &staged.policy))
+    reason_store
+        .record_success(inventory, &after, plan.proposal(), &staged.policy)
         .map_err(|error| {
             ExecutorError::Plan(format!(
                 "package reason state persistence failed after successful transaction: {error}"
