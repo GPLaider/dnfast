@@ -134,6 +134,21 @@ impl Response {
         }
     }
 
+    pub(crate) fn aborted(command: &str, plan_digest: String, actions: Vec<Action>) -> Self {
+        Self {
+            schema: CLI_SCHEMA.into(),
+            command: command.into(),
+            status: Status::Aborted,
+            exit_code: 0,
+            message: None,
+            plan_digest: Some(plan_digest),
+            plan_path: None,
+            transaction_id: None,
+            actions,
+            errors: Vec::new(),
+        }
+    }
+
     pub(crate) fn completed(command: &str, message: impl Into<String>) -> Self {
         Self {
             schema: CLI_SCHEMA.into(),

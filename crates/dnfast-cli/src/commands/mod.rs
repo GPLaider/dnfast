@@ -160,11 +160,13 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(AppFailure::new(1, "mutation requires root"));
     }
-    let approval = approval(arguments.assumeyes, arguments.assumeno)?;
+    let assume_no = arguments.assumeno;
+    let native_action = Action::from(action);
+    let mut approval = approval(arguments.assumeyes, arguments.assumeno)?;
     let daemon_approval = daemon_approval(arguments.assumeyes, arguments.assumeno)?;
     let repositories = canonical_repository_ids(arguments.repositories)?;
     match dnfast_executor::transact_via_daemon(
-        Action::from(action),
+        native_action,
         &arguments.packages,
         &repositories,
         daemon_approval,
@@ -177,8 +179,30 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
     // Preserve the inherited terminal for the later approval prompt, but keep
     // librpm non-interactive while this pre-approval root boundary is open.
     let mut standard_input = DetachedStandardInput::new()?;
-    let intent = intent(action, arguments.packages)?;
-    let plan = planner::solve(intent, &repositories)?;
+    let plan = match dnfast_executor::plan_without_daemon(
+        native_action,
+        &arguments.packages,
+        &repositories,
+    )
+    .map_err(|error| AppFailure::new(1, error.to_string()))?
+    {
+        Some(local) => local.plan,
+        None => planner::solve(intent(action, arguments.packages)?, &repositories)?,
+    };
+    if assume_no {
+        return aborted_plan_response(&plan);
+    }
+    if approval == dnfast_native_sys::ExecutorApproval::Prompt {
+        // Match the daemon boundary: the immutable, RPMDB-bound plan is
+        // complete before asking, while artifact staging and the independent
+        // fixed-executor re-solve happen only after explicit approval.
+        standard_input.restore()?;
+        if !prompt_local_approval()? {
+            return aborted_plan_response(&plan);
+        }
+        approval = dnfast_native_sys::ExecutorApproval::Yes;
+        standard_input = DetachedStandardInput::new()?;
+    }
     let bytes = plan
         .canonical_json()
         .map_err(|error| AppFailure::new(1, error.to_string()))?;
@@ -209,6 +233,17 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
         Ok(()) => Err(AppFailure::new(1, "fixed executor unexpectedly returned")),
         Err(error) => Err(AppFailure::new(1, error.to_string())),
     }
+}
+
+fn prompt_local_approval() -> Result<bool, AppFailure> {
+    eprint!("dnfast transaction is planned. Continue? [y/N] ");
+    std::io::Write::flush(&mut std::io::stderr())
+        .map_err(|error| AppFailure::new(1, format!("write approval prompt failed: {error}")))?;
+    let mut reply = String::new();
+    std::io::stdin()
+        .read_line(&mut reply)
+        .map_err(|error| AppFailure::new(1, format!("read approval failed: {error}")))?;
+    Ok(matches!(reply.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
 struct DetachedStandardInput {
@@ -411,9 +446,16 @@ fn run_plan(
     let plan = if rustix::process::geteuid().as_raw() == 0 {
         match dnfast_executor::plan_via_daemon(Action::from(action), &packages, &repositories) {
             Ok(resident) => resident.plan,
-            Err(error) if error.is_unavailable() => {
-                planner::solve(intent(action, packages)?, &repositories)?
-            }
+            Err(error) if error.is_unavailable() => match dnfast_executor::plan_without_daemon(
+                Action::from(action),
+                &packages,
+                &repositories,
+            )
+            .map_err(|error| AppFailure::new(1, error.to_string()))?
+            {
+                Some(local) => local.plan,
+                None => planner::solve(intent(action, packages)?, &repositories)?,
+            },
             Err(error) => return Err(AppFailure::new(1, error.to_string())),
         }
     } else {
@@ -503,6 +545,26 @@ fn response_action(action: &dnfast_solver::ExplainedAction) -> ResponseAction {
         repo_id: action.repo_id.clone(),
         reason,
     }
+}
+
+fn aborted_plan_response(
+    plan: &dnfast_solver::CanonicalSolverPlan,
+) -> Result<Response, AppFailure> {
+    let command = match plan.proposal().intent().action() {
+        Action::Install => "install",
+        Action::Upgrade => "upgrade",
+        Action::Remove => "remove",
+    };
+    let digest = plan
+        .digest()
+        .map_err(|error| AppFailure::new(1, error.to_string()))?
+        .as_str()
+        .to_owned();
+    Ok(Response::aborted(
+        command,
+        digest,
+        plan.actions().iter().map(response_action).collect(),
+    ))
 }
 
 fn run_doctor() -> Response {

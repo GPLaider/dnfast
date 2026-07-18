@@ -7,6 +7,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     rc::Rc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -48,6 +49,8 @@ const PLAN_LIFETIME_SECONDS: u64 = 300;
 const PROTOCOL_SCHEMA: &str = "dnfast.daemon.v1";
 const CONNECT_RETRY_LIMIT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
+const SYSTEM_SERVICE: &str = "dnfastd.service";
 const SYSTEM_RPMDB_PATH: &str = "/usr/lib/sysimage/rpm/rpmdb.sqlite";
 const SYSTEM_RPMDB_WAL_PATH: &str = "/usr/lib/sysimage/rpm/rpmdb.sqlite-wal";
 type MaterializedPaths = (String, String, String);
@@ -266,6 +269,36 @@ pub fn plan_via_daemon(
     }
 }
 
+/// Builds one plan with the same verified cached pool used by the resident
+/// daemon when the service is genuinely unavailable.
+///
+/// `None` means an absolute selector needs the legacy full-filelists planner.
+/// The common path keeps the receipt, immutable solv cache, module policy,
+/// compact selector, and final root-state revalidation contracts identical to
+/// the daemon path without retaining a pool after the call.
+pub fn plan_without_daemon(
+    action: Action,
+    packages: &[String],
+    repositories: &[String],
+) -> Result<Option<DaemonPlan>, DaemonError> {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return Err(DaemonError::NotRoot);
+    }
+    canonical_repository_ids(repositories)?;
+    let mut planner = ResidentPlanner::default();
+    planner.verify_startup(system_architecture()?)?;
+    let result = if planner.requires_full_filelists(action, packages, repositories)? {
+        Ok(None)
+    } else {
+        let solved = planner.solve(action, packages.to_vec(), repositories)?;
+        revalidate_solved(&solved)?;
+        Ok(Some(DaemonPlan { plan: solved.plan }))
+    };
+    drop(planner);
+    dnfast_native::release_unused_memory();
+    result
+}
+
 pub fn transact_via_daemon(
     action: Action,
     packages: &[String],
@@ -361,16 +394,62 @@ fn connect_once() -> Result<UnixStream, DaemonError> {
 }
 
 fn connect_retry() -> Result<UnixStream, DaemonError> {
-    let deadline = Instant::now() + CONNECT_RETRY_LIMIT;
+    let mut deadline = Instant::now() + CONNECT_RETRY_LIMIT;
+    let mut service_start_requested = false;
     loop {
         match connect_once() {
             Ok(stream) => return Ok(stream),
+            // systemd creates RuntimeDirectory before it execs the service.
+            // If the installed service is stopped, request one non-blocking
+            // activation through a fixed, root-owned binary and then wait for
+            // its root-only socket.  Unsupported/non-systemd environments
+            // retain the verified one-shot compatibility fallback.
+            Err(DaemonError::Unavailable)
+                if !Path::new("/run/dnfast").is_dir() && !service_start_requested =>
+            {
+                service_start_requested = true;
+                if !request_system_service_start() {
+                    return Err(DaemonError::Unavailable);
+                }
+                deadline = Instant::now() + CONNECT_RETRY_LIMIT;
+            }
             Err(DaemonError::Unavailable) if Instant::now() < deadline => {
                 std::thread::sleep(CONNECT_RETRY_INTERVAL);
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+fn request_system_service_start() -> bool {
+    if !Path::new("/run/systemd/system").is_dir() {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(SYSTEMCTL_PATH) else {
+        return false;
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() != 1
+    {
+        return false;
+    }
+    Command::new(SYSTEMCTL_PATH)
+        .args([
+            "--system",
+            "--no-ask-password",
+            "--no-block",
+            "start",
+            SYSTEM_SERVICE,
+        ])
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 pub fn serve_system() -> Result<(), DaemonError> {

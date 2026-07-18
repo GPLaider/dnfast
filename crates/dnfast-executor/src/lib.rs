@@ -21,7 +21,8 @@ pub use plan_fd::{InheritedPlan, MAX_PLAN_BYTES, open_plan, validate_plan_path};
 pub use recovery::recover_pending_transactions;
 pub use resident::{
     DaemonAction, DaemonApproval, DaemonError, DaemonOutcome, DaemonPlan, DaemonStatus,
-    SYSTEM_SOCKET, daemon_status, plan_via_daemon, serve_system, transact_via_daemon, warm_daemon,
+    SYSTEM_SOCKET, daemon_status, plan_via_daemon, plan_without_daemon, serve_system,
+    transact_via_daemon, warm_daemon,
 };
 pub use root_inputs::RootInputs;
 pub use root_preparer::{PreparationError, PreparedInputs, RootInputPreparer};

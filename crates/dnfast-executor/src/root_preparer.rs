@@ -183,22 +183,27 @@ fn prepare_into_draft(
 
     let repositories = selected_repositories(snapshot, proposal)?;
     let mut materialized_repositories = Vec::with_capacity(repositories.len());
+    let mut repository_inputs = Vec::with_capacity(repositories.len());
     let mut candidates = Vec::new();
     let mut metadata = Vec::new();
     for (index, repository) in repositories.iter().enumerate() {
-        let materialized = draft.write_repository(snapshot, repository, index)?;
-        let mut repomd = draft.open(&materialized.input.repomd)?;
-        let mut primary = draft.open(&materialized.input.primary)?;
-        let parsed = parse_candidates(
-            &materialized.input,
-            &mut repomd,
-            &mut primary,
-            policy.base_arch(),
-        )
-        .map_err(inputs)?;
-        candidates.extend(parsed.0);
-        metadata.extend(parsed.1);
         if let Some((context, _)) = &mut context {
+            let materialized = draft.write_repository(snapshot, repository, index)?;
+            // A locally solved proposal was already built from this exact
+            // immutable snapshot.  Only the independent re-solve path needs
+            // another full candidate/relation copy here; the fixed executor
+            // will parse the published raw metadata at its own boundary.
+            let mut repomd = draft.open(&materialized.input.repomd)?;
+            let mut primary = draft.open(&materialized.input.primary)?;
+            let parsed = parse_candidates(
+                &materialized.input,
+                &mut repomd,
+                &mut primary,
+                policy.base_arch(),
+            )
+            .map_err(inputs)?;
+            candidates.extend(parsed.0);
+            metadata.extend(parsed.1);
             context
                 .add_repository(Repository {
                     id: materialized.input.id.clone(),
@@ -209,8 +214,15 @@ fn prepare_into_draft(
                     cost: materialized.input.cost,
                 })
                 .map_err(native)?;
+            repository_inputs.push(materialized.input.clone());
+            materialized_repositories.push(materialized);
+        } else {
+            // The local fallback has already solved and revalidated this exact
+            // immutable snapshot.  Publish only the digest-bound raw payloads
+            // consumed by the fixed executor instead of inflating duplicate
+            // native XML that would immediately be discarded.
+            repository_inputs.push(draft.write_repository_raw(snapshot, repository, index)?);
         }
-        materialized_repositories.push(materialized);
     }
 
     let module_catalog = snapshot
@@ -222,10 +234,6 @@ fn prepare_into_draft(
     apply_module_artifact_policy(&mut candidates, &module_policies);
 
     draft.discard_native_metadata(&materialized_repositories)?;
-    let repository_inputs = materialized_repositories
-        .into_iter()
-        .map(|materialized| materialized.input)
-        .collect::<Vec<_>>();
     if let Some((mut context, inventory)) = context {
         let module_excludes = module_policies
             .iter()

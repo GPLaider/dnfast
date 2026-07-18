@@ -131,6 +131,52 @@ impl InputDraft {
         )
     }
 
+    pub(crate) fn write_repository_raw(
+        &mut self,
+        snapshot: &PlanningSnapshot,
+        repository: &PlanningRepository,
+        index: usize,
+    ) -> Result<InputRepository, PreparationError> {
+        let prefix = format!("repo-{index}");
+        let repomd =
+            self.write_snapshot_payload(snapshot, &repository.repomd, &format!("{prefix}-repomd"))?;
+        let primary = self.write_snapshot_payload(
+            snapshot,
+            &repository.primary,
+            &format!("{prefix}-primary"),
+        )?;
+        let filelists = self.write_snapshot_payload(
+            snapshot,
+            &repository.filelists,
+            &format!("{prefix}-filelists"),
+        )?;
+        let file_provides = self.write_optional_payload(
+            snapshot,
+            repository.file_provides.as_ref(),
+            &format!("{prefix}-file-provides"),
+        )?;
+        let group = self.write_optional_payload(
+            snapshot,
+            repository.group.as_ref(),
+            &format!("{prefix}-group"),
+        )?;
+        let modules = self.write_optional_payload(
+            snapshot,
+            repository.modules.as_ref(),
+            &format!("{prefix}-modules"),
+        )?;
+        self.repository_input(
+            repository,
+            index,
+            repomd,
+            primary,
+            filelists,
+            file_provides,
+            group,
+            modules,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn write_legacy_repository(
         &mut self,
@@ -163,6 +209,36 @@ impl InputDraft {
             &format!("{prefix}-native-filelists.xml"),
             metadata.filelists(),
         )?;
+        let input = self.repository_input(
+            repository,
+            index,
+            repomd,
+            primary,
+            filelists,
+            file_provides,
+            group,
+            modules,
+        )?;
+        Ok(MaterializedRepository {
+            input,
+            native_primary,
+            native_filelists,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn repository_input(
+        &mut self,
+        repository: &PlanningRepository,
+        index: usize,
+        repomd: InputFile,
+        primary: InputFile,
+        filelists: InputFile,
+        file_provides: Option<InputFile>,
+        group: Option<InputFile>,
+        modules: Option<InputFile>,
+    ) -> Result<InputRepository, PreparationError> {
+        let prefix = format!("repo-{index}");
         let trust_bytes = repository.trust.to_canonical_json().map_err(domain)?;
         let trust_policy = self.write_bytes(&format!("{prefix}-trust.json"), &trust_bytes)?;
         let keys = repository
@@ -179,7 +255,7 @@ impl InputDraft {
                 })
             })
             .collect::<Result<Vec<_>, PreparationError>>()?;
-        let input = InputRepository {
+        Ok(InputRepository {
             id: repository.id.clone(),
             priority: i32::try_from(repository.priority)
                 .map_err(|error| PreparationError::Snapshot(error.to_string()))?,
@@ -206,12 +282,19 @@ impl InputDraft {
                     .into(),
                 keys,
             },
-        };
-        Ok(MaterializedRepository {
-            input,
-            native_primary,
-            native_filelists,
         })
+    }
+
+    fn write_snapshot_payload(
+        &mut self,
+        snapshot: &PlanningSnapshot,
+        payload: &dnfast_planning::PlanningBytes,
+        name: &str,
+    ) -> Result<InputFile, PreparationError> {
+        let bytes = snapshot
+            .materialize_payload(payload)
+            .map_err(|error| PreparationError::Snapshot(error.to_string()))?;
+        self.write_bytes(name, &bytes)
     }
 
     fn write_optional_payload(

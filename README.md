@@ -33,9 +33,11 @@ metadata, repository policy, package digests, and trust material and expire afte
 The convenience mutation commands normally use the root-only `dnfastd` service. The daemon keeps
 one libsolv pool resident, returns the exact solved action set for approval, and accepts an
 approval token only on the same connection and unchanged RPMDB/repository generation. If the
-socket is genuinely absent or refusing connections, the CLI retains the fixed-executor path as a
-safe compatibility fallback; protocol and integrity failures never fall back. Root `plan` also
-uses the resident solve when the service is available.
+socket is absent because the installed systemd service is stopped, the root CLI requests one
+non-blocking activation through the fixed root-owned `/usr/bin/systemctl` path and reconnects to
+the same token-bound protocol. If systemd or the service is unavailable, the CLI retains the
+fixed-executor path as a safe compatibility fallback; protocol and integrity failures never fall
+back. Root `plan` also uses the resident solve when the service is available.
 
 Install `dnfastd` at `/usr/libexec/dnfastd`, install
 [`packaging/dnfastd.service`](packaging/dnfastd.service) as a system service, and enable it before
