@@ -7,9 +7,11 @@ use crate::{
     PlanningBytes, PlanningError, PlanningRepository, PlanningSnapshot, fs::TrustedDirectory,
 };
 
-const INDEX_SCHEMA_VERSION: u32 = 2;
+const INDEX_SCHEMA_VERSION: u32 = 3;
 const BUCKET_COUNT: usize = 256;
-const SHARD_COUNT: usize = 16;
+// One independently authenticated blob per leading digest byte keeps an
+// absolute-file lookup from rereading unrelated file-provides evidence.
+const SHARD_COUNT: usize = 256;
 const BUCKETS_PER_SHARD: usize = BUCKET_COUNT / SHARD_COUNT;
 const HEADER_SIZE: usize = 24;
 const RECORD_SIZE: usize = 36;
@@ -202,6 +204,64 @@ impl PlanningSnapshot {
     }
 }
 
+pub(crate) fn current_descriptor_valid(
+    snapshot: &PlanningSnapshot,
+    repository: &PlanningRepository,
+) -> Result<bool, PlanningError> {
+    let descriptor = repository.file_provides.as_ref().ok_or_else(|| {
+        PlanningError::Input("planning repository has no file-provides index".into())
+    })?;
+    let manifest_bytes = descriptor.decode_verified(snapshot.storage())?;
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(json)?;
+    if serde_json::to_vec(&manifest).map_err(json)? != manifest_bytes {
+        return Err(PlanningError::Input(
+            "file-provides manifest is not canonical JSON".into(),
+        ));
+    }
+    if manifest.schema_version != INDEX_SCHEMA_VERSION {
+        return Ok(false);
+    }
+    validate_manifest(
+        &manifest,
+        &repository.primary.sha256,
+        &repository.filelists.sha256,
+    )?;
+    Ok(true)
+}
+
+pub(crate) fn referenced_shards_for_gc(
+    manifest_bytes: &[u8],
+    repository: &PlanningRepository,
+) -> Result<Vec<String>, PlanningError> {
+    let manifest: Manifest = serde_json::from_slice(manifest_bytes).map_err(json)?;
+    if serde_json::to_vec(&manifest).map_err(json)? != manifest_bytes {
+        return Err(PlanningError::Input(
+            "file-provides manifest is not canonical JSON".into(),
+        ));
+    }
+    let shard_count = match manifest.schema_version {
+        2 => 16,
+        INDEX_SCHEMA_VERSION => SHARD_COUNT,
+        _ => {
+            return Err(PlanningError::Input(
+                "retained file-provides manifest schema is unsupported".into(),
+            ));
+        }
+    };
+    validate_manifest_layout(
+        &manifest,
+        &repository.primary.sha256,
+        &repository.filelists.sha256,
+        manifest.schema_version,
+        shard_count,
+    )?;
+    Ok(manifest
+        .shards
+        .into_iter()
+        .map(|shard| shard.sha256)
+        .collect())
+}
+
 fn encode_bucket(index: usize, records: &[[u8; RECORD_SIZE]]) -> Result<Vec<u8>, PlanningError> {
     let body = records
         .len()
@@ -333,17 +393,39 @@ fn validate_manifest(
     primary_sha256: &str,
     filelists_sha256: &str,
 ) -> Result<(), PlanningError> {
-    if manifest.schema_version != INDEX_SCHEMA_VERSION
+    validate_manifest_layout(
+        manifest,
+        primary_sha256,
+        filelists_sha256,
+        INDEX_SCHEMA_VERSION,
+        SHARD_COUNT,
+    )
+}
+
+fn validate_manifest_layout(
+    manifest: &Manifest,
+    primary_sha256: &str,
+    filelists_sha256: &str,
+    schema_version: u32,
+    shard_count: usize,
+) -> Result<(), PlanningError> {
+    if shard_count == 0 || BUCKET_COUNT % shard_count != 0 {
+        return Err(PlanningError::Input(
+            "file-provides manifest shard layout is invalid".into(),
+        ));
+    }
+    let buckets_per_shard = BUCKET_COUNT / shard_count;
+    if manifest.schema_version != schema_version
         || manifest.primary_sha256 != primary_sha256
         || manifest.filelists_sha256 != filelists_sha256
-        || manifest.shards.len() != SHARD_COUNT
+        || manifest.shards.len() != shard_count
         || manifest.buckets.len() != BUCKET_COUNT
         || manifest.package_count == 0
         || manifest.shards.iter().any(|shard| {
-            shard.size < (HEADER_SIZE * BUCKETS_PER_SHARD) as u64 || !valid_sha256(&shard.sha256)
+            shard.size < (HEADER_SIZE * buckets_per_shard) as u64 || !valid_sha256(&shard.sha256)
         })
         || manifest.buckets.iter().any(|bucket| {
-            usize::from(bucket.shard) >= SHARD_COUNT
+            usize::from(bucket.shard) >= shard_count
                 || bucket.size < HEADER_SIZE as u64
                 || (bucket.size - HEADER_SIZE as u64) % RECORD_SIZE as u64 != 0
                 || !valid_sha256(&bucket.sha256)
@@ -354,9 +436,9 @@ fn validate_manifest(
         ));
     }
     let mut counted = 0_u64;
-    for shard_index in 0..SHARD_COUNT {
+    for shard_index in 0..shard_count {
         let mut offset = 0_u64;
-        for bucket_index in shard_index * BUCKETS_PER_SHARD..(shard_index + 1) * BUCKETS_PER_SHARD {
+        for bucket_index in shard_index * buckets_per_shard..(shard_index + 1) * buckets_per_shard {
             let bucket = &manifest.buckets[bucket_index];
             if usize::from(bucket.shard) != shard_index || bucket.offset != offset {
                 return Err(PlanningError::Input(

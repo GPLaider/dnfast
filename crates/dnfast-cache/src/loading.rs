@@ -22,6 +22,20 @@ type LoadedInputs = (
 );
 
 impl Cache {
+    /// Opens only the root-owned current pointer. The returned value is useful
+    /// for comparing an in-memory refresh proof with a previously published
+    /// planning snapshot without rereading large immutable metadata files.
+    pub fn open_current_generation_identity(
+        &self,
+        repository: &str,
+    ) -> Result<crate::CurrentGenerationIdentity, CacheError> {
+        let pointer = self.current_pointer(repository)?;
+        Ok(crate::CurrentGenerationIdentity {
+            digest: pointer.digest,
+            repomd_authentication: pointer.repomd_authentication,
+        })
+    }
+
     pub fn open_current_verified_complete_generation(
         &self,
         repository: &str,

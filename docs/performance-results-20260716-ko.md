@@ -1,6 +1,21 @@
 # Fedora 44 x86_64 성능·안전성 검증 (2026-07-16)
 
-## 결론
+> 2026-07-19 갱신: 아래 2026-07-16 수치는 역사적 기준선이다. 현재 daemonless release의
+> 동일 `fedora,updates`, cache-only, `--assumeno`, process-cold 9회 교차 중앙값은 이름
+> 0.56초(dnf5 0.84초), `/usr/bin/htop` 0.56초(0.95초), 깊은 filelists 경로 0.56초
+> (1.93초), 이미 설치된 패키지 0.54초(0.85초)다. dnfast peak RSS 중앙값은
+> 141,996–142,252 KiB, dnf5는 197,432–222,176 KiB였다. 각 도구의 immutable derived
+> cache를 먼저 준비했고 측정 전후 cache SHA-256 inventory와 RPM inventory가 같으며
+> `rpm --verifydb`가 통과했다. daemon은 모든 측정에서 비활성이었다.
+>
+> 파생 `.solv`를 완전히 지운 뒤 명시적 refresh가 repository와 installed cache를 모두
+> ABI/repository/architecture/RPMDB-cookie에 결합해 prewarm하는 데 8.98초,
+> 494,524 KiB가 들었다. 그 직후 최초 절대경로 solve는 0.55초/142,148 KiB, 두 번째는
+> 0.52초/141,972 KiB였다. file-provides schema v3 최초 1회 마이그레이션은
+> 30.23초/844,884 KiB였고, 이후 같은 세대 refresh는 반복 실행에서 1.65–5.09초였다.
+> 이 결과는 공개 미러의 전체 cold download 우열을 주장하지 않는다.
+
+## 역사적 2026-07-16 결론
 
 dnfast는 동일한 intent가 반복되는 resident hot path와 변경 없는 verified refresh에서
 dnf5보다 명확히 빨랐다. 반면 서로 다른 intent의 첫 solve는 대체로 dnf5보다 느렸고,
@@ -55,7 +70,7 @@ dnfast exact hit의 daemon 내부 시간은 약 3.8–8.2 ms였다. 클라이언
   filelists를 포함한 snapshot-bound planner로 안전하게 fallback해 올바른 plan을 만들었다.
 - `history list/info`는 dnfast 자체 durable journal만 검증해 보여 준다.
 
-## 남은 실제 제한
+## 2026-07-16 당시 남은 제한
 
 - groups/environments 및 modules는 아직 미지원이며 요청 시 fail closed한다.
 - 서로 다른 첫 intent solve는 추가 최적화가 필요하다.

@@ -7,7 +7,7 @@ use std::{
 
 use dnfast_core::CanonicalDocument;
 use dnfast_solver::CanonicalSolverPlan;
-use rustix::fs::{FileType, Mode, OFlags, ResolveFlags, fstat, openat2};
+use rustix::fs::{FileType, FlockOperation, Mode, OFlags, ResolveFlags, flock, fstat, openat2};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -48,6 +48,7 @@ impl RootInputs {
         )
         .map_err(errno)?;
         validate_directory(&directory, owner)?;
+        flock(&directory, FlockOperation::LockShared).map_err(errno)?;
         let bytes = read_manifest(&directory, owner)?;
         let manifest: InputManifest =
             serde_json::from_slice(&bytes).map_err(|error| inputs(error.to_string()))?;

@@ -90,13 +90,15 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
             }
         },
         Commands::History { command } => match command {
-            HistoryCommand::List { limit } => {
-                history::list(limit).map(|message| Response::completed("history", message))
+            HistoryCommand::List { limit, source } => {
+                history::list(limit, source).map(|message| Response::completed("history", message))
             }
             HistoryCommand::Info { transaction_id } => history::info(&transaction_id)
                 .map(|message| Response::completed("history", message)),
         },
-        Commands::Doctor => Ok(run_doctor()),
+        Commands::Doctor {
+            cleanup_stale_inputs,
+        } => run_doctor(cleanup_stale_inputs),
         Commands::Search {
             repositories,
             cache_dir,
@@ -106,10 +108,12 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
             GroupCommand::List { repositories } => group::list(repositories),
             GroupCommand::Info { repositories, id } => group::info(repositories, &id),
             GroupCommand::Install(arguments) => group::install(arguments),
+            GroupCommand::Remove(arguments) => group::remove(arguments),
         },
         Commands::Module { command } => match command {
             ModuleCommand::List { repositories } => group::module_list(repositories),
             ModuleCommand::Info { repositories, spec } => group::module_info(repositories, &spec),
+            ModuleCommand::Install(arguments) => group::module_install(arguments),
             ModuleCommand::Enable(arguments) => group::module_mutation("enable", arguments),
             ModuleCommand::Reset(arguments) => group::module_mutation("reset", arguments),
             ModuleCommand::Disable(arguments) => group::module_mutation("disable", arguments),
@@ -127,7 +131,7 @@ pub(crate) fn name(command: &Commands) -> &'static str {
         Commands::Daemon { .. } => "daemon",
         Commands::Repo { .. } => "repo",
         Commands::History { .. } => "history",
-        Commands::Doctor => "doctor",
+        Commands::Doctor { .. } => "doctor",
         Commands::Search { .. } => "search",
         Commands::Group { .. } => "group",
         Commands::Module { .. } => "module",
@@ -157,6 +161,14 @@ fn run_apply(plan: PathBuf, assumeyes: bool, assumeno: bool) -> Result<Response,
 }
 
 fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Response, AppFailure> {
+    run_convenience_with_plan(action, arguments, |_| Ok(()))
+}
+
+fn run_convenience_with_plan(
+    action: PlanAction,
+    arguments: MutationArgs,
+    on_execute: impl FnOnce(Option<&dnfast_solver::CanonicalSolverPlan>) -> Result<(), AppFailure>,
+) -> Result<Response, AppFailure> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(AppFailure::new(1, "mutation requires root"));
     }
@@ -167,12 +179,21 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
     // Mutations are one-shot by default: no service is started and no solver
     // pool survives the command.  The explicit `dnfast daemon` commands remain
     // available for operators who intentionally opt into a resident service.
-    let local = dnfast_executor::plan_transaction_without_daemon(
+    let local = match dnfast_executor::plan_transaction_without_daemon(
         native_action,
         &arguments.packages,
         &repositories,
-    )
-    .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    ) {
+        Ok(local) => local,
+        Err(error) if error.is_no_changes() => {
+            on_execute(None)?;
+            return Ok(Response::completed(
+                action_name(action),
+                "no changes; requested state is already satisfied",
+            ));
+        }
+        Err(error) => return Err(AppFailure::new(1, error.to_string())),
+    };
     // The local fallback reads RPMDB before it execs the fixed executor.
     // Preserve the inherited terminal for the later approval prompt, but keep
     // librpm non-interactive while this pre-approval root boundary is open.
@@ -195,6 +216,7 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
         approval = dnfast_native_sys::ExecutorApproval::Yes;
         standard_input = DetachedStandardInput::new()?;
     }
+    on_execute(Some(&plan))?;
     match local {
         Some(local) => {
             let compact = local
@@ -244,6 +266,14 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
                 Err(error) => Err(AppFailure::new(1, error.to_string())),
             }
         }
+    }
+}
+
+const fn action_name(action: PlanAction) -> &'static str {
+    match action {
+        PlanAction::Install => "install",
+        PlanAction::Remove => "remove",
+        PlanAction::Upgrade => "upgrade",
     }
 }
 
@@ -559,7 +589,7 @@ fn aborted_plan_response(
     ))
 }
 
-fn run_doctor() -> Response {
+fn run_doctor(cleanup_stale_inputs: bool) -> Result<Response, AppFailure> {
     let fedora_config = std::path::Path::new("/etc/os-release").is_file()
         && ["/etc/yum.repos.d", "/etc/dnf/repos.d"]
             .into_iter()
@@ -574,17 +604,34 @@ fn run_doctor() -> Response {
     } else {
         "unavailable"
     };
-    Response::completed(
+    let cleaned = if cleanup_stale_inputs {
+        if rustix::process::geteuid().as_raw() != 0 {
+            return Err(AppFailure::new(
+                1,
+                "doctor --cleanup-stale-inputs requires root",
+            ));
+        }
+        Some(
+            dnfast_executor::RootInputPreparer::garbage_collect_system()
+                .map_err(|error| AppFailure::new(1, error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    Ok(Response::completed(
         "doctor",
         format!(
-            "fedora_config={}; libsolv={libsolv}; librpm={librpm}; metadata_refresh=available; fixed_executor=root_apply_only",
+            "fedora_config={}; libsolv={libsolv}; librpm={librpm}; metadata_refresh=available; fixed_executor=root_apply_only{}",
             if fedora_config {
                 "available"
             } else {
                 "unavailable"
             },
+            cleaned
+                .map(|count| format!("; stale_input_generations_removed={count}"))
+                .unwrap_or_default(),
         ),
-    )
+    ))
 }
 
 #[cfg(test)]

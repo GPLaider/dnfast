@@ -458,6 +458,7 @@ dependencies = [
  "clap",
  "dnfast-cache",
  "dnfast-core",
+ "dnfast-dnf5-history",
  "dnfast-executor",
  "dnfast-metadata",
  "dnfast-native",
@@ -482,6 +483,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "dnfast-dnf5-history"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "rustix",
  "thiserror 2.0.18",
 ]
 
@@ -555,6 +565,7 @@ dependencies = [
  "dnfast-core",
  "dnfast-metadata",
  "dnfast-native",
+ "dnfast-native-sys",
  "dnfast-repo",
  "hex",
  "rustix",

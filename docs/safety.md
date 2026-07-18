@@ -5,8 +5,8 @@
 Read-only `repo list`, `search`, `doctor`, and `plan` do not change RPMDB state. `plan` may run as
 an unprivileged user when it can read the root-published snapshots and write the requested output
 path. Comps `group list` and `group info` are also read-only. `repo refresh`, `apply`, `install`,
-`remove`, `upgrade`, and `group install` require root because they publish system state or can
-change packages. Module list/info and enable/reset/disable consume only checksum-bound modulemd;
+`remove`, `upgrade`, `group install/remove`, and module profile install require root because they
+publish system state or can change packages. Module list/info and enable/reset/disable consume only checksum-bound modulemd;
 absence is reported exactly, while malformed or unbound metadata fails closed before module state
 can change. Unsupported commands fail closed.
 
@@ -26,9 +26,13 @@ root-owned key bundle at the refresh timestamp. The verified primary and signing
 key-bundle digest, and signature digest are bound into the cache generation and planning snapshot.
 
 An apparently unchanged refresh is not a stale-cache shortcut. Dnfast first fetches the current
-repomd and requires an exact byte digest match, then reopens and rehashes the complete immutable
-raw metadata and search index before reuse. Any mismatch or missing object takes the full refresh
-path or fails closed. A changed repomd can never reuse the old primary or filelists payload.
+repomd and requires an exact byte digest match. Reuse then requires a freshly verified repository
+generation capability and exact agreement of the root configuration, key/authentication evidence,
+current pointer, policy/architecture, and derived-index schema. This fast identity gate does not
+pretend to have rehashed unread payload bytes: a selected content-addressed blob is size/hash
+checked when opened, and a protected `.solv` cache uses an inode-generation cookie bound to its
+content digest. Any mismatch takes the full reconstruction path or fails closed. A changed repomd
+can never reuse the old primary or filelists payload.
 
 Snapshots and artifacts are immutable and content addressed. Complete objects are staged on the
 cache filesystem, synced, and renamed before an atomic pointer update. Readers revalidate sizes,
@@ -42,7 +46,9 @@ their integrity cookie binds the content digest to the checksum-protected inode 
 normal process-cold open does not reread the whole file for SHA-256; cache misses and cookie misses
 still perform the full hash. Libsolv reads the verified bytes from a read-only private `mmap`.
 Detected content, reference, or cookie corruption is never consumed: trusted metadata rebuilds a
-replacement off-path and atomically replaces the damaged cache object before reuse.
+replacement off-path and atomically replaces the damaged cache object before reuse. Libsolv byte
+serialization can vary with irrelevant pool string numbering, so a valid existing binding wins a
+concurrent publication; only a corrupt or missing referenced object permits atomic ref repair.
 
 Implementation ceilings are 2 MiB for Metalink, 16 MiB for repomd, 512 MiB for compressed
 metadata, 1 GiB for opened metadata, 32 Metalink resources, and 2,000,000 packages. Arithmetic is
@@ -106,8 +112,8 @@ The resident solve cache is an optimization of that same proof, not a second aut
 requires the identical canonical intent, repository selection, planning generation, and RPMDB
 cookie and produces a newly sequence-bound prepared token. The pool omits filelists to reduce the
 normal working set. Refresh streams verified filelists into a snapshot-bound compact index with
-256 logical buckets stored in 16 physical shards. An absolute-path selector opens and rehashes one
-physical shard, maps the path to package ordinals, and submits one native `ONE_OF` selection to the
+256 independently authenticated bucket shards. An absolute-path selector opens and rehashes one
+shard, maps the path to package ordinals, and submits one native `ONE_OF` selection to the
 resident primary-only pool. A missing path, empty candidate set, malformed index, or digest
 mismatch fails closed; full filelists are never opened during solve. Integrity or protocol errors
 never trigger a compatibility fallback.

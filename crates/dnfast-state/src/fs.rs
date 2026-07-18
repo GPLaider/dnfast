@@ -5,7 +5,9 @@ use std::{
     path::Path,
 };
 
-use rustix::fs::{Mode, OFlags, fchmod, fstat, fsync, mkdirat, open, openat, renameat};
+use rustix::fs::{
+    AtFlags, Mode, OFlags, fchmod, fstat, fsync, mkdirat, open, openat, renameat, unlinkat,
+};
 
 use crate::{FaultPlan, FaultPoint, StateError, error::errno, error::io};
 
@@ -150,6 +152,67 @@ pub(crate) fn read_bounded(
         return Err(StateError::Limit("record"));
     }
     Ok(bytes)
+}
+
+pub(crate) fn read_optional_bounded(
+    directory: &OwnedFd,
+    name: &str,
+    maximum: u64,
+) -> Result<Option<Vec<u8>>, StateError> {
+    match openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            verify(&fd, false, true)?;
+            let stat = fstat(&fd).map_err(errno)?;
+            if stat.st_size < 0 || stat.st_size as u64 > maximum {
+                return Err(StateError::Limit("record"));
+            }
+            let mut bytes = Vec::new();
+            File::from(fd)
+                .take(maximum + 1)
+                .read_to_end(&mut bytes)
+                .map_err(io)?;
+            if bytes.len() as u64 > maximum {
+                return Err(StateError::Limit("record"));
+            }
+            Ok(Some(bytes))
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(errno(error)),
+    }
+}
+
+pub(crate) fn write_atomic_replacing(
+    directory: &OwnedFd,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), StateError> {
+    let temporary = format!(".{name}.tmp-{}", std::process::id());
+    let _ = unlinkat(directory, temporary.as_str(), AtFlags::empty());
+    let fd = openat(
+        directory,
+        temporary.as_str(),
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(errno)?;
+    let mut cleanup = TempCleanup {
+        directory,
+        name: temporary.clone(),
+        armed: true,
+    };
+    fchmod(&fd, Mode::from_raw_mode(0o600)).map_err(errno)?;
+    let mut file = File::from(fd);
+    file.write_all(bytes).map_err(io)?;
+    file.sync_all().map_err(io)?;
+    renameat(directory, temporary.as_str(), directory, name).map_err(errno)?;
+    fsync(directory).map_err(errno)?;
+    cleanup.armed = false;
+    Ok(())
 }
 
 pub(crate) fn verify(fd: &OwnedFd, directory: bool, one_link: bool) -> Result<(), StateError> {

@@ -12,6 +12,7 @@ KEY_DIRECTORY=/etc/dnfast/keys/dnfast-module-gate
 CA_ANCHOR=/etc/pki/ca-trust/source/anchors/dnfast-module-gate-ca.pem
 SERVER_PID=
 SUCCEEDED=0
+DAEMON_WAS_ACTIVE=0
 
 if [[ $EUID -ne 0 ]]; then
   printf 'modulemd gate requires EUID 0\n' >&2
@@ -52,6 +53,8 @@ run_dnfast() {
 cleanup() {
   local status=$?
   set +e
+  "$DNFAST" --json group remove --repo "$REPO_ID" --assumeyes dnfast-fixture \
+    >"$EVIDENCE/cleanup-group-remove.json" 2>&1 || true
   if rpm -q dnfast-upgrade >/dev/null 2>&1; then
     "$DNFAST" --json remove --repo "$REPO_ID" --assumeyes dnfast-upgrade \
       >"$EVIDENCE/cleanup-remove.json" 2>&1 || rpm -e dnfast-upgrade \
@@ -66,7 +69,11 @@ cleanup() {
   update-ca-trust >/dev/null 2>&1 || true
   "$DNFAST" --json repo refresh --repo fedora --repo updates \
     >"$EVIDENCE/cleanup-official-refresh.json" 2>&1 || true
-  systemctl restart dnfastd.service >"$EVIDENCE/cleanup-daemon-restart.log" 2>&1 || true
+  if [[ $DAEMON_WAS_ACTIVE -eq 1 ]]; then
+    systemctl restart dnfastd.service >"$EVIDENCE/cleanup-daemon-restore.log" 2>&1 || true
+  else
+    systemctl stop dnfastd.service >"$EVIDENCE/cleanup-daemon-restore.log" 2>&1 || true
+  fi
   rm -rf "$RUNTIME"
   record cleanup_exit "$status"
   if [[ $status -eq 0 && $SUCCEEDED -eq 1 ]]; then
@@ -82,6 +89,7 @@ trap cleanup EXIT INT TERM HUP
   printf 'unexpected pre-existing fixture payload\n' >&2
   exit 1
 }
+systemctl is-active --quiet dnfastd.service && DAEMON_WAS_ACTIVE=1
 if rpm -q dnfast-upgrade >/dev/null 2>&1; then
   printf 'dnfast-upgrade must be absent before the gate\n' >&2
   exit 1
@@ -96,7 +104,23 @@ mkdir -m 0700 "$RUNTIME/gnupg"
 mkdir -p "$RUNTIME/repo"
 cp "$ROOT/fixtures/rpm/generated-build11/repos/main/dnfast-upgrade-1.0-1.noarch.rpm" "$RUNTIME/repo/"
 cp "$ROOT/fixtures/rpm/generated-build11/repos/main/dnfast-upgrade-2.0-1.noarch.rpm" "$RUNTIME/repo/"
+cat >"$RUNTIME/comps.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<comps>
+  <group>
+    <id>dnfast-fixture</id>
+    <name>dnfast fixture group</name>
+    <description>Exercises durable group ownership.</description>
+    <default>false</default>
+    <uservisible>true</uservisible>
+    <packagelist>
+      <packagereq type="mandatory">dnfast-upgrade</packagereq>
+    </packagelist>
+  </group>
+</comps>
+EOF
 createrepo_c --no-database --simple-md-filenames --revision 1784246400 \
+  --groupfile "$RUNTIME/comps.xml" \
   "$RUNTIME/repo" >/dev/null
 modulemd-validator "$ROOT/fixtures/modulemd/dnfast-upgrade.yaml"
 
@@ -162,30 +186,44 @@ curl --fail --silent --show-error "https://localhost:$PORT/repodata/repomd.xml" 
 record https_fixture ready
 
 run_dnfast refresh repo refresh --repo "$REPO_ID"
-systemctl restart dnfastd.service
-for _ in $(seq 1 50); do
-  if "$DNFAST" --json daemon status >"$EVIDENCE/daemon-status.json" 2>&1 &&
-    grep -F 'resident_daemon=available' "$EVIDENCE/daemon-status.json" >/dev/null; then
-    cat "$EVIDENCE/daemon-status.json"
-    break
-  fi
-  sleep 0.1
-done
-grep -F 'resident_daemon=available' "$EVIDENCE/daemon-status.json" >/dev/null
+systemctl is-active --quiet dnfastd.service && {
+  printf 'daemonless module gate unexpectedly found dnfastd active\n' >&2
+  exit 1
+}
 run_dnfast module-list module list --repo "$REPO_ID"
 grep -F 'dnfast-upgrade:stable:default' "$EVIDENCE/module-list.json" >/dev/null
 grep -F 'dnfast-upgrade:next:inactive' "$EVIDENCE/module-list.json" >/dev/null
 run_dnfast module-info module info --repo "$REPO_ID" dnfast-upgrade
 
-run_dnfast default-install install --repo "$REPO_ID" --assumeyes dnfast-upgrade
+run_dnfast group-list group list --repo "$REPO_ID"
+grep -F 'dnfast-fixture=dnfast fixture group' "$EVIDENCE/group-list.json" >/dev/null
+run_dnfast group-info group info --repo "$REPO_ID" dnfast-fixture
+run_dnfast group-install-owned group install --repo "$REPO_ID" --assumeyes dnfast-fixture
 [[ $(rpm -q --qf '%{VERSION}\n' dnfast-upgrade) == 1.0 ]]
-record default_stream_install 1.0
+run_dnfast group-remove-owned group remove --repo "$REPO_ID" --assumeyes dnfast-fixture
+rpm -q dnfast-upgrade >/dev/null 2>&1 && exit 1
+run_dnfast group-direct-install install --repo "$REPO_ID" --assumeyes dnfast-upgrade
+run_dnfast group-install-no-change group install --repo "$REPO_ID" --assumeyes dnfast-fixture
+grep -F 'no changes; requested state is already satisfied' \
+  "$EVIDENCE/group-install-no-change.json" >/dev/null
+run_dnfast group-remove-no-change group remove --repo "$REPO_ID" --assumeyes dnfast-fixture
+grep -F 'no changes; selected group packages are already absent' \
+  "$EVIDENCE/group-remove-no-change.json" >/dev/null
+rpm -q dnfast-upgrade >/dev/null
+run_dnfast group-direct-remove remove --repo "$REPO_ID" --assumeyes dnfast-upgrade
+record group_ownership_and_no_change passed
+
+run_dnfast default-install module install --repo "$REPO_ID" --assumeyes \
+  dnfast-upgrade:stable/default
+[[ $(rpm -q --qf '%{VERSION}\n' dnfast-upgrade) == 1.0 ]]
+record default_profile_install 1.0
 run_dnfast default-remove remove --repo "$REPO_ID" --assumeyes dnfast-upgrade
 
 run_dnfast enable-next module enable --repo "$REPO_ID" dnfast-upgrade:next
-run_dnfast next-install install --repo "$REPO_ID" --assumeyes dnfast-upgrade
+run_dnfast next-install module install --repo "$REPO_ID" --assumeyes \
+  dnfast-upgrade:next/default
 [[ $(rpm -q --qf '%{VERSION}\n' dnfast-upgrade) == 2.0 ]]
-record enabled_stream_install 2.0
+record enabled_profile_install 2.0
 run_dnfast next-remove remove --repo "$REPO_ID" --assumeyes dnfast-upgrade
 
 run_dnfast disable module disable --repo "$REPO_ID" dnfast-upgrade
@@ -257,11 +295,13 @@ mapfile -t MODULE_PAYLOADS < <(
 }
 install -m 0644 "$ROOT/fixtures/modulemd/dnfast-upgrade.yaml" \
   "$EVIDENCE/fixture-modulemd.yaml"
+install -m 0644 "$RUNTIME/comps.xml" "$EVIDENCE/fixture-comps.xml"
 install -m 0644 "$RUNTIME/repo/repodata/repomd.xml" "$EVIDENCE/final-repomd.xml"
 install -m 0644 "${MODULE_PAYLOADS[0]}" "$EVIDENCE/final-modules.yaml.zst"
 (
   cd "$EVIDENCE"
-  sha256sum fixture-modulemd.yaml final-repomd.xml final-modules.yaml.zst ./*.json \
+  sha256sum fixture-modulemd.yaml fixture-comps.xml final-repomd.xml \
+    final-modules.yaml.zst ./*.json \
     >artifacts.sha256
   sha256sum -c artifacts.sha256
 )

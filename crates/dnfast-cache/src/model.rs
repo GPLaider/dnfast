@@ -197,6 +197,26 @@ pub struct VerifiedCompleteGeneration {
     pub(crate) repomd_authentication: RepomdAuthentication,
 }
 
+/// The small, authenticated repository pointer identity. This proves which
+/// generation is current, but deliberately does not claim that the generation
+/// payload was rehashed; callers needing payload bytes must open the complete
+/// verified generation instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentGenerationIdentity {
+    pub(crate) digest: String,
+    pub(crate) repomd_authentication: RepomdAuthentication,
+}
+
+impl CurrentGenerationIdentity {
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn repomd_authentication(&self) -> &RepomdAuthentication {
+        &self.repomd_authentication
+    }
+}
+
 impl VerifiedCompleteGeneration {
     pub fn digest(&self) -> &str {
         &self.digest

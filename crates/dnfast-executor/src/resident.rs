@@ -121,6 +121,8 @@ pub struct DaemonAction {
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
+    #[error("solver produced no changes")]
+    NoChanges,
     #[error("resident daemon is unavailable")]
     Unavailable,
     #[error("resident daemon requires EUID 0")]
@@ -129,17 +131,21 @@ pub enum DaemonError {
     UnsafeSocket,
     #[error("resident daemon protocol failed: {0}")]
     Protocol(String),
-    #[error("resident daemon planning failed: {0}")]
+    #[error("transaction planning failed: {0}")]
     Planning(String),
-    #[error("resident daemon execution failed: {0}")]
+    #[error("transaction execution failed: {0}")]
     Execution(String),
-    #[error("resident daemon I/O failed: {0}")]
+    #[error("transaction I/O failed: {0}")]
     Io(String),
 }
 
 impl DaemonError {
     pub const fn is_unavailable(&self) -> bool {
         matches!(self, Self::Unavailable)
+    }
+
+    pub const fn is_no_changes(&self) -> bool {
+        matches!(self, Self::NoChanges)
     }
 }
 
@@ -1117,7 +1123,13 @@ impl ResidentPlanner {
             expires_at_unix: now.saturating_add(PLAN_LIFETIME_SECONDS),
         }
         .build_with_satisfied(&resolved, &satisfied_specs)
-        .map_err(planning)?;
+        .map_err(|error| {
+            if error == dnfast_solver::PlanError::NoChanges {
+                DaemonError::NoChanges
+            } else {
+                planning(error)
+            }
+        })?;
         trace_phase(trace, started, "resident-plan-built");
         cached.last_solve = Some(CachedResidentSolve {
             action,
@@ -1359,7 +1371,9 @@ fn build_pool(
     for (index, repository) in selected.iter().enumerate() {
         let priority = i32::try_from(repository.priority).map_err(planning)?;
         let cost = i32::try_from(repository.cost).map_err(planning)?;
-        let (binding, binding_sha256) = solv_cache_binding(repository, policy.base_arch())?;
+        let (binding, binding_sha256) =
+            dnfast_planning::repository_solv_cache_binding(repository, policy.base_arch())
+                .map_err(planning)?;
         let cached = match solv_cache.open(&binding_sha256) {
             Ok(cached) => cached,
             Err(CacheError::Corrupt(message)) => {
@@ -1522,7 +1536,8 @@ fn load_installed_solv_cache(
     trace: bool,
     started: Instant,
 ) -> Result<(), DaemonError> {
-    let (binding, binding_sha256) = installed_solv_cache_binding(snapshot, architecture)?;
+    let (binding, binding_sha256) =
+        dnfast_planning::installed_solv_cache_binding(snapshot, architecture).map_err(planning)?;
     let cache = SolvCache::new(SYSTEM_CACHE_PATH);
     let cached = match cache.open(&binding_sha256) {
         Ok(cached) => cached,
@@ -1567,28 +1582,6 @@ fn load_installed_solv_cache(
         }
     }
     Ok(())
-}
-
-fn installed_solv_cache_binding(
-    snapshot: &InventorySnapshot,
-    architecture: Architecture,
-) -> Result<(Vec<u8>, String), DaemonError> {
-    let inventory = snapshot.inventory.canonical_sha256().map_err(planning)?;
-    let binding = format!(
-        "dnfast-installed-solv-cache-v2\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrpmdb_cookie={}\ninventory_sha256={}\nlimits_validated=true\n",
-        dnfast_native_sys::ABI_VERSION,
-        architecture.as_rpm_arch(),
-        snapshot.rpmdb_cookie,
-        inventory.as_str(),
-    )
-    .into_bytes();
-    if binding.len() > 4096 {
-        return Err(DaemonError::Planning(
-            "installed solv cache binding exceeds native limit".into(),
-        ));
-    }
-    let sha256 = hex::encode(Sha256::digest(&binding));
-    Ok((binding, sha256))
 }
 
 fn system_architecture() -> Result<Architecture, DaemonError> {
@@ -1766,29 +1759,6 @@ fn selected_repositories<'a>(
                 })
         })
         .collect()
-}
-
-fn solv_cache_binding(
-    repository: &PlanningRepository,
-    architecture: Architecture,
-) -> Result<(Vec<u8>, String), DaemonError> {
-    let binding = format!(
-        "dnfast-solv-cache-v2\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrepository={}\ngeneration_sha256={}\nprimary_sha256={}\nprimary_size={}\nlimits_validated=true\n",
-        dnfast_native_sys::ABI_VERSION,
-        architecture.as_rpm_arch(),
-        repository.id,
-        repository.generation_sha256,
-        repository.primary.sha256,
-        repository.primary.size,
-    )
-    .into_bytes();
-    if binding.len() > 4096 {
-        return Err(DaemonError::Planning(
-            "solv cache binding exceeds native limit".into(),
-        ));
-    }
-    let sha256 = format!("{:x}", Sha256::digest(&binding));
-    Ok((binding, sha256))
 }
 
 fn materialize(

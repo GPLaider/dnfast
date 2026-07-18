@@ -124,7 +124,7 @@ fn main() {
         holder.wait().expect("wait holder");
     } else if let Some(rpm) = arguments.first() {
         let status = std::process::Command::new("sudo")
-            .args(["rpm", "--nodeps", "--nosignature", "-i", &rpm])
+            .args(["rpm", "--nodeps", "--nosignature", "-i", rpm])
             .status()
             .expect("rpm mutation");
         assert!(status.success());

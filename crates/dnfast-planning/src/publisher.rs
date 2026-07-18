@@ -4,10 +4,10 @@ use std::{
 };
 
 use base64::Engine;
-use dnfast_cache::{Cache, VerifiedCompleteGeneration};
+use dnfast_cache::{Cache, CacheError, SolvCache, VerifiedCompleteGeneration};
 use dnfast_core::{
-    Architecture, InstalledInventory, RepoPreference, RepoTrustPolicy, SigningSubkeyRule,
-    SolverPolicy,
+    Architecture, CanonicalDocument, InstalledInventory, RepoPreference, RepoTrustPolicy,
+    SigningSubkeyRule, SolverPolicy,
 };
 use dnfast_repo::{
     KeyBundle, MetadataExpire, MutationProfile, RepoConfig, key_bundle_digest,
@@ -23,7 +23,9 @@ use crate::{
     ModuleState, PlanningConfiguration, PlanningError, PlanningKey, PlanningOrigin,
     PlanningPayload, PlanningPolicy, PlanningRepository, PlanningSnapshot,
     fs::{TrustedDirectory, validate_root_executable, validate_tree},
-    snapshot_store::{current_digest, garbage_collect, open_snapshot, publish_snapshot},
+    snapshot_store::{
+        current_digest, garbage_collect, garbage_collect_blobs, open_snapshot, publish_snapshot,
+    },
 };
 
 pub const SYSTEM_CACHE_PATH: &str = "/var/cache/dnfast";
@@ -109,7 +111,7 @@ impl RootPlanningPublisher {
     fn publish_system(
         &self,
         published_at_unix: u64,
-        refreshed_repository_ids: Option<&[String]>,
+        refreshed_generations: Option<&[(String, String)]>,
     ) -> Result<String, PlanningError> {
         self.require_publisher()?;
         let planning = self.publication_directory()?;
@@ -119,15 +121,29 @@ impl RootPlanningPublisher {
         let host_architecture = host_rpm_architecture()?;
         let mut context = dnfast_native::NativeContext::open(host_architecture, || false)
             .map_err(|error| PlanningError::Input(error.to_string()))?;
-        let inventory = context
-            .read_installed_inventory()
+        let installed = context
+            .read_installed_inventory_snapshot()
             .map_err(|error| PlanningError::Input(error.to_string()))?;
+        prewarm_installed_solv_cache(
+            &mut context,
+            &installed,
+            &self.roots.cache_root,
+            host_architecture,
+        )?;
+        let inventory = installed.inventory;
+        let refreshed_repository_ids = refreshed_generations.map(|generations| {
+            generations
+                .iter()
+                .map(|(repository, _)| repository.clone())
+                .collect::<Vec<_>>()
+        });
         self.publish(
             &profile,
             inventory,
             published_at_unix,
             host_architecture,
-            refreshed_repository_ids,
+            refreshed_repository_ids.as_deref(),
+            refreshed_generations,
             &planning,
         )
     }
@@ -135,9 +151,21 @@ impl RootPlanningPublisher {
     pub fn publish_after_verified_refresh(
         &self,
         published_at_unix: u64,
-        refreshed_repository_ids: &[String],
+        refreshed_generations: &[(String, String)],
     ) -> Result<String, PlanningError> {
-        self.publish_system(published_at_unix, Some(refreshed_repository_ids))
+        if refreshed_generations.is_empty()
+            || refreshed_generations
+                .windows(2)
+                .any(|pair| pair[0].0 >= pair[1].0)
+            || refreshed_generations
+                .iter()
+                .any(|(_, digest)| !crate::snapshot_store::valid_digest(digest))
+        {
+            return Err(PlanningError::Input(
+                "verified refresh generations are absent or noncanonical".into(),
+            ));
+        }
+        self.publish_system(published_at_unix, Some(refreshed_generations))
     }
 
     /// Publishes the live RPMDB inventory without changing the current source bindings.
@@ -146,10 +174,16 @@ impl RootPlanningPublisher {
         let host_architecture = host_rpm_architecture()?;
         let mut context = dnfast_native::NativeContext::open(host_architecture, || false)
             .map_err(|error| PlanningError::Input(error.to_string()))?;
-        let inventory = context
-            .read_installed_inventory()
+        let installed = context
+            .read_installed_inventory_snapshot()
             .map_err(|error| PlanningError::Input(error.to_string()))?;
-        self.publish_inventory_onto_current(inventory)
+        prewarm_installed_solv_cache(
+            &mut context,
+            &installed,
+            &self.roots.cache_root,
+            host_architecture,
+        )?;
+        self.publish_inventory_onto_current(installed.inventory)
     }
 
     pub fn publish_inventory_onto_current(
@@ -189,6 +223,7 @@ impl RootPlanningPublisher {
         validate_tree(&self.roots.cache_root, self.owner)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn publish(
         &self,
         profile: &MutationProfile,
@@ -196,38 +231,68 @@ impl RootPlanningPublisher {
         published_at_unix: u64,
         host_architecture: Architecture,
         refreshed_repository_ids: Option<&[String]>,
+        refreshed_generations: Option<&[(String, String)]>,
         planning: &TrustedDirectory,
     ) -> Result<String, PlanningError> {
         trace_memory("planning:begin");
         self.require_publisher()?;
         let snapshots = planning.child(SNAPSHOTS_DIRECTORY, true, 0o755)?;
-        let module_state = if planning.read_if_present("current", 65)?.is_some() {
-            open_snapshot(&self.roots, self.owner)?
-                .payload()
-                .module_state
-                .clone()
+        let current = if planning.read_if_present("current", 65)?.is_some() {
+            Some(open_snapshot(&self.roots, self.owner)?)
         } else {
-            ModuleState::default()
+            None
         };
+        let module_state = current
+            .as_ref()
+            .map(|snapshot| snapshot.payload().module_state.clone())
+            .unwrap_or_default();
         let cache_root = TrustedDirectory::open(&self.roots.cache_root, self.owner, true, 0o700)?;
         cache_root.recheck()?;
         validate_tree(&self.roots.cache_root, self.owner)?;
-        let mut snapshot = snapshot_from(
-            profile,
-            SnapshotHostState {
-                inventory,
-                module_state,
+        let cache = Cache::new(&self.roots.cache_root);
+        let mut snapshot = match (current.as_ref(), refreshed_generations) {
+            (Some(current), Some(refreshed_generations)) => match reuse_unchanged_generations(
+                profile,
+                current,
+                inventory.clone(),
+                published_at_unix,
+                host_architecture,
+                &cache,
+                refreshed_repository_ids,
+                refreshed_generations,
+            )? {
+                Some(reused) => reused,
+                None => snapshot_from(
+                    profile,
+                    SnapshotHostState {
+                        inventory,
+                        module_state,
+                    },
+                    published_at_unix,
+                    host_architecture,
+                    &cache,
+                    refreshed_repository_ids,
+                    Some(planning),
+                )?,
             },
-            published_at_unix,
-            host_architecture,
-            &Cache::new(&self.roots.cache_root),
-            refreshed_repository_ids,
-            Some(planning),
-        )?;
+            _ => snapshot_from(
+                profile,
+                SnapshotHostState {
+                    inventory,
+                    module_state,
+                },
+                published_at_unix,
+                host_architecture,
+                &cache,
+                refreshed_repository_ids,
+                Some(planning),
+            )?,
+        };
         snapshot.attach_storage(&self.roots.planning_root, self.owner);
         snapshot
             .module_catalog(&[])?
             .validate_state(&snapshot.payload().module_state)?;
+        prewarm_repository_solv_caches(&snapshot, &self.roots.cache_root)?;
         trace_memory("planning:snapshot-built");
         validate_tree(&self.roots.cache_root, self.owner)?;
         let bytes = snapshot.canonical_bytes()?;
@@ -235,6 +300,7 @@ impl RootPlanningPublisher {
         let digest = digest(&bytes);
         publish_snapshot(planning, &snapshots, &digest, &bytes)?;
         garbage_collect(&snapshots, &digest)?;
+        garbage_collect_blobs(planning, &snapshots, self.owner)?;
         trace_memory("planning:published");
         Ok(digest)
     }
@@ -250,6 +316,7 @@ impl RootPlanningPublisher {
         let digest = digest(&bytes);
         publish_snapshot(planning, &snapshots, &digest, &bytes)?;
         garbage_collect(&snapshots, &digest)?;
+        garbage_collect_blobs(planning, &snapshots, self.owner)?;
         Ok(digest)
     }
 
@@ -647,6 +714,172 @@ fn snapshot_from(
     }
 }
 
+/// Reuses only derived, content-addressed planning blobs when every live
+/// authority and immutable cache generation still agrees with the current
+/// snapshot. Cache verification errors are propagated; ordinary source
+/// changes return `None` and take the complete reconstruction path.
+#[allow(clippy::too_many_arguments)]
+fn reuse_unchanged_generations(
+    profile: &MutationProfile,
+    current: &PlanningSnapshot,
+    inventory: InstalledInventory,
+    published_at_unix: u64,
+    host_architecture: Architecture,
+    cache: &Cache,
+    refreshed_repository_ids: Option<&[String]>,
+    refreshed_generations: &[(String, String)],
+) -> Result<Option<PlanningSnapshot>, PlanningError> {
+    let configuration = normalized_configuration(profile)?;
+    if current.payload().configuration != configuration {
+        return Ok(None);
+    }
+    let mut enabled = profile
+        .repositories
+        .iter()
+        .filter(|repository| repository.enabled)
+        .collect::<Vec<_>>();
+    enabled.sort_by(|left, right| left.id.cmp(&right.id));
+    if enabled.is_empty() || enabled.windows(2).any(|pair| pair[0].id == pair[1].id) {
+        return Err(PlanningError::Input(
+            "enabled repositories are absent or duplicate".into(),
+        ));
+    }
+    if !profile.main.install_weak_deps || profile.main.best || !profile.main.includepkgs.is_empty()
+    {
+        return Err(PlanningError::Input(
+            "mutation policy cannot be represented safely".into(),
+        ));
+    }
+    let preferences = enabled
+        .iter()
+        .map(|repository| {
+            RepoPreference::new(
+                &repository.id,
+                u32::from(repository.priority),
+                repository.cost,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(domain)?;
+    let policy = PlanningPolicy {
+        solver: policy_for(host_architecture, profile, preferences)?,
+        included_packages: profile.main.includepkgs.clone(),
+        installonly_limit: profile.main.installonly_limit,
+    };
+    if current.payload().policy != policy
+        || current.payload().allowed_repositories.len() != enabled.len()
+    {
+        return Ok(None);
+    }
+
+    let mut repositories = Vec::with_capacity(enabled.len());
+    for configured in enabled {
+        if !configured.sslverify
+            || !configured.gpgcheck
+            || !configured.pkg_gpgcheck
+            || configured.allowed_fingerprints.is_empty()
+            || configured.gpgkey.is_empty()
+        {
+            return Err(PlanningError::Input(
+                "repository trust policy is incomplete".into(),
+            ));
+        }
+        let Some(previous) = current
+            .payload()
+            .allowed_repositories
+            .iter()
+            .find(|repository| repository.id == configured.id)
+        else {
+            return Ok(None);
+        };
+        if previous.priority != u32::from(configured.priority)
+            || previous.cost != configured.cost
+            || previous.file_provides.is_none()
+        {
+            return Ok(None);
+        }
+        if !crate::file_provides::current_descriptor_valid(current, previous)? {
+            return Ok(None);
+        }
+
+        let paths = configured
+            .gpgkey
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let bundle = key_bundle_digest(&configured.id, &paths)
+            .map_err(|error| PlanningError::Input(error.to_string()))?;
+        if configured.key_bundle_digest != Some(bundle.digest) {
+            return Err(PlanningError::Input(
+                "repository key bundle changed after profile validation".into(),
+            ));
+        }
+        let trust = RepoTrustPolicy::new(
+            &configured.id,
+            encode(bundle.digest),
+            configured.allowed_fingerprints.clone(),
+            SigningSubkeyRule::AuthorizedSubkeys,
+            published_at_unix,
+        )
+        .map_err(domain)?;
+        let keys = planning_keys(&bundle)?;
+        if previous.keys != keys {
+            return Ok(None);
+        }
+
+        let identity = cache
+            .open_current_generation_identity(&configured.id)
+            .map_err(|error| PlanningError::Cache(error.to_string()))?;
+        if previous.generation_sha256 != identity.digest() {
+            return Ok(None);
+        }
+        let mut reused = previous.clone();
+        match refreshed_generations
+            .iter()
+            .find(|(repository, _)| repository == &configured.id)
+        {
+            Some((_, verified_digest)) if verified_digest == identity.digest() => {
+                reused.trust = trust;
+                reused.repomd_authentication = identity.repomd_authentication().clone();
+            }
+            Some(_) => return Ok(None),
+            None if previous.repomd_authentication == *identity.repomd_authentication() => {}
+            None => return Ok(None),
+        }
+        repositories.push(reused);
+    }
+
+    if refreshed_repository_ids
+        != Some(
+            &refreshed_generations
+                .iter()
+                .map(|(repository, _)| repository.clone())
+                .collect::<Vec<_>>(),
+        )
+    {
+        return Err(PlanningError::Input(
+            "verified refresh identities differ from repository selection".into(),
+        ));
+    }
+
+    let payload = PlanningPayload {
+        policy,
+        inventory,
+        allowed_repositories: repositories,
+        configuration,
+        module_state: current.payload().module_state.clone(),
+    };
+    let snapshot = match refreshed_repository_ids {
+        Some(ids) => PlanningSnapshot::new_with_refreshed_repositories(
+            published_at_unix,
+            ids.to_vec(),
+            payload,
+        ),
+        None => PlanningSnapshot::new(published_at_unix, payload),
+    }?;
+    Ok(Some(snapshot))
+}
+
 fn policy_for(
     host: Architecture,
     profile: &MutationProfile,
@@ -740,20 +973,7 @@ fn generation_payload(
     blob_store: Option<&TrustedDirectory>,
 ) -> Result<PlanningRepository, PlanningError> {
     let file_provides = crate::file_provides::build(&generation, blob_store)?;
-    let keys = bundle
-        .paths
-        .iter()
-        .zip(bundle.certificates)
-        .map(|(path, certificate)| {
-            Ok(PlanningKey {
-                bundle_path: path
-                    .to_str()
-                    .ok_or_else(|| PlanningError::Input("key path is not UTF-8".into()))?
-                    .into(),
-                certificate_base64: base64::engine::general_purpose::STANDARD.encode(certificate),
-            })
-        })
-        .collect::<Result<Vec<_>, PlanningError>>()?;
+    let keys = planning_keys(&bundle)?;
     if generation.repository() != repository.id {
         return Err(PlanningError::Cache(
             "cache generation repository differs from configuration".into(),
@@ -795,6 +1015,23 @@ fn generation_payload(
         keys,
         repomd_authentication: generation.repomd_authentication().clone(),
     })
+}
+
+fn planning_keys(bundle: &KeyBundle) -> Result<Vec<PlanningKey>, PlanningError> {
+    bundle
+        .paths
+        .iter()
+        .zip(&bundle.certificates)
+        .map(|(path, certificate)| {
+            Ok(PlanningKey {
+                bundle_path: path
+                    .to_str()
+                    .ok_or_else(|| PlanningError::Input("key path is not UTF-8".into()))?
+                    .into(),
+                certificate_base64: base64::engine::general_purpose::STANDARD.encode(certificate),
+            })
+        })
+        .collect()
 }
 
 fn normalized_configuration(
@@ -856,6 +1093,145 @@ pub(crate) fn require_current_snapshot(
 fn digest(bytes: &[u8]) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// ABI-, architecture-, repository-, and immutable-generation-bound libsolv
+/// cache key shared by publication prewarming and one-shot planning.
+pub fn repository_solv_cache_binding(
+    repository: &PlanningRepository,
+    architecture: Architecture,
+) -> Result<(Vec<u8>, String), PlanningError> {
+    let binding = format!(
+        "dnfast-solv-cache-v2\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrepository={}\ngeneration_sha256={}\nprimary_sha256={}\nprimary_size={}\nlimits_validated=true\n",
+        dnfast_native_sys::ABI_VERSION,
+        architecture.as_rpm_arch(),
+        repository.id,
+        repository.generation_sha256,
+        repository.primary.sha256,
+        repository.primary.size,
+    )
+    .into_bytes();
+    if binding.len() > 4096 {
+        return Err(PlanningError::Input(
+            "solv cache binding exceeds native limit".into(),
+        ));
+    }
+    let sha256 = digest(&binding);
+    Ok((binding, sha256))
+}
+
+pub fn installed_solv_cache_binding(
+    snapshot: &dnfast_native::InventorySnapshot,
+    architecture: Architecture,
+) -> Result<(Vec<u8>, String), PlanningError> {
+    let inventory = snapshot.inventory.canonical_sha256().map_err(domain)?;
+    let binding = format!(
+        "dnfast-installed-solv-cache-v3\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrpmdb_cookie_size={}\nrpmdb_cookie_sha256={}\ninventory_sha256={}\nlimits_validated=true\n",
+        dnfast_native_sys::ABI_VERSION,
+        architecture.as_rpm_arch(),
+        snapshot.rpmdb_cookie.len(),
+        digest(snapshot.rpmdb_cookie.as_bytes()),
+        inventory.as_str(),
+    )
+    .into_bytes();
+    if binding.len() > 4096 {
+        return Err(PlanningError::Input(
+            "installed solv cache binding exceeds native limit".into(),
+        ));
+    }
+    let sha256 = digest(&binding);
+    Ok((binding, sha256))
+}
+
+fn prewarm_installed_solv_cache(
+    context: &mut dnfast_native::NativeContext,
+    snapshot: &dnfast_native::InventorySnapshot,
+    cache_root: &Path,
+    architecture: Architecture,
+) -> Result<(), PlanningError> {
+    let (binding, binding_sha256) = installed_solv_cache_binding(snapshot, architecture)?;
+    let cache = SolvCache::new(cache_root);
+    match cache.open(&binding_sha256) {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) | Err(CacheError::Corrupt(_)) => {}
+        Err(error) => return Err(PlanningError::Cache(error.to_string())),
+    }
+    context
+        .add_installed_rpmdb("/")
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
+    let staged = cache
+        .stage(&binding_sha256)
+        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    context
+        .write_repository_solv("@System", staged.file(), &binding)
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
+    staged
+        .commit()
+        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    trace_memory("planning:installed-solv-cache-prewarmed");
+    Ok(())
+}
+
+fn prewarm_repository_solv_caches(
+    snapshot: &PlanningSnapshot,
+    cache_root: &Path,
+) -> Result<(), PlanningError> {
+    let cache = SolvCache::new(cache_root);
+    for (index, repository) in snapshot.payload().allowed_repositories.iter().enumerate() {
+        let (binding, binding_sha256) = repository_solv_cache_binding(
+            repository,
+            snapshot.payload().policy.solver.base_arch(),
+        )?;
+        match cache.open(&binding_sha256) {
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(CacheError::Corrupt(_)) => {}
+            Err(error) => return Err(PlanningError::Cache(error.to_string())),
+        }
+        let metadata = snapshot.materialize_native_primary_unparsed(repository)?;
+        let workspace =
+            tempfile::tempdir().map_err(|error| PlanningError::Io(error.to_string()))?;
+        let repomd = workspace.path().join("repomd.xml");
+        let primary = workspace.path().join("primary.xml");
+        let filelists = workspace.path().join("filelists.xml");
+        std::fs::write(&repomd, metadata.repomd())
+            .and_then(|_| std::fs::write(&primary, metadata.primary()))
+            .and_then(|_| std::fs::write(&filelists, []))
+            .map_err(|error| PlanningError::Io(error.to_string()))?;
+        let path = |value: &Path| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| PlanningError::Input("temporary metadata path is not UTF-8".into()))
+        };
+        let mut context = dnfast_native::NativeContext::open(
+            snapshot.payload().policy.solver.base_arch(),
+            || false,
+        )
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
+        context
+            .add_repository_primary(dnfast_native::Repository {
+                id: repository.id.clone(),
+                repomd_path: path(&repomd)?,
+                primary_path: path(&primary)?,
+                filelists_path: path(&filelists)?,
+                priority: i32::try_from(repository.priority)
+                    .map_err(|error| PlanningError::Input(error.to_string()))?,
+                cost: i32::try_from(repository.cost)
+                    .map_err(|error| PlanningError::Input(error.to_string()))?,
+            })
+            .map_err(|error| PlanningError::Input(error.to_string()))?;
+        let staged = cache
+            .stage(&binding_sha256)
+            .map_err(|error| PlanningError::Cache(error.to_string()))?;
+        context
+            .write_repository_solv(&repository.id, staged.file(), &binding)
+            .map_err(|error| PlanningError::Input(error.to_string()))?;
+        staged
+            .commit()
+            .map_err(|error| PlanningError::Cache(error.to_string()))?;
+        trace_memory(&format!("planning:solv-cache-{index}-prewarmed"));
+    }
+    Ok(())
 }
 fn require_root() -> Result<(), PlanningError> {
     if geteuid().as_raw() == 0 {

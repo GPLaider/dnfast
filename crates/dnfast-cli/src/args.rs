@@ -75,8 +75,14 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: HistoryCommand,
     },
-    #[command(about = "Report read-only runtime capabilities")]
-    Doctor,
+    #[command(about = "Report runtime capabilities and optionally clean stale private inputs")]
+    Doctor {
+        #[arg(
+            long,
+            help = "Remove only old, unlocked root-private input generations"
+        )]
+        cleanup_stale_inputs: bool,
+    },
     #[command(about = "Search verified cached repository metadata without network access")]
     Search {
         #[arg(long = "repo", value_name = "ID")]
@@ -112,6 +118,8 @@ pub(crate) enum GroupCommand {
     },
     #[command(about = "Install mandatory/default packages from groups or environments")]
     Install(GroupInstallArgs),
+    #[command(about = "Remove installed packages selected by groups or environments")]
+    Remove(GroupInstallArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -144,12 +152,26 @@ pub(crate) enum ModuleCommand {
         repositories: Vec<String>,
         spec: String,
     },
+    #[command(about = "Install a profile from an active module stream")]
+    Install(ModuleInstallArgs),
     #[command(about = "Enable a module stream")]
     Enable(ModuleMutationArgs),
     #[command(about = "Reset module stream state")]
     Reset(ModuleMutationArgs),
     #[command(about = "Disable a module stream")]
     Disable(ModuleMutationArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ModuleInstallArgs {
+    #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+    pub(crate) repositories: Vec<String>,
+    #[arg(long, conflicts_with = "assumeno")]
+    pub(crate) assumeyes: bool,
+    #[arg(long, conflicts_with = "assumeyes")]
+    pub(crate) assumeno: bool,
+    #[arg(value_name = "NAME[:STREAM]/PROFILE", required = true)]
+    pub(crate) specs: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -166,9 +188,18 @@ pub(crate) enum HistoryCommand {
     List {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=1000))]
         limit: u16,
+        #[arg(long, value_enum, default_value_t = HistorySource::Dnfast)]
+        source: HistorySource,
     },
     #[command(about = "Show the verified journal sequence for one transaction")]
     Info { transaction_id: String },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum HistorySource {
+    Dnfast,
+    Dnf5,
+    All,
 }
 
 #[derive(Debug, Subcommand)]

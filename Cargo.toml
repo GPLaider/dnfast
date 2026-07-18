@@ -3,6 +3,7 @@ members = [
     "crates/dnfast-cache",
     "crates/dnfast-cli",
     "crates/dnfast-core",
+    "crates/dnfast-dnf5-history",
     "crates/dnfast-executor",
     "crates/dnfast-metadata",
     "crates/dnfast-native",

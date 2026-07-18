@@ -6,12 +6,12 @@ use dnfast_planning::{
 };
 
 use crate::{
-    args::{GroupInstallArgs, ModuleMutationArgs, MutationArgs, PlanAction},
+    args::{GroupInstallArgs, ModuleInstallArgs, ModuleMutationArgs, MutationArgs, PlanAction},
     rendering::escaped_field,
     response::Response,
 };
 
-use super::{AppFailure, canonical_repository_ids, run_convenience};
+use super::{AppFailure, canonical_repository_ids, run_convenience, run_convenience_with_plan};
 
 #[derive(Default)]
 struct Catalog {
@@ -112,8 +112,138 @@ pub(super) fn install(arguments: GroupInstallArgs) -> Result<Response, AppFailur
     }
     let repositories = canonical_repository_ids(arguments.repositories)?;
     let (snapshot, catalog) = catalog(repositories.clone())?;
+    let selected = selected_group_package_map(
+        &snapshot,
+        &catalog,
+        &arguments.groups,
+        arguments.with_optional,
+    )?;
+    let packages = selected
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if packages.is_empty() {
+        return Err(AppFailure::new(
+            1,
+            "selected group set has no installable mandatory/default packages",
+        ));
+    }
+    let installed = snapshot
+        .payload()
+        .inventory
+        .packages()
+        .iter()
+        .map(|package| package.name())
+        .collect::<BTreeSet<_>>();
+    let records = selected
+        .into_iter()
+        .map(|(id, packages)| dnfast_state::GroupRecord {
+            id,
+            owned_packages: packages.into_iter().collect(),
+        })
+        .collect::<Vec<_>>();
+    let introduced_packages = packages
+        .iter()
+        .filter(|package| !installed.contains(package.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let store = dnfast_state::GroupStateStore::open_system()
+        .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    run_convenience_with_plan(
+        PlanAction::Install,
+        MutationArgs {
+            repositories,
+            assumeyes: arguments.assumeyes,
+            assumeno: arguments.assumeno,
+            packages: packages.into_iter().collect(),
+        },
+        move |plan| match plan {
+            Some(plan) => store
+                .record_pending_install(
+                    plan.digest()
+                        .map_err(|error| AppFailure::new(1, error.to_string()))?
+                        .as_str(),
+                    &records,
+                    &introduced_packages,
+                )
+                .map_err(|error| AppFailure::new(1, error.to_string())),
+            None => store
+                .apply_install_now(&records, &introduced_packages)
+                .map_err(|error| AppFailure::new(1, error.to_string())),
+        },
+    )
+}
+
+pub(super) fn remove(arguments: GroupInstallArgs) -> Result<Response, AppFailure> {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return Err(AppFailure::new(1, "group remove requires root"));
+    }
+    let repositories = canonical_repository_ids(arguments.repositories)?;
+    let (snapshot, catalog) = catalog(repositories.clone())?;
+    let installed = snapshot
+        .payload()
+        .inventory
+        .packages()
+        .iter()
+        .map(|package| package.name())
+        .collect::<BTreeSet<_>>();
+    let selected = selected_group_package_map(
+        &snapshot,
+        &catalog,
+        &arguments.groups,
+        arguments.with_optional,
+    )?;
+    let group_ids = selected.into_keys().collect::<Vec<_>>();
+    let store = dnfast_state::GroupStateStore::open_system()
+        .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    let packages = store
+        .packages_to_remove(&group_ids)
+        .map_err(|error| AppFailure::new(1, error.to_string()))?
+        .into_iter()
+        .filter(|package| installed.contains(package.as_str()))
+        .collect::<Vec<_>>();
+    if packages.is_empty() {
+        store
+            .apply_remove_now(&group_ids)
+            .map_err(|error| AppFailure::new(1, error.to_string()))?;
+        return Ok(Response::completed(
+            "group",
+            "no changes; selected group packages are already absent",
+        ));
+    }
+    run_convenience_with_plan(
+        PlanAction::Remove,
+        MutationArgs {
+            repositories,
+            assumeyes: arguments.assumeyes,
+            assumeno: arguments.assumeno,
+            packages,
+        },
+        move |plan| match plan {
+            Some(plan) => store
+                .record_pending_remove(
+                    plan.digest()
+                        .map_err(|error| AppFailure::new(1, error.to_string()))?
+                        .as_str(),
+                    &group_ids,
+                )
+                .map_err(|error| AppFailure::new(1, error.to_string())),
+            None => store
+                .apply_remove_now(&group_ids)
+                .map_err(|error| AppFailure::new(1, error.to_string())),
+        },
+    )
+}
+
+fn selected_group_package_map(
+    snapshot: &PlanningSnapshot,
+    catalog: &Catalog,
+    requested: &[String],
+    with_optional: bool,
+) -> Result<BTreeMap<String, BTreeSet<String>>, AppFailure> {
     let mut requested_groups = BTreeSet::new();
-    for id in &arguments.groups {
+    for id in requested {
         validate_id(id, "group or environment id")?;
         if !requested_groups.insert(id.clone()) {
             return Err(AppFailure::with_error_code(
@@ -129,29 +259,33 @@ pub(super) fn install(arguments: GroupInstallArgs) -> Result<Response, AppFailur
             selected_groups.insert(id);
         } else if let Some(environment) = catalog.environments.get(&id) {
             selected_groups.extend(environment.groups.iter().cloned());
-            if arguments.with_optional {
+            if with_optional {
                 selected_groups.extend(environment.optional_groups.iter().cloned());
             }
         } else {
             return Err(not_found("group or environment", &id));
         }
     }
-    let mut packages = BTreeSet::new();
-    let mut conditional = Vec::new();
+    let mut packages = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut conditional = BTreeMap::<String, Vec<CompsPackage>>::new();
     for id in selected_groups {
         let group = catalog
             .groups
             .get(&id)
             .ok_or_else(|| not_found("environment member group", &id))?;
+        let selected = packages.entry(id.clone()).or_default();
         for package in &group.packages {
             match package.kind {
                 CompsPackageType::Mandatory | CompsPackageType::Default => {
-                    packages.insert(package.name.clone());
+                    selected.insert(package.name.clone());
                 }
-                CompsPackageType::Optional if arguments.with_optional => {
-                    packages.insert(package.name.clone());
+                CompsPackageType::Optional if with_optional => {
+                    selected.insert(package.name.clone());
                 }
-                CompsPackageType::Conditional => conditional.push(package.clone()),
+                CompsPackageType::Conditional => conditional
+                    .entry(id.clone())
+                    .or_default()
+                    .push(package.clone()),
                 CompsPackageType::Optional => {}
             }
         }
@@ -164,33 +298,32 @@ pub(super) fn install(arguments: GroupInstallArgs) -> Result<Response, AppFailur
         .map(|package| package.name())
         .collect::<BTreeSet<_>>();
     loop {
-        let before = packages.len();
-        for package in &conditional {
-            if package.condition.as_deref().is_some_and(|condition| {
-                installed.contains(condition) || packages.contains(condition)
-            }) {
-                packages.insert(package.name.clone());
+        let available = packages
+            .values()
+            .flatten()
+            .cloned()
+            .chain(installed.iter().map(|value| (*value).to_owned()))
+            .collect::<BTreeSet<_>>();
+        let before = packages.values().map(BTreeSet::len).sum::<usize>();
+        for (id, conditionals) in &conditional {
+            for package in conditionals {
+                if package
+                    .condition
+                    .as_deref()
+                    .is_some_and(|condition| available.contains(condition))
+                {
+                    packages
+                        .get_mut(id)
+                        .expect("selected group has a package set")
+                        .insert(package.name.clone());
+                }
             }
         }
-        if packages.len() == before {
+        if packages.values().map(BTreeSet::len).sum::<usize>() == before {
             break;
         }
     }
-    if packages.is_empty() {
-        return Err(AppFailure::new(
-            1,
-            "selected group set has no installable mandatory/default packages",
-        ));
-    }
-    run_convenience(
-        PlanAction::Install,
-        MutationArgs {
-            repositories,
-            assumeyes: arguments.assumeyes,
-            assumeno: arguments.assumeno,
-            packages: packages.into_iter().collect(),
-        },
-    )
+    Ok(packages)
 }
 
 pub(super) fn module_list(repositories: Vec<String>) -> Result<Response, AppFailure> {
@@ -291,6 +424,86 @@ pub(super) fn module_info(repositories: Vec<String>, spec: &str) -> Result<Respo
         "module",
         format!("streams=[{rendered}]"),
     ))
+}
+
+pub(super) fn module_install(arguments: ModuleInstallArgs) -> Result<Response, AppFailure> {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return Err(AppFailure::new(1, "module install requires root"));
+    }
+    let repositories = canonical_repository_ids(arguments.repositories)?;
+    let snapshot = PlanningSnapshot::open_system().map_err(snapshot_error)?;
+    let catalog = snapshot
+        .module_catalog(&repositories)
+        .map_err(snapshot_error)?;
+    let mut unique = BTreeSet::new();
+    let mut packages = BTreeSet::new();
+    for spec in &arguments.specs {
+        validate_id(spec, "module profile spec")?;
+        if !unique.insert(spec.clone()) {
+            return Err(AppFailure::with_error_code(
+                2,
+                "invalid_arguments",
+                "module profile specs must be unique",
+            ));
+        }
+        let (module_stream_spec, profile_name) = module_profile_spec(spec)?;
+        let (name, requested_stream) = module_spec(module_stream_spec)?;
+        let module = catalog
+            .module(name)
+            .ok_or_else(|| not_found("module", name))?;
+        let active = catalog
+            .active_stream(&snapshot.payload().module_state, name)
+            .ok_or_else(|| AppFailure::new(1, format!("module has no active stream: {name}")))?;
+        if requested_stream.is_some_and(|stream| stream != active) {
+            return Err(AppFailure::with_error_code(
+                1,
+                "module_stream_inactive",
+                format!(
+                    "module stream is not active: {name}:{}; enable it before profile install",
+                    requested_stream.expect("checked stream")
+                ),
+            ));
+        }
+        let stream = module
+            .streams
+            .get(active)
+            .ok_or_else(|| not_found("active module stream", active))?;
+        let profile = stream
+            .profiles
+            .iter()
+            .find(|profile| profile.name == profile_name)
+            .ok_or_else(|| not_found("module profile", spec))?;
+        packages.extend(profile.rpms.iter().cloned());
+    }
+    if packages.is_empty() {
+        return Ok(Response::completed(
+            "module",
+            "no changes; selected module profiles contain no packages",
+        ));
+    }
+    run_convenience(
+        PlanAction::Install,
+        MutationArgs {
+            repositories,
+            assumeyes: arguments.assumeyes,
+            assumeno: arguments.assumeno,
+            packages: packages.into_iter().collect(),
+        },
+    )
+}
+
+fn module_profile_spec(spec: &str) -> Result<(&str, &str), AppFailure> {
+    let mut parts = spec.split('/');
+    let module = parts.next().unwrap_or_default();
+    let profile = parts.next().unwrap_or_default();
+    if parts.next().is_some() || module.is_empty() || profile.is_empty() {
+        return Err(AppFailure::with_error_code(
+            2,
+            "invalid_arguments",
+            "module profile spec must be NAME[:STREAM]/PROFILE",
+        ));
+    }
+    Ok((module, profile))
 }
 
 pub(super) fn module_mutation(

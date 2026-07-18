@@ -14,6 +14,7 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 dnfast-cache = { path = "../dnfast-cache" }
 dnfast-core = { path = "../dnfast-core" }
+dnfast-dnf5-history = { path = "../dnfast-dnf5-history" }
 dnfast-executor = { path = "../dnfast-executor" }
 dnfast-metadata = { path = "../dnfast-metadata" }
 dnfast-native-sys = { path = "../dnfast-native-sys" }

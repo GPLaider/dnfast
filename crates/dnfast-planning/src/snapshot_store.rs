@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     fs,
     io::Write,
     os::{
         fd::{AsFd, AsRawFd},
-        unix::fs::PermissionsExt,
+        unix::fs::{MetadataExt, PermissionsExt},
     },
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -54,10 +55,11 @@ pub(crate) fn publish_blob_deferred(
 }
 
 pub(crate) fn sync_blobs(planning: &TrustedDirectory) -> Result<(), PlanningError> {
-    planning
+    let sha256 = planning
         .child("blobs", false, 0)?
-        .child("sha256", false, 0)?
-        .sync()
+        .child("sha256", false, 0)?;
+    rustix::fs::syncfs(sha256.fd()).map_err(|error| PlanningError::Io(error.to_string()))?;
+    sha256.sync()
 }
 
 fn publish_blob_inner(
@@ -87,7 +89,11 @@ fn publish_blob_inner(
         std::process::id(),
         now_nanos()?
     );
-    write_file(Path::new(&temporary), bytes)?;
+    if sync_directory {
+        write_file(Path::new(&temporary), bytes)?;
+    } else {
+        write_file_deferred(Path::new(&temporary), bytes)?;
+    }
     let target = format!(
         "/proc/self/fd/{}/{}",
         sha256.fd().as_fd().as_raw_fd(),
@@ -226,6 +232,103 @@ pub(crate) fn garbage_collect(
     snapshots.recheck()
 }
 
+pub(crate) fn garbage_collect_blobs(
+    planning: &TrustedDirectory,
+    snapshots: &TrustedDirectory,
+    owner: u32,
+) -> Result<(), PlanningError> {
+    planning.recheck()?;
+    snapshots.recheck()?;
+    let Some(blobs) = planning.child_if_present("blobs")? else {
+        return Ok(());
+    };
+    let Some(sha256) = blobs.child_if_present("sha256")? else {
+        return Ok(());
+    };
+    let mut retained = HashSet::new();
+    let snapshot_directory = format!("/proc/self/fd/{}", snapshots.fd().as_fd().as_raw_fd());
+    for entry in fs::read_dir(snapshot_directory).map_err(io)? {
+        let entry = entry.map_err(io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| PlanningError::UnsafeSnapshot("non-UTF-8 snapshot name".into()))?;
+        if !valid_digest(&name) {
+            continue;
+        }
+        let snapshot_directory = snapshots.child(&name, false, 0)?;
+        let bytes = snapshot_directory.read(SNAPSHOT_FILE, MAX_SNAPSHOT_BYTES)?;
+        let snapshot = PlanningSnapshot::from_canonical_bytes(&bytes)?;
+        if snapshot.digest()? != name {
+            return Err(PlanningError::UnsafeSnapshot(
+                "retained snapshot digest differs from directory".into(),
+            ));
+        }
+        for repository in &snapshot.payload().allowed_repositories {
+            let descriptors = [
+                Some(&repository.repomd),
+                Some(&repository.primary),
+                Some(&repository.filelists),
+                repository.file_provides.as_ref(),
+                repository.group.as_ref(),
+                repository.modules.as_ref(),
+            ];
+            for descriptor in descriptors.into_iter().flatten() {
+                if !valid_digest(&descriptor.sha256) {
+                    return Err(PlanningError::UnsafeSnapshot(
+                        "retained snapshot has an invalid blob digest".into(),
+                    ));
+                }
+                retained.insert(descriptor.sha256.clone());
+            }
+            if let Some(descriptor) = &repository.file_provides {
+                let maximum = usize::try_from(descriptor.size)
+                    .map_err(|error| PlanningError::UnsafeSnapshot(error.to_string()))?
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        PlanningError::UnsafeSnapshot("planning blob size overflow".into())
+                    })?;
+                let manifest = sha256.read(&descriptor.sha256, maximum)?;
+                if manifest.len() as u64 != descriptor.size
+                    || format!("{:x}", sha2::Sha256::digest(&manifest)) != descriptor.sha256
+                {
+                    return Err(PlanningError::UnsafeSnapshot(
+                        "retained file-provides manifest digest differs".into(),
+                    ));
+                }
+                retained.extend(crate::file_provides::referenced_shards_for_gc(
+                    &manifest, repository,
+                )?);
+            }
+        }
+    }
+
+    let blob_directory = format!("/proc/self/fd/{}", sha256.fd().as_fd().as_raw_fd());
+    for entry in fs::read_dir(blob_directory).map_err(io)? {
+        let entry = entry.map_err(io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| PlanningError::UnsafeSnapshot("non-UTF-8 blob name".into()))?;
+        if !valid_digest(&name) || retained.contains(&name) {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(io)?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != owner
+            || metadata.mode() & 0o7777 != 0o644
+            || metadata.nlink() != 1
+        {
+            return Err(PlanningError::UnsafeSnapshot(
+                "unreferenced planning blob is not a trusted regular file".into(),
+            ));
+        }
+        fs::remove_file(entry.path()).map_err(io)?;
+    }
+    sha256.sync()?;
+    planning.recheck()
+}
+
 fn snapshot_exists(snapshots: &TrustedDirectory, digest: &str) -> Result<bool, PlanningError> {
     if !valid_digest(digest) {
         return Err(PlanningError::UnsafeSnapshot(
@@ -260,7 +363,15 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), PlanningError> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(io)
 }
 
-fn valid_digest(value: &str) -> bool {
+fn write_file_deferred(path: &Path, bytes: &[u8]) -> Result<(), PlanningError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(path).map_err(io)?;
+    file.write_all(bytes).map_err(io)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(io)
+}
+
+pub(crate) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

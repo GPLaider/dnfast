@@ -72,6 +72,13 @@ impl PreparedInputs {
 pub struct RootInputPreparer;
 
 impl RootInputPreparer {
+    /// Removes only old, unlocked, root-private input generations. Active
+    /// preparers and executors retain shared directory locks and are skipped.
+    pub fn garbage_collect_system() -> Result<usize, PreparationError> {
+        require_root()?;
+        prepared_generation::garbage_collect_system()
+    }
+
     /// Downloads through the bounded system artifact cache and publishes only an exactly re-solved plan.
     pub fn prepare_system(
         proposal: &CanonicalSolverPlan,

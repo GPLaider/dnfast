@@ -34,7 +34,8 @@ trust material, solver policy, and RPMDB inventory. `dnfast-native-sys` and `dnf
 the libsolv/librpm ABI. `dnfast-solver` converts the native transaction to a complete, explained,
 canonical plan. `dnfast-executor` owns the daemonless compact boundary, the optional resident
 protocol, and the legacy external-plan boundary; it revalidates and applies only the approved
-solve. `dnfast-state` owns durable transaction journals and post-start reconciliation.
+solve. `dnfast-state` owns durable transaction journals, group membership plus the separately
+tracked set of packages introduced by those groups, and post-start reconciliation.
 
 ## Metadata and cache model
 
@@ -50,9 +51,12 @@ does not decompress and reparse all primary XML for every query. System cache an
 are `/var/cache/dnfast` and `/var/lib/dnfast/planning`.
 
 A refresh always obtains fresh `repomd.xml`. When its exact bytes hash to the already published
-generation, dnfast reopens and rehashes the complete immutable primary, filelists, and search-index
-objects and republishes only the verified pointer/evidence. A byte-distinct repomd takes the full
-download, validation, and atomic publication path. Independent repository downloads overlap;
+generation, reuse requires the freshly verified `(repository, generation)` capability plus the
+same normalized configuration, trust/key evidence, repomd authentication, architecture/policy,
+root current pointer, and current derived-index schema. This identity check does not claim to
+rehash payloads it did not read: content-addressed payloads are checked when materialized, while
+protected `.solv` cookies bind their inode generation and content digest. Any mismatch takes the
+full download/reconstruction path or fails closed. Independent repository downloads overlap;
 Fedora-scale metadata validation/publication is serialized to keep peak memory bounded.
 
 Planning snapshot schema v6 stores only SHA-256 and size descriptors in the canonical JSON and
@@ -86,7 +90,8 @@ inputs have the same fail-closed generation binding and are loaded from read-onl
 
 Absolute-path selectors first query the primary-only pool. A path missing from primary metadata is
 resolved through the checksum-bound compact file-provides index and added as one exact libsolv
-`ONE_OF` selector; full filelists are not loaded during solve. The one-shot pool is released after
+`ONE_OF` selector. The index uses one authenticated shard per leading SHA-256 byte, so a lookup
+does not reread unrelated file evidence; full filelists are not loaded during solve. The one-shot pool is released after
 the response. An explicitly started `dnfastd` may keep the same verified pool resident and
 memoizes one solved result only under the exact canonical intent, repository set, generation, and
 cookie. External cookie or generation changes invalidate both pool and result.
@@ -119,9 +124,10 @@ by RPMDB/inventory reconciliation, not described as rollback.
 ## Compatibility and concurrency
 
 RPM and rpm-md compatibility do not imply DNF5 behavioral compatibility. DNF5 also owns policy,
-install reasons, groups, modules, plugins, locks, and private state beyond RPMDB. Dnfast's history
-surface reports only its own verified journal. Dnfast therefore describes itself as an independent
-package manager with an explicitly smaller command surface.
+install reasons, groups, modules, plugins, locks, and private state beyond RPMDB. Dnfast keeps its
+own verified journal and group ownership state. Its optional DNF5 history view opens only the
+fixed root-owned SQLite schema read-only and does not claim state compatibility. Dnfast therefore
+describes itself as an independent package manager with an explicitly smaller command surface.
 
 Network and decompression may run concurrently through bounded queues. One repomd generation is
 immutable; solver state has one owner; the librpm execution boundary is single-threaded and root

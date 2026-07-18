@@ -3,6 +3,7 @@
 mod error;
 mod fault;
 mod fs;
+mod group;
 mod log;
 mod model;
 mod reason;
@@ -11,6 +12,7 @@ mod store;
 
 pub use error::StateError;
 pub use fault::{FaultPlan, FaultPoint};
+pub use group::{GroupRecord, GroupStateStore};
 pub use log::LogAppend;
 pub use model::{
     CallbackSummary, JournalEntry, NativeResult, ReconcileResult, RecoveryAction, TransactionId,

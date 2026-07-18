@@ -40,9 +40,9 @@ pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
                 .refresh_with_metadata_trust(&repository.id, source, metadata_trust.as_ref())
                 .map_err(|error| error.to_string())
         },
-        |published_at_unix, refreshed_repository_ids| {
+        |published_at_unix, refreshed_generations| {
             publisher
-                .publish_after_verified_refresh(published_at_unix, refreshed_repository_ids)
+                .publish_after_verified_refresh(published_at_unix, refreshed_generations)
                 .map_err(|error| error.to_string())
         },
         now,
@@ -89,7 +89,7 @@ fn refresh_profile<Refresh, Publish>(
 ) -> Result<RefreshReport, AppFailure>
 where
     Refresh: Fn(&RepoConfig, Source) -> Result<RefreshOutcome, String> + Sync,
-    Publish: FnOnce(u64, &[String]) -> Result<String, String>,
+    Publish: FnOnce(u64, &[(String, String)]) -> Result<String, String>,
 {
     requested.sort();
     requested.dedup();
@@ -130,7 +130,13 @@ where
                         }
                     }
                     outcome
-                        .map(|_| (escaped_field(&repository.id), repository.id.clone()))
+                        .map(|outcome| {
+                            (
+                                escaped_field(&repository.id),
+                                repository.id.clone(),
+                                outcome.digest,
+                            )
+                        })
                         .ok_or_else(|| {
                             format!(
                                 "{}: {}",
@@ -151,8 +157,13 @@ where
             .collect::<Result<Vec<_>, String>>()
     })
     .map_err(|error| AppFailure::new(1, error))?;
-    let (refreshed, refreshed_repository_ids): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-    let planning_snapshot = publish_snapshot(published_at_unix, &refreshed_repository_ids)
+    let mut refreshed = Vec::with_capacity(results.len());
+    let mut refreshed_generations = Vec::with_capacity(results.len());
+    for (label, repository, digest) in results {
+        refreshed.push(label);
+        refreshed_generations.push((repository, digest));
+    }
+    let planning_snapshot = publish_snapshot(published_at_unix, &refreshed_generations)
         .map_err(|error| AppFailure::new(1, error))?;
     Ok(RefreshReport {
         refreshed,

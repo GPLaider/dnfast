@@ -1,19 +1,106 @@
 use dnfast_state::{JournalEntry, JournalStore, TransactionId, TransactionState};
 
+use crate::{args::HistorySource, rendering::escaped_field};
+
 use super::AppFailure;
 
-pub(super) fn list(limit: u16) -> Result<String, AppFailure> {
+pub(super) fn list(limit: u16, source: HistorySource) -> Result<String, AppFailure> {
     require_root()?;
-    let store = JournalStore::open_system().map_err(state_failure)?;
-    list_from(&store, usize::from(limit))
+    match source {
+        HistorySource::Dnfast => {
+            let store = JournalStore::open_system().map_err(state_failure)?;
+            list_from(&store, usize::from(limit))
+        }
+        HistorySource::Dnf5 => list_dnf5(limit),
+        HistorySource::All => {
+            let store = JournalStore::open_system().map_err(state_failure)?;
+            Ok(format!(
+                "{}; {}",
+                list_from(&store, usize::from(limit))?,
+                list_dnf5(limit)?
+            ))
+        }
+    }
 }
 
 pub(super) fn info(transaction_id: &str) -> Result<String, AppFailure> {
+    if let Some(value) = transaction_id.strip_prefix("dnf5:") {
+        let id = value
+            .parse::<i64>()
+            .map_err(|_| AppFailure::new(2, "DNF5 transaction id must be dnf5:POSITIVE_INTEGER"))?;
+        if id <= 0 {
+            return Err(AppFailure::new(
+                2,
+                "DNF5 transaction id must be dnf5:POSITIVE_INTEGER",
+            ));
+        }
+        require_root()?;
+        return info_dnf5(id);
+    }
     let id = TransactionId::parse(transaction_id)
         .map_err(|_| AppFailure::new(2, "transaction id must be a canonical UUIDv7"))?;
     require_root()?;
     let store = JournalStore::open_system().map_err(state_failure)?;
     info_from(&store, &id)
+}
+
+fn list_dnf5(limit: u16) -> Result<String, AppFailure> {
+    let rows = dnfast_dnf5_history::list_system(limit).map_err(dnf5_failure)?;
+    if rows.is_empty() {
+        return Ok("DNF5 history transactions: none".into());
+    }
+    Ok(format!(
+        "DNF5 history transactions: {}",
+        rows.iter().map(dnf5_summary).collect::<Vec<_>>().join("; ")
+    ))
+}
+
+fn info_dnf5(id: i64) -> Result<String, AppFailure> {
+    let detail = dnfast_dnf5_history::info_system(id)
+        .map_err(dnf5_failure)?
+        .ok_or_else(|| AppFailure::with_error_code(1, "not_found", "DNF5 transaction not found"))?;
+    let transaction = dnf5_summary(&detail.transaction);
+    let items = detail
+        .items
+        .iter()
+        .map(|item| {
+            format!(
+                "{}-{}:{}-{}.{} action={} reason={} state={} repo={}",
+                escaped_field(&item.name),
+                item.epoch,
+                escaped_field(&item.version),
+                escaped_field(&item.release),
+                escaped_field(&item.arch),
+                escaped_field(&item.action),
+                escaped_field(&item.reason),
+                escaped_field(&item.state),
+                escaped_field(&item.repository)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("{transaction}; packages=[{items}]"))
+}
+
+fn dnf5_summary(transaction: &dnfast_dnf5_history::Transaction) -> String {
+    format!(
+        "id=dnf5:{} state={} begin={} end={} user={} releasever={} items={} description={}",
+        transaction.id,
+        escaped_field(&transaction.state),
+        transaction.begin_unix,
+        transaction
+            .end_unix
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into()),
+        transaction.user_id,
+        escaped_field(&transaction.releasever),
+        transaction.item_count,
+        escaped_field(&transaction.description)
+    )
+}
+
+fn dnf5_failure(error: dnfast_dnf5_history::HistoryError) -> AppFailure {
+    AppFailure::new(1, error.to_string())
 }
 
 fn list_from(store: &JournalStore, limit: usize) -> Result<String, AppFailure> {

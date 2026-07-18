@@ -23,7 +23,7 @@ pub use modulemd::{
 pub use native_xml::{NativeRepositoryPrimary, NativeRepositoryXml};
 pub use publisher::{
     PlanningRoots, RootPlanningPublisher, SYSTEM_CACHE_PATH, SYSTEM_PLANNING_PATH,
-    host_rpm_architecture,
+    host_rpm_architecture, installed_solv_cache_binding, repository_solv_cache_binding,
 };
 
 #[cfg(test)]
@@ -49,8 +49,16 @@ mod tests {
         PlanningPolicy, PlanningRepository, PlanningRoots, PlanningSnapshot, RootPlanningPublisher,
         fs::TrustedDirectory,
         host_rpm_architecture,
-        snapshot_store::{garbage_collect, publish_snapshot},
+        snapshot_store::{garbage_collect, publish_snapshot, valid_digest},
     };
+
+    #[test]
+    fn planning_digests_require_canonical_lowercase_hex() {
+        assert!(valid_digest(&"ab".repeat(32)));
+        assert!(!valid_digest(&"AB".repeat(32)));
+        assert!(!valid_digest(&"g0".repeat(32)));
+        assert!(!valid_digest(&"a".repeat(63)));
+    }
 
     struct Fixture(PathBuf);
 
@@ -478,6 +486,38 @@ mod tests {
             .expect("shadow child");
         assert!(status.success());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn installed_solv_binding_hashes_cookie_inventory_and_architecture() {
+        let first = dnfast_native::InventorySnapshot {
+            inventory: InstalledInventory::new("sqlite", "4.20", Vec::new()).unwrap(),
+            rpmdb_cookie: "cookie-a\nwith-delimiter".into(),
+        };
+        let second = dnfast_native::InventorySnapshot {
+            inventory: first.inventory.clone(),
+            rpmdb_cookie: "cookie-b".into(),
+        };
+        let (first_bytes, first_digest) =
+            super::installed_solv_cache_binding(&first, Architecture::X86_64).unwrap();
+        assert!(
+            !String::from_utf8(first_bytes.clone())
+                .unwrap()
+                .contains(&first.rpmdb_cookie)
+        );
+        assert_eq!(first_digest, format!("{:x}", Sha256::digest(first_bytes)));
+        assert_ne!(
+            first_digest,
+            super::installed_solv_cache_binding(&second, Architecture::X86_64)
+                .unwrap()
+                .1
+        );
+        assert_ne!(
+            first_digest,
+            super::installed_solv_cache_binding(&first, Architecture::Aarch64)
+                .unwrap()
+                .1
+        );
     }
 
     fn bytes(input: &[u8]) -> PlanningBytes {

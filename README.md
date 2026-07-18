@@ -15,14 +15,17 @@ sudo dnfast search bash
 dnfast group list
 dnfast group info development-tools
 sudo dnfast group install development-tools --assumeno
+sudo dnfast group remove development-tools --assumeno
 dnfast module list
+sudo dnfast module install nodejs:22/default --assumeno
 sudo dnfast plan install bash --output /var/lib/dnfast/bash-plan.json
 sudo dnfast apply /var/lib/dnfast/bash-plan.json --assumeyes
 sudo dnfast install bash --assumeyes
 sudo dnfast remove bash --assumeyes
 sudo dnfast upgrade --assumeyes
-sudo dnfast history list
+sudo dnfast history list --source all
 sudo dnfast history info 018f1f2e-7b3c-7abc-8def-0123456789ab
+sudo dnfast history info dnf5:10
 sudo dnfast daemon status
 sudo dnfast daemon warm --repo fedora
 ```
@@ -46,24 +49,31 @@ using `dnfast daemon warm`. `dnfast daemon status` only reports protocol readine
 
 The daemon caches only an exact canonical intent for the unchanged planning generation and RPMDB
 cookie. Its libsolv pool stays primary-only. During refresh, verified filelists are streamed into
-a checksum-bound compact path-to-package index (256 logical buckets stored in 16 physical shards).
-An absolute-path selector reads only its one physical shard, maps the path to package ordinals,
+a checksum-bound compact path-to-package index with 256 independently authenticated bucket shards.
+An absolute-path selector reads only its one shard, maps the path to package ordinals,
 and adds one native `ONE_OF` selector to the resident solve. The solve never opens full filelists,
 and the plan preserves the user's original absolute-path intent.
 
 `repo makecache` obeys the trusted `metadata_expire` policy. Both `makecache` and explicit
-`refresh` still fetch current `repomd.xml`; reuse is allowed only when its exact digest matches the
-published generation and every immutable metadata/index object has been rehashed successfully.
-`history list` and `history info` report dnfast's verified durable transaction journal; they do not
-import or claim compatibility with DNF5 history.
+`refresh` still fetch current `repomd.xml`; same-generation reuse additionally requires exact root
+configuration, trust/authentication evidence, generation identity, policy/architecture, and the
+current index schema. Payload bytes remain content addressed and are verified when opened; a
+mismatch or corrupt binding fails closed and rebuilds off-path.
+`history list/info` reports dnfast's verified durable journal and can also read the fixed,
+root-owned DNF5 SQLite v1.1 history database through `--source dnf5|all` and `dnf5:ID`. The DNF5
+view is bounded and read-only; dnfast does not import or mutate DNF5 state.
 
-Checksum-bound comps group/environment list, info, and install are implemented. Group install
+Checksum-bound comps group/environment list, info, install, and remove are implemented. Group install
 selects mandatory/default packages, conditionals whose requirements are selected or installed,
-and optional packages/groups only with `--with-optional`. Module list/info and
+and optional packages/groups only with `--with-optional`. A root-private durable schema-v2 record
+separates group membership references from packages actually introduced by group transactions,
+so group remove never deletes a pre-existing user package or one still referenced by another
+installed group. Module list/info and
 enable/reset/disable consume checksum-bound modulemd and exclude artifacts from inactive streams;
-repositories without module metadata list no streams. Dedicated `NAME:STREAM/PROFILE` installation
-is not yet implemented.
-Plugin, COPR, system-upgrade, offline, group removal, autoremove, downgrade, reinstall,
+repositories without module metadata list no streams. `module install NAME[:STREAM]/PROFILE`
+installs a profile only from the active/default stream; an explicitly inactive stream must first
+be enabled.
+Plugin, COPR, system-upgrade, offline, autoremove, downgrade, reinstall,
 distro-sync, and advisory commands are not implemented and fail closed.
 `dnfast` does not claim DNF5 policy or state compatibility.
 
@@ -85,6 +95,7 @@ DNFAST_NATIVE_REAL=1 cargo test --offline --locked --workspace --all-targets -- 
 - `dnfast-repo`: strict `.repo` and `dnf.conf` loading with explicit trust policy
 - `dnfast-metadata`: bounded rpm-md parsing and checksum verification
 - `dnfast-cache`: immutable metadata and RPM artifact caches
+- `dnfast-dnf5-history`: bounded read-only DNF5 SQLite history view
 - `dnfast-refresh`: HTTPS-only repository refresh orchestration
 - `dnfast-planning`: root-published RPMDB/repository snapshots
 - `dnfast-native-sys`: narrow C ABI over libsolv and librpm

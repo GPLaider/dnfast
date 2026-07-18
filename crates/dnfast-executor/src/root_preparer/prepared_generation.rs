@@ -1,4 +1,5 @@
 mod digest;
+mod gc;
 mod publication;
 
 use std::{
@@ -16,7 +17,10 @@ use dnfast_planning::{
     NativeRepositoryXml, PlanningRepository, PlanningSnapshot, SYSTEM_CACHE_PATH,
 };
 use rustix::{
-    fs::{AtFlags, Mode, OFlags, ResolveFlags, fsync, mkdirat, openat, openat2, unlinkat},
+    fs::{
+        AtFlags, FlockOperation, Mode, OFlags, ResolveFlags, flock, fsync, mkdirat, openat,
+        openat2, unlinkat,
+    },
     io::Errno,
 };
 use sha2::{Digest as _, Sha256};
@@ -67,6 +71,7 @@ impl InputDraft {
     }
 
     fn create_with_parent(parent: OwnedFd, root_path: &str) -> Result<Self, PreparationError> {
+        gc::garbage_collect(&parent, gc::STALE_INPUT_GRACE_SECONDS)?;
         for _ in 0..16 {
             let name = format!("{PREPARING_PREFIX}{}", nonce()?);
             match mkdirat(&parent, &name, Mode::from_raw_mode(0o700)) {
@@ -81,6 +86,7 @@ impl InputDraft {
                             | ResolveFlags::NO_MAGICLINKS,
                     )
                     .map_err(errno)?;
+                    flock(&directory, FlockOperation::LockShared).map_err(errno)?;
                     return Ok(Self {
                         parent,
                         directory,
@@ -494,6 +500,11 @@ impl InputDraft {
     pub(crate) fn absolute_path(&self, name: &str) -> String {
         format!("{}/{}/{}", self.root_path, self.name, name)
     }
+}
+
+pub(super) fn garbage_collect_system() -> Result<usize, PreparationError> {
+    let parent = system_directory(&INPUT_PATH).map_err(inputs)?;
+    gc::garbage_collect(&parent, gc::STALE_INPUT_GRACE_SECONDS)
 }
 
 #[cfg(test)]

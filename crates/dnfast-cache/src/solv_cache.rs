@@ -164,10 +164,22 @@ impl StagedSolv {
             Err(rustix::io::Errno::EXIST) => {
                 match read_reference(&self.directory, &reference_name) {
                     Ok(bound) if bound == sha256 => {}
-                    Ok(_) => {
-                        return Err(CacheError::Corrupt(
-                            "solv cache binding is nondeterministic".into(),
-                        ));
+                    Ok(bound) => {
+                        let bound_name = format!("{}-{bound}.solv", self.binding);
+                        match open_content(&self.directory, &self.binding, &bound_name, &bound) {
+                            // libsolv serialization may differ with otherwise
+                            // irrelevant pool string numbering. A binding
+                            // covers semantics, so the first still-valid
+                            // content is the canonical concurrent winner.
+                            Ok(existing) => return Ok(existing),
+                            // A corrupt/missing referenced entry is derived
+                            // state. Atomically point the binding at the fully
+                            // verified staged replacement.
+                            Err(CacheError::Corrupt(_)) => {
+                                replace_from_unnamed(&self.directory, &reference, &reference_name)?
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     Err(CacheError::Corrupt(_)) => {
                         replace_from_unnamed(&self.directory, &reference, &reference_name)?;
@@ -286,13 +298,20 @@ fn open_content(
     name: &str,
     expected_sha256: &str,
 ) -> Result<CachedSolv, CacheError> {
-    let fd = openat(
+    let fd = match openat(
         directory,
         name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(errno)?;
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => {
+            return Err(CacheError::Corrupt(
+                "referenced solv cache content disappeared".into(),
+            ));
+        }
+        Err(error) => return Err(errno(error)),
+    };
     validate_regular(&fd)?;
     let before = fstat(&fd).map_err(errno)?;
     let mut file = File::from(fd);
@@ -807,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_staging_converges_only_for_identical_content() {
+    fn concurrent_staging_keeps_the_first_valid_binding_content() {
         let root = tempfile::tempdir().expect("cache root");
         let cache = SolvCache::new(root.path());
         let first = cache.stage(&binding()).expect("first stage");
@@ -829,6 +848,39 @@ mod tests {
             .file()
             .write_all(b"different payload")
             .expect("conflicting write");
-        assert!(conflicting.commit().is_err());
+        let winner = conflicting.commit().expect("existing semantic winner");
+        assert_eq!(winner.sha256(), first.sha256());
+        assert_eq!(
+            cache.open(&binding()).unwrap().unwrap().sha256(),
+            first.sha256()
+        );
+    }
+
+    #[test]
+    fn corrupt_binding_can_be_atomically_repaired_with_different_serialization() {
+        let root = tempfile::tempdir().expect("cache root");
+        let cache = SolvCache::new(root.path());
+        let first = cache.stage(&binding()).expect("first stage");
+        first.file().write_all(b"first payload").expect("write");
+        let first_sha256 = first.commit().expect("first commit").sha256().to_owned();
+        let first_path = root
+            .path()
+            .join("solv-v1")
+            .join(format!("{}-{first_sha256}.solv", binding()));
+        std::fs::remove_file(&first_path).expect("remove first content");
+        std::fs::write(&first_path, b"corrupt payload").expect("replace first content");
+        assert!(cache.open(&binding()).is_err());
+
+        let replacement = cache.stage(&binding()).expect("replacement stage");
+        replacement
+            .file()
+            .write_all(b"second valid serialization")
+            .expect("replacement write");
+        let replacement = replacement.commit().expect("atomic replacement");
+        assert_ne!(replacement.sha256(), first_sha256);
+        assert_eq!(
+            cache.open(&binding()).unwrap().unwrap().sha256(),
+            replacement.sha256()
+        );
     }
 }
