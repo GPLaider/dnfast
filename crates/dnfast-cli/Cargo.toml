@@ -24,7 +24,7 @@ dnfast-repo = { path = "../dnfast-repo" }
 dnfast-solver = { path = "../dnfast-solver" }
 dnfast-state = { path = "../dnfast-state" }
 hex = "0.4"
-rustix = { version = "1.1", features = ["fs", "process"] }
+rustix = { version = "1.1", features = ["fs", "process", "stdio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.27"

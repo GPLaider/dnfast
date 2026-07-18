@@ -10,7 +10,7 @@ export DNFAST_NATIVE_REAL=1
 
 inventory() { cargo run -q --offline --locked -p dnfast-native --example inventory; }
 solve() { cargo run -q --offline --locked -p dnfast-native --example solve -- "$@"; }
-gate() { sudo env DNFAST_NATIVE_REAL=1 ASAN_OPTIONS="${ASAN_OPTIONS:-}" target/debug/examples/inventory_gate "$@"; }
+gate() { sudo env DNFAST_NATIVE_REAL=1 ASAN_OPTIONS="${ASAN_OPTIONS:-}" target/debug/examples/inventory_gate "$@" </dev/null; }
 repo() {
   local directory="$FIXTURE/main/repodata"
   zstd -qdf "$directory/primary.xml.zst" -o "$TMP/primary.xml"

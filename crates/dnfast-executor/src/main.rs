@@ -4,6 +4,7 @@
 use std::{
     ffi::OsString,
     io::{self, Write},
+    os::fd::OwnedFd,
     process::ExitCode,
     rc::Rc,
     time::{SystemTime, UNIX_EPOCH},
@@ -65,6 +66,11 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
         .as_secs();
     let proposal = dnfast_solver::CanonicalSolverPlan::from_canonical_json(plan.bytes(), now)
         .map_err(|error| ExecutorError::Plan(error.to_string()))?;
+    // librpm may turn an initial non-blocking RPMDB lock failure into an
+    // unbounded wait when stdin is a TTY. Root re-solve and recovery both
+    // inspect RPMDB before approval, so temporarily make that whole boundary
+    // non-interactive, then restore the exact inherited stdin for the prompt.
+    let mut standard_input = DetachedStandardInput::new()?;
     let inputs = RootInputs::open(&proposal)?;
     recover_pending_transactions(&store, inputs.base_arch()?)?;
     let mut staging = Staging::create(plan.bytes())?;
@@ -75,11 +81,13 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
         .to_str()
         .ok_or(ExecutorError::Plan("mount root is not UTF-8".into()))?;
     let inventory = require_root_resolve_equal(&proposal, &staged, root_path)?;
+    standard_input.restore()?;
     if !approval.approved()? {
         root.cleanup()?;
         staging.cleanup()?;
         return Ok(Outcome::Aborted(proposal));
     }
+    detach_standard_input()?;
     let id = dnfast_state::TransactionId::parse(staging.id())
         .map_err(|error| ExecutorError::Plan(error.to_string()))?;
     let digest = proposal
@@ -104,6 +112,52 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
     republish_planning_inventory_after_transaction(&inventory_after)?;
     root.cleanup()?;
     Ok(Outcome::Executed(proposal, id.as_str().into()))
+}
+
+struct DetachedStandardInput {
+    inherited: Option<OwnedFd>,
+}
+
+impl DetachedStandardInput {
+    fn new() -> Result<Self, ExecutorError> {
+        let inherited = rustix::io::dup(rustix::stdio::stdin())
+            .map_err(|error| ExecutorError::Read(format!("retain stdin failed: {error}")))?;
+        detach_standard_input()?;
+        Ok(Self {
+            inherited: Some(inherited),
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), ExecutorError> {
+        let inherited = self
+            .inherited
+            .as_ref()
+            .ok_or_else(|| ExecutorError::Read("stdin was already restored".into()))?;
+        rustix::stdio::dup2_stdin(inherited)
+            .map_err(|error| ExecutorError::Read(format!("restore stdin failed: {error}")))?;
+        self.inherited.take();
+        Ok(())
+    }
+}
+
+impl Drop for DetachedStandardInput {
+    fn drop(&mut self) {
+        if let Some(inherited) = self.inherited.as_ref() {
+            let _ = rustix::stdio::dup2_stdin(inherited);
+        }
+    }
+}
+
+fn detach_standard_input() -> Result<(), ExecutorError> {
+    // librpm intentionally changes a failed non-blocking transaction lock into
+    // an unbounded blocking wait when stdin is a TTY. Approval is complete at
+    // this point, so retain the native deadline/interrupt contract by giving
+    // the transaction phase a non-TTY stdin just like the resident service.
+    let null = std::fs::File::open("/dev/null")
+        .map_err(|error| ExecutorError::Read(format!("open /dev/null failed: {error}")))?;
+    rustix::stdio::dup2_stdin(&null)
+        .map_err(|error| ExecutorError::Read(format!("detach stdin failed: {error}")))?;
+    Ok(())
 }
 
 fn republish_planning_inventory_after_transaction(

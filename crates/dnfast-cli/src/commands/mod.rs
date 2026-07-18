@@ -6,7 +6,7 @@ mod repo;
 
 use std::{
     io::{Seek, SeekFrom},
-    os::fd::AsFd,
+    os::fd::{AsFd, OwnedFd},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -147,7 +147,9 @@ fn run_apply(plan: PathBuf, assumeyes: bool, assumeno: bool) -> Result<Response,
     };
     let plan =
         dnfast_executor::open_plan(&plan).map_err(|error| AppFailure::new(1, error.to_string()))?;
+    let mut standard_input = DetachedStandardInput::new()?;
     prepare_before_fixed_executor(&plan)?;
+    standard_input.restore()?;
     match dnfast_native_sys::exec_fixed_executor(plan, approval) {
         Ok(()) => Err(AppFailure::new(1, "fixed executor unexpectedly returned")),
         Err(error) => Err(AppFailure::new(1, error.to_string())),
@@ -171,6 +173,10 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
         Err(error) if error.is_unavailable() => {}
         Err(error) => return Err(AppFailure::new(1, error.to_string())),
     }
+    // The local fallback reads RPMDB before it execs the fixed executor.
+    // Preserve the inherited terminal for the later approval prompt, but keep
+    // librpm non-interactive while this pre-approval root boundary is open.
+    let mut standard_input = DetachedStandardInput::new()?;
     let intent = intent(action, arguments.packages)?;
     let plan = planner::solve(intent, &repositories)?;
     let bytes = plan
@@ -198,9 +204,47 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
         .try_clone_to_owned()
         .map_err(|error| AppFailure::new(1, error.to_string()))?;
     prepare_locally_solved_before_fixed_executor(&plan_fd)?;
+    standard_input.restore()?;
     match dnfast_native_sys::exec_fixed_executor(plan_fd, approval) {
         Ok(()) => Err(AppFailure::new(1, "fixed executor unexpectedly returned")),
         Err(error) => Err(AppFailure::new(1, error.to_string())),
+    }
+}
+
+struct DetachedStandardInput {
+    inherited: Option<OwnedFd>,
+}
+
+impl DetachedStandardInput {
+    fn new() -> Result<Self, AppFailure> {
+        let inherited = rustix::io::dup(rustix::stdio::stdin())
+            .map_err(|error| AppFailure::new(1, format!("retain stdin failed: {error}")))?;
+        let null = std::fs::File::open("/dev/null")
+            .map_err(|error| AppFailure::new(1, format!("open /dev/null failed: {error}")))?;
+        rustix::stdio::dup2_stdin(&null)
+            .map_err(|error| AppFailure::new(1, format!("detach stdin failed: {error}")))?;
+        Ok(Self {
+            inherited: Some(inherited),
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), AppFailure> {
+        let inherited = self
+            .inherited
+            .as_ref()
+            .ok_or_else(|| AppFailure::new(1, "stdin was already restored"))?;
+        rustix::stdio::dup2_stdin(inherited)
+            .map_err(|error| AppFailure::new(1, format!("restore stdin failed: {error}")))?;
+        self.inherited.take();
+        Ok(())
+    }
+}
+
+impl Drop for DetachedStandardInput {
+    fn drop(&mut self) {
+        if let Some(inherited) = self.inherited.as_ref() {
+            let _ = rustix::stdio::dup2_stdin(inherited);
+        }
     }
 }
 

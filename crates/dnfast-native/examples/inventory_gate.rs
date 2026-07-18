@@ -3,6 +3,23 @@ use dnfast_native::{
 };
 
 fn main() {
+    if rustix::process::geteuid().as_raw() != 0 {
+        let expected = dnfast_core::InstalledInventory::new("sqlite", "6.0.1", Vec::new())
+            .expect("minimal inventory");
+        let error = ExecutorInventory::begin(
+            dnfast_core::Architecture::Aarch64,
+            KeyringInstalled::fixture().expect("fixture keyring"),
+            &expected,
+        )
+        .err()
+        .expect("non-root executor inventory must fail");
+        assert!(matches!(
+            error,
+            InventoryError::Native(dnfast_native::NativeError::PermissionDenied)
+        ));
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     let mut reader =
         InventoryReader::open(dnfast_core::Architecture::Aarch64).expect("inventory reader");
     let expected = reader.read().expect("initial inventory");
