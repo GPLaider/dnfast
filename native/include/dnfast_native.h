@@ -262,6 +262,7 @@ typedef struct dnfast_transaction_install {
     dnfast_verified_package package;
     uint8_t artifact_sha256[32];
     uint64_t artifact_size;
+    /* 0 install, 1 upgrade, 2 reinstall, 3 downgrade. */
     uint8_t upgrade;
 } dnfast_transaction_install;
 typedef enum dnfast_transaction_phase {

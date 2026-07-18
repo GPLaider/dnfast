@@ -19,8 +19,8 @@ pub use model::{
     TransactionState,
 };
 pub use reason::{
-    InstalledIdentity, PlannedIdentity, ReasonDecision, ReconciledReason, proposals_from_plan,
-    reconcile_reasons,
+    InstalledIdentity, PlannedIdentity, ReasonDecision, ReasonStateStore, ReconciledReason,
+    proposals_from_plan, reconcile_reasons,
 };
 pub use recovery::{recover, recover_with_staging};
 pub use store::{JournalStore, TransactionJournal};

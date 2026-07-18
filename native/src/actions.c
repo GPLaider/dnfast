@@ -17,10 +17,12 @@ const char *dnfast_solver_action_kind(const dnfast_context *context, size_t inde
                              mode | SOLVER_TRANSACTION_SHOW_OBSOLETES)) {
         case SOLVER_TRANSACTION_ERASE: return "erase";
         case SOLVER_TRANSACTION_REINSTALLED: return "reinstalled";
+        case SOLVER_TRANSACTION_CHANGED: return "changed";
         case SOLVER_TRANSACTION_DOWNGRADED: return "downgraded";
         case SOLVER_TRANSACTION_UPGRADED: return "upgraded";
         case SOLVER_TRANSACTION_OBSOLETED: return "obsoleted";
         case SOLVER_TRANSACTION_REINSTALL: return "reinstall";
+        case SOLVER_TRANSACTION_CHANGE: return "change";
         case SOLVER_TRANSACTION_DOWNGRADE: return "downgrade";
         case SOLVER_TRANSACTION_UPGRADE: return "upgrade";
         case SOLVER_TRANSACTION_OBSOLETES: return "obsoletes";

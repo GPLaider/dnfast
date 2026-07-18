@@ -31,7 +31,7 @@ impl ExecutorInventory {
         &mut self,
         artifact: &CachedArtifact,
         verified: &VerifiedArtifact,
-        upgrade: bool,
+        mode: crate::TransactionInstallMode,
     ) -> Result<(), InventoryError> {
         if self.state != ExecutionState::Prepared {
             return Err(InventoryError::InvalidState);
@@ -52,13 +52,13 @@ impl ExecutorInventory {
             .try_into()
             .map_err(|_| InventoryError::HeaderDigest)?;
         self.context
-            .transaction_add_install(
+            .transaction_add_install_mode(
                 &self._keyring.native,
                 artifact.file().as_raw_fd(),
                 &expected,
                 &digest,
                 verified.artifact_size,
-                upgrade,
+                mode,
             )
             .map_err(NativeError::from)
             .map_err(InventoryError::from)

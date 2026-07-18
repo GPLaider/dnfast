@@ -65,6 +65,10 @@ fn main() {
     let best = std::env::var("DNFAST_BEST").as_deref() == Ok("1");
     let result = match std::env::var("DNFAST_OPERATION").as_deref() {
         Ok("upgrade") => context.solve_upgrade_many(&names, best),
+        Ok("downgrade") => context.solve_downgrade_many(&names),
+        Ok("reinstall") => context.solve_reinstall_many(&names),
+        Ok("distro-sync") => context.solve_distro_sync_many(&names, best),
+        Ok("autoremove") => context.solve_autoremove_many(&names),
         Ok("erase") => context.solve_erase_many(&names),
         Ok(_) => panic!("unsupported DNFAST_OPERATION"),
         Err(_) => context.solve_install_many(&names, weak, best),

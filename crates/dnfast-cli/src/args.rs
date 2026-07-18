@@ -60,6 +60,14 @@ pub(crate) enum Commands {
     Remove(MutationArgs),
     #[command(about = "Plan and apply an upgrade through the fixed root executor")]
     Upgrade(MutationArgs),
+    #[command(about = "Plan and apply an explicit package downgrade")]
+    Downgrade(MutationArgs),
+    #[command(about = "Reinstall the exact installed EVRA from a verified repository")]
+    Reinstall(MutationArgs),
+    #[command(about = "Synchronize installed packages to verified repository versions")]
+    DistroSync(MutationArgs),
+    #[command(about = "Remove only dependency-reason packages proven unneeded")]
+    Autoremove(MutationArgs),
     #[command(about = "Inspect or pre-warm the resident transaction daemon")]
     Daemon {
         #[command(subcommand)]
@@ -96,11 +104,67 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: GroupCommand,
     },
+    #[command(about = "Inspect, install, or remove comps environments")]
+    Environment {
+        #[command(subcommand)]
+        command: GroupCommand,
+    },
     #[command(about = "Inspect or change modular repository state")]
     Module {
         #[command(subcommand)]
         command: ModuleCommand,
     },
+    #[command(about = "Inspect or apply checksum-bound Fedora advisories")]
+    Advisory {
+        #[command(subcommand)]
+        command: AdvisoryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AdvisoryCommand {
+    #[command(about = "List advisories applicable to the current RPMDB")]
+    List(AdvisoryQueryArgs),
+    #[command(about = "Show full details for one or more advisory identifiers")]
+    Info {
+        #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+        repositories: Vec<String>,
+        #[arg(required = true)]
+        advisories: Vec<String>,
+    },
+    #[command(about = "Upgrade packages covered by applicable advisories")]
+    Upgrade(AdvisoryUpgradeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct AdvisoryQueryArgs {
+    #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+    pub(crate) repositories: Vec<String>,
+    #[arg(
+        long,
+        help = "Include advisories that are not applicable to installed packages"
+    )]
+    pub(crate) all: bool,
+    #[arg(long, help = "Select only security advisories")]
+    pub(crate) security: bool,
+    #[arg(long, value_name = "SEVERITY")]
+    pub(crate) severity: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct AdvisoryUpgradeArgs {
+    #[arg(long = "repo", visible_alias = "enable-repo", value_name = "ID")]
+    pub(crate) repositories: Vec<String>,
+    #[arg(long, conflicts_with = "assumeno")]
+    pub(crate) assumeyes: bool,
+    #[arg(long, conflicts_with = "assumeyes")]
+    pub(crate) assumeno: bool,
+    #[arg(long, help = "Select only security advisories")]
+    pub(crate) security: bool,
+    #[arg(long, value_name = "SEVERITY")]
+    pub(crate) severity: Option<String>,
+    #[arg(value_name = "ADVISORY")]
+    pub(crate) advisories: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -229,6 +293,10 @@ pub(crate) enum PlanAction {
     Install,
     Upgrade,
     Remove,
+    Downgrade,
+    Reinstall,
+    DistroSync,
+    Autoremove,
 }
 
 impl From<PlanAction> for Action {
@@ -237,6 +305,10 @@ impl From<PlanAction> for Action {
             PlanAction::Install => Self::Install,
             PlanAction::Upgrade => Self::Upgrade,
             PlanAction::Remove => Self::Remove,
+            PlanAction::Downgrade => Self::Downgrade,
+            PlanAction::Reinstall => Self::Reinstall,
+            PlanAction::DistroSync => Self::DistroSync,
+            PlanAction::Autoremove => Self::Autoremove,
         }
     }
 }

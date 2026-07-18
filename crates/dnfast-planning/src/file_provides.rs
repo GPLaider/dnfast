@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    io::{Read, Seek, Write},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -71,9 +74,14 @@ pub(crate) fn build(
             "primary package checksums are duplicate".into(),
         ));
     }
+    // Fedora filelists contain millions of paths. Holding every 36-byte path
+    // digest in 256 Vecs made a first-generation rebuild scale with the whole
+    // repository and previously pushed peak RSS above 800 MiB. Anonymous
+    // 0600 temporary files retain the exact same deterministic sort/dedup
+    // result while bounding resident evidence to one hash bucket at a time.
     let mut buckets = (0..BUCKET_COUNT)
-        .map(|_| Vec::<[u8; RECORD_SIZE]>::new())
-        .collect::<Vec<_>>();
+        .map(|_| tempfile::tempfile().map_err(io))
+        .collect::<Result<Vec<_>, _>>()?;
     dnfast_metadata::visit_filelists_record_identities(
         generation.filelists().bytes(),
         &records.filelists,
@@ -88,7 +96,9 @@ pub(crate) fn build(
             let mut record = [0_u8; RECORD_SIZE];
             record[..32].copy_from_slice(&path_digest);
             record[32..].copy_from_slice(&ordinal.to_be_bytes());
-            buckets[usize::from(path_digest[0])].push(record);
+            buckets[usize::from(path_digest[0])]
+                .write_all(&record)
+                .map_err(|error| dnfast_metadata::MetadataError::Io(error.to_string()))?;
             Ok(())
         },
     )
@@ -99,12 +109,33 @@ pub(crate) fn build(
     let mut record_count = 0_u64;
     for shard_index in 0..SHARD_COUNT {
         let mut shard = Vec::new();
-        for (index, records) in buckets
+        for (index, spool) in buckets
             .iter_mut()
             .enumerate()
             .skip(shard_index * BUCKETS_PER_SHARD)
             .take(BUCKETS_PER_SHARD)
         {
+            spool.rewind().map_err(io)?;
+            let length = usize::try_from(spool.metadata().map_err(io)?.len())
+                .map_err(|error| PlanningError::Input(error.to_string()))?;
+            if length % RECORD_SIZE != 0 {
+                return Err(PlanningError::Input(
+                    "file-provides spool has a partial record".into(),
+                ));
+            }
+            let mut raw = Vec::new();
+            raw.try_reserve_exact(length)
+                .map_err(|error| PlanningError::Io(error.to_string()))?;
+            spool.read_to_end(&mut raw).map_err(io)?;
+            let mut records = raw
+                .chunks_exact(RECORD_SIZE)
+                .map(|value| {
+                    let mut record = [0_u8; RECORD_SIZE];
+                    record.copy_from_slice(value);
+                    record
+                })
+                .collect::<Vec<_>>();
+            drop(raw);
             records.sort_unstable();
             records.dedup();
             record_count = record_count
@@ -112,7 +143,7 @@ pub(crate) fn build(
                 .ok_or_else(|| {
                     PlanningError::Input("file-provides record count overflow".into())
                 })?;
-            let bytes = encode_bucket(index, records)?;
+            let bytes = encode_bucket(index, &records)?;
             let offset = shard.len() as u64;
             descriptors.push(Bucket {
                 shard: shard_index as u8,
@@ -121,8 +152,6 @@ pub(crate) fn build(
                 size: bytes.len() as u64,
             });
             shard.extend_from_slice(&bytes);
-            records.clear();
-            records.shrink_to_fit();
         }
         let sha256 = format!("{:x}", Sha256::digest(&shard));
         if let Some(store) = blob_store {
@@ -481,6 +510,10 @@ fn metadata(error: dnfast_metadata::MetadataError) -> PlanningError {
     ))
 }
 
+fn io(error: std::io::Error) -> PlanningError {
+    PlanningError::Io(error.to_string())
+}
+
 fn json(error: serde_json::Error) -> PlanningError {
     PlanningError::Input(error.to_string())
 }
@@ -568,6 +601,27 @@ mod tests {
         corrupted[0] ^= 1;
         fs::write(&bucket_path, corrupted).expect("tamper bucket");
         assert!(read_shard_from_storage(&planning_root, owner, shard).is_err());
+    }
+
+    /// Read-only, opt-in Fedora-scale memory gate. It deliberately writes no
+    /// cache or planning state; anonymous spools disappear when the process
+    /// exits. Run as root with DNFAST_FILE_PROVIDES_BENCH_REPO=fedora.
+    #[test]
+    #[ignore = "requires an explicitly selected system cache generation"]
+    fn system_generation_memory_gate() {
+        let repository = std::env::var("DNFAST_FILE_PROVIDES_BENCH_REPO")
+            .expect("DNFAST_FILE_PROVIDES_BENCH_REPO must name one repository");
+        let cache = dnfast_cache::Cache::new("/var/cache/dnfast");
+        let generation = cache
+            .open_current_verified_complete_generation(&repository)
+            .expect("verified system generation");
+        let descriptor = build(&generation, None).expect("bounded file-provides rebuild");
+        eprintln!(
+            "dnfast-file-provides-gate repository={repository} generation={} manifest={} size={}",
+            generation.digest(),
+            descriptor.sha256,
+            descriptor.size
+        );
     }
 
     fn read_shard_from_storage(

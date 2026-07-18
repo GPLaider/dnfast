@@ -13,6 +13,11 @@ pub enum Action {
     Install,
     Upgrade,
     Remove,
+    Downgrade,
+    Reinstall,
+    #[serde(rename = "distro_sync")]
+    DistroSync,
+    Autoremove,
 }
 
 impl Action {
@@ -21,6 +26,10 @@ impl Action {
             Self::Install => "install",
             Self::Upgrade => "upgrade",
             Self::Remove => "remove",
+            Self::Downgrade => "downgrade",
+            Self::Reinstall => "reinstall",
+            Self::DistroSync => "distro-sync",
+            Self::Autoremove => "autoremove",
         }
     }
 }
@@ -122,7 +131,11 @@ impl TransactionIntent {
         if self.schema_version != SCHEMA_VERSION {
             return Err(IntentError::SchemaVersion(self.schema_version));
         }
-        if matches!(self.action, Action::Install | Action::Remove) && self.packages.is_empty() {
+        if matches!(
+            self.action,
+            Action::Install | Action::Remove | Action::Downgrade | Action::Reinstall
+        ) && self.packages.is_empty()
+        {
             return Err(IntentError::MissingPackages(self.action));
         }
         let mut seen = HashSet::with_capacity(self.packages.len());

@@ -3,6 +3,14 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TOOLROOT=${FEDORA44_TOOLROOT:-$ROOT/.cache/fedora44-vm/toolroot}
+if [[ ! -f $TOOLROOT/usr/include/modulemd-2.0/modulemd.h ]]; then
+  if [[ -f /usr/include/modulemd-2.0/modulemd.h ]]; then
+    TOOLROOT=/
+  else
+    echo 'no complete Fedora native toolroot (modulemd.h is missing)' >&2
+    exit 1
+  fi
+fi
 FIXTURE=$ROOT/fixtures/rpm/generated-build10/repos
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/dnfast-solver.XXXXXX")
 RPMROOT=
@@ -164,6 +172,23 @@ grep -q $'pair\tdnfast-upgrade-0:2.0-1.noarch\tdnfast-upgrade-0:1.0-1.noarch' <<
 UPGRADE_ALL=$(DNFAST_BEST=1 DNFAST_OPERATION=upgrade solve @all no-weak "$SYSTEM" "$MAIN")
 grep -q $'action\tupgrade\tmain\tdnfast-upgrade-0:2.0-1.noarch' <<<"$UPGRADE_ALL"
 ! grep -q '^selector' <<<"$UPGRADE_ALL"
+awk 'BEGIN { block="" } /<metadata / { sub(/packages="25"/, "packages=\"1\""); print; next } /<package type=/ { block=$0 ORS; next } block != "" { block=block $0 ORS; if ($0 ~ /<\/package>/) { if (block ~ /<name>dnfast-upgrade<\/name>/ && block ~ /ver="2.0"/) printf "%s", block; block="" }; next } { print }' "$LIMIT_PRIMARY" >"$TMP/installed-v2.xml"
+SYSTEM_V2="@System,$LIMIT_REPOMD,$TMP/installed-v2.xml,$LIMIT_FILELISTS,9999,0"
+DOWNGRADE=$(DNFAST_OPERATION=downgrade solve dnfast-upgrade no-weak "$SYSTEM_V2" "$MAIN")
+grep -q $'action\tdowngrade\tmain\tdnfast-upgrade-0:1.0-1.noarch' <<<"$DOWNGRADE"
+grep -q $'action\tdowngraded\t@System\tdnfast-upgrade-0:2.0-1.noarch' <<<"$DOWNGRADE"
+REINSTALL=$(DNFAST_OPERATION=reinstall solve dnfast-upgrade no-weak "$SYSTEM_V2" "$MAIN")
+grep -q $'action\treinstall\tmain\tdnfast-upgrade-0:2.0-1.noarch' <<<"$REINSTALL"
+grep -q $'action\treinstalled\t@System\tdnfast-upgrade-0:2.0-1.noarch' <<<"$REINSTALL"
+DISTRO_SYNC=$(DNFAST_BEST=1 DNFAST_OPERATION=distro-sync solve dnfast-upgrade no-weak "$SYSTEM" "$MAIN")
+grep -q $'action\tupgrade\tmain\tdnfast-upgrade-0:2.0-1.noarch' <<<"$DISTRO_SYNC"
+AUTOREMOVE=$(DNFAST_OPERATION=autoremove solve dnfast-dep no-weak "$SYSTEM" "$MAIN")
+grep -q $'action\terase\t@System\tdnfast-dep-0:1.0-1.noarch' <<<"$AUTOREMOVE"
+awk 'BEGIN { block="" } /<metadata / { sub(/packages="25"/, "packages=\"3\""); print; next } /<package type=/ { block=$0 ORS; next } block != "" { block=block $0 ORS; if ($0 ~ /<\/package>/) { if (block ~ /<name>dnfast-dep<\/name>/ || block ~ /<name>dnfast-app<\/name>/ || (block ~ /<name>dnfast-upgrade<\/name>/ && block ~ /ver="1.0"/)) printf "%s", block; block="" }; next } { print }' "$LIMIT_PRIMARY" >"$TMP/installed-needed.xml"
+SYSTEM_NEEDED="@System,$LIMIT_REPOMD,$TMP/installed-needed.xml,$LIMIT_FILELISTS,9999,0"
+AUTOREMOVE_NEEDED=$(DNFAST_OPERATION=autoremove solve dnfast-dep no-weak "$SYSTEM_NEEDED" "$MAIN")
+grep -qx $'satisfied\tdnfast-dep' <<<"$AUTOREMOVE_NEEDED"
+! grep -q '^action' <<<"$AUTOREMOVE_NEEDED"
 OBSOLETE_OLD=$(solve dnfast-obsoletes no-weak "$SYSTEM" "$MAIN")
 grep -q $'action\tobsoleted\t@System\tdnfast-dep-0:1.0-1.noarch' <<<"$OBSOLETE_OLD"
 grep -q $'action\tobsoletes\tmain\tdnfast-obsoletes-0:2.0-1.noarch' <<<"$OBSOLETE_OLD"
@@ -195,6 +220,8 @@ printf '%s\n' 'assert transitive=true' 'assert rich=true' 'assert file-provide=t
   'assert causal-strong-weak-installed=true' \
   'assert ambiguous-installed-provider-rejected=true' \
   'assert native-obsolete-counterparts=true' \
+  'assert downgrade-reinstall-distro-sync=true' \
+  'assert reason-bounded-autoremove=true' \
   'assert exact-plus-one-limits=true' \
   'assert forced-failure-cleanup=true' \
   'assert repeated-cleanup=true'

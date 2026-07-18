@@ -147,6 +147,13 @@ impl NativeSolveOutput {
         }
         let mut identities = BTreeMap::new();
         for (nevra, repo) in result.actions.iter().zip(&result.repositories) {
+            // Reinstall deliberately has the same NEVRA on the selected
+            // repository and in @System. Decision provenance names only
+            // repository actions; installed providers are carried by the
+            // explicit provider_installed bit below.
+            if repo == "@System" {
+                continue;
+            }
             if identities.insert(nevra.clone(), repo.clone()).is_some() {
                 return Err(PlanError::DuplicateAction(nevra.clone()));
             }
@@ -395,7 +402,13 @@ impl NativeSolveOutput {
                     .collect::<Result<Vec<_>, PlanError>>()?;
                 let requested_spec = action.requested_spec;
                 let requested = requested_spec.is_some()
-                    || (expected_specs.is_empty() && operation == ResolvedOperation::Upgrade);
+                    || (expected_specs.is_empty()
+                        && matches!(
+                            operation,
+                            ResolvedOperation::Upgrade
+                                | ResolvedOperation::Downgrade
+                                | ResolvedOperation::Reinstall
+                        ));
                 Ok(ResolvedAction {
                     operation,
                     requested,
@@ -620,6 +633,32 @@ fn action_identity(
                 Some(old.vendor().into()),
             ))
         }
+        "downgrade" => {
+            let value = candidate.ok_or(PlanError::Invalid(
+                "native downgrade missing exact candidate",
+            ))?;
+            let old = exact_installed(action, inventory)?;
+            Ok((
+                ResolvedOperation::Downgrade,
+                value.name.clone(),
+                Some(old.db_instance()),
+                Some(old.immutable_header_sha256().as_str().into()),
+                Some(old.vendor().into()),
+            ))
+        }
+        "reinstall" | "change" => {
+            let value = candidate.ok_or(PlanError::Invalid(
+                "native reinstall missing exact candidate",
+            ))?;
+            let old = exact_installed(action, inventory)?;
+            Ok((
+                ResolvedOperation::Reinstall,
+                value.name.clone(),
+                Some(old.db_instance()),
+                Some(old.immutable_header_sha256().as_str().into()),
+                Some(old.vendor().into()),
+            ))
+        }
         "erase" | "obsoleted" => {
             let old = exact_installed(action, inventory)?;
             Ok((
@@ -672,6 +711,9 @@ fn pair_actions(
     for index in 0..raw.len() {
         let old_kind = match raw[index].kind.as_str() {
             "upgrade" => Some("upgraded"),
+            "downgrade" => Some("downgraded"),
+            "reinstall" => Some("reinstalled"),
+            "change" => Some("changed"),
             "obsoletes" => Some("obsoleted"),
             _ => None,
         };
@@ -696,7 +738,11 @@ fn pair_actions(
         if matches.is_empty() {
             return Err(PlanError::InstalledMissing(name));
         }
-        if old_kind == "upgraded" && matches.len() != 1 {
+        if matches!(
+            old_kind,
+            "upgraded" | "downgraded" | "reinstalled" | "changed"
+        ) && matches.len() != 1
+        {
             return Err(PlanError::AmbiguousInstalled(name));
         }
         let parent = format!("{}:{}", raw[index].repository, raw[index].nevra);
@@ -720,13 +766,21 @@ fn pair_actions(
         }
     }
     if raw.iter().enumerate().any(|(index, item)| {
-        matches!(item.kind.as_str(), "upgraded" | "obsoleted") && !paired.contains(&index)
+        matches!(
+            item.kind.as_str(),
+            "upgraded" | "downgraded" | "reinstalled" | "changed" | "obsoleted"
+        ) && !paired.contains(&index)
     }) {
         return Err(PlanError::Invalid("unpaired native old action"));
     }
     Ok(raw
         .into_iter()
-        .filter(|item| item.kind != "upgraded")
+        .filter(|item| {
+            !matches!(
+                item.kind.as_str(),
+                "upgraded" | "downgraded" | "reinstalled" | "changed"
+            )
+        })
         .collect())
 }
 
@@ -812,7 +866,7 @@ fn nevra_name(value: &str) -> Result<String, PlanError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{arch, parse_compact_relation, relation_text};
+    use super::{NativeAction, arch, pair_actions, parse_compact_relation, relation_text};
 
     #[test]
     fn x86_64_native_solver_architecture_is_not_aarch64() {
@@ -832,5 +886,65 @@ mod tests {
         }
         assert!(parse_compact_relation("").is_err());
         assert!(parse_compact_relation(" = 1").is_err());
+    }
+
+    #[test]
+    fn downgrade_and_reinstall_pairs_retain_exact_installed_identity() {
+        let inventory = dnfast_core::InstalledInventory::new(
+            "sqlite",
+            "6",
+            vec![
+                dnfast_core::InstalledPackage::new(
+                    "demo",
+                    dnfast_core::Evra::new(0, "2", "1", dnfast_core::Architecture::X86_64),
+                    "Fedora",
+                    7,
+                    1,
+                    "a".repeat(64),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for (active, passive, target) in [
+            ("downgrade", "downgraded", "demo-0:1-1.x86_64"),
+            ("reinstall", "reinstalled", "demo-0:2-1.x86_64"),
+        ] {
+            let old = "demo-0:2-1.x86_64";
+            let paired = pair_actions(
+                vec![
+                    NativeAction {
+                        kind: active.into(),
+                        repository: "fedora".into(),
+                        nevra: target.into(),
+                        old_nevra: None,
+                        installed_instance: None,
+                        installed_header_sha256: None,
+                        requested_spec: Some(dnfast_core::PackageSpec::parse("demo").unwrap()),
+                        requested_relation: false,
+                        provenance: None,
+                        transaction_counterpart_nevra: Some(old.into()),
+                    },
+                    NativeAction {
+                        kind: passive.into(),
+                        repository: "@System".into(),
+                        nevra: old.into(),
+                        old_nevra: None,
+                        installed_instance: None,
+                        installed_header_sha256: None,
+                        requested_spec: None,
+                        requested_relation: false,
+                        provenance: None,
+                        transaction_counterpart_nevra: Some(target.into()),
+                    },
+                ],
+                &inventory,
+            )
+            .unwrap();
+            assert_eq!(paired.len(), 1);
+            assert_eq!(paired[0].installed_instance, Some(7));
+            assert_eq!(paired[0].installed_header_sha256, Some("a".repeat(64)));
+            assert_eq!(paired[0].old_nevra.as_deref(), Some(old));
+        }
     }
 }

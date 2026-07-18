@@ -102,17 +102,29 @@ fn trust_policy_rejects_unknown_schema_and_unknown_fields() {
 }
 
 #[test]
-fn solver_policy_rejects_unsafe_mutation_modes() {
+fn solver_policy_validates_explicit_replacement_direction_and_identity() {
     let policy = SolverPolicy::fedora44_aarch64(vec!["kernel".into()], vec!["dnfast".into()]);
+    let old = Evra::new(0, "2", "1", Architecture::Noarch);
+    let older = Evra::new(0, "1", "1", Architecture::Noarch);
     assert!(
         policy
-            .validate_action(&CandidateAction::downgrade())
-            .is_err()
+            .validate_downgrade(&CandidateAction::downgrade(
+                old.clone(),
+                older,
+                "Fedora",
+                "Fedora",
+            ))
+            .is_ok()
     );
     assert!(
         policy
-            .validate_action(&CandidateAction::reinstall())
-            .is_err()
+            .validate_reinstall(&CandidateAction::reinstall(
+                old.clone(),
+                old,
+                "Fedora",
+                "Fedora",
+            ))
+            .is_ok()
     );
     assert!(
         policy

@@ -242,6 +242,17 @@ run_dnfast upgrade-enable-next module enable --repo "$REPO_ID" dnfast-upgrade:ne
 run_dnfast upgrade upgrade --repo "$REPO_ID" --assumeyes dnfast-upgrade
 [[ $(rpm -q --qf '%{VERSION}\n' dnfast-upgrade) == 2.0 ]]
 record stream_upgrade 1.0_to_2.0
+run_dnfast reinstall-next reinstall --repo "$REPO_ID" --assumeyes dnfast-upgrade
+[[ $(rpm -q --qf '%{VERSION}\n' dnfast-upgrade) == 2.0 ]]
+run_dnfast downgrade-reset module reset --repo "$REPO_ID" dnfast-upgrade
+run_dnfast downgrade downgrade --repo "$REPO_ID" --assumeyes dnfast-upgrade
+[[ $(rpm -q --qf '%{VERSION}\n' dnfast-upgrade) == 1.0 ]]
+run_dnfast reinstall-stable reinstall --repo "$REPO_ID" --assumeyes dnfast-upgrade
+[[ $(rpm -q --qf '%{VERSION}\n' dnfast-upgrade) == 1.0 ]]
+run_dnfast distro-sync-enable-next module enable --repo "$REPO_ID" dnfast-upgrade:next
+run_dnfast distro-sync distro-sync --repo "$REPO_ID" --assumeyes dnfast-upgrade
+[[ $(rpm -q --qf '%{VERSION}\n' dnfast-upgrade) == 2.0 ]]
+record downgrade_reinstall_distro_sync passed
 run_dnfast upgrade-remove remove --repo "$REPO_ID" --assumeyes dnfast-upgrade
 run_dnfast final-reset module reset --repo "$REPO_ID" dnfast-upgrade
 

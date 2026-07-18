@@ -9,6 +9,7 @@ mod primary;
 mod relations;
 mod repomd;
 mod search;
+mod updateinfo;
 mod xml;
 
 pub use compression::{
@@ -33,3 +34,4 @@ pub use repomd::{
     PrimaryRecord, RepomdRecords, parse_repomd, parse_repomd_records,
 };
 pub use search::search;
+pub use updateinfo::{Advisory, AdvisoryPackage, AdvisoryReference, UpdateInfo, parse_updateinfo};

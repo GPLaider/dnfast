@@ -15,7 +15,8 @@ use crate::PlanningError;
 const LEGACY_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const EXTERNAL_SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 const EXTENDED_SNAPSHOT_SCHEMA_VERSION: u32 = 5;
-const SNAPSHOT_SCHEMA_VERSION: u32 = 6;
+const MODULE_STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 6;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 7;
 const MAX_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -67,6 +68,8 @@ pub struct PlanningRepository {
     pub group: Option<PlanningBytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modules: Option<PlanningBytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updateinfo: Option<PlanningBytes>,
     pub trust: RepoTrustPolicy,
     pub keys: Vec<PlanningKey>,
     pub repomd_authentication: RepomdAuthentication,
@@ -144,6 +147,9 @@ impl PlanningSnapshot {
 
     pub const fn published_at_unix(&self) -> u64 {
         self.published_at_unix
+    }
+    pub(crate) const fn has_current_schema(&self) -> bool {
+        self.schema_version == SNAPSHOT_SCHEMA_VERSION
     }
     pub fn payload(&self) -> &PlanningPayload {
         &self.payload
@@ -247,6 +253,7 @@ impl PlanningSnapshot {
             LEGACY_SNAPSHOT_SCHEMA_VERSION
                 | EXTERNAL_SNAPSHOT_SCHEMA_VERSION
                 | EXTENDED_SNAPSHOT_SCHEMA_VERSION
+                | MODULE_STATE_SNAPSHOT_SCHEMA_VERSION
                 | SNAPSHOT_SCHEMA_VERSION
         ) {
             return Err(PlanningError::Input("unsupported snapshot schema".into()));
@@ -285,7 +292,9 @@ impl PlanningSnapshot {
             .map_err(domain)?;
         self.payload.inventory.canonical_sha256().map_err(domain)?;
         self.payload.module_state.validate()?;
-        if self.schema_version < SNAPSHOT_SCHEMA_VERSION && !self.payload.module_state.is_empty() {
+        if self.schema_version < MODULE_STATE_SNAPSHOT_SCHEMA_VERSION
+            && !self.payload.module_state.is_empty()
+        {
             return Err(PlanningError::Input(
                 "legacy snapshot contains module state".into(),
             ));
@@ -463,6 +472,11 @@ fn validate_repository(
             "legacy snapshot contains unbound extended metadata".into(),
         ));
     }
+    if schema_version < SNAPSHOT_SCHEMA_VERSION && repository.updateinfo.is_some() {
+        return Err(PlanningError::Input(
+            "legacy snapshot contains unbound updateinfo metadata".into(),
+        ));
+    }
     for payload in [
         &repository.repomd,
         &repository.primary,
@@ -471,6 +485,9 @@ fn validate_repository(
         payload.validate_shape(schema_version)?;
     }
     for payload in repository.group.iter().chain(repository.modules.iter()) {
+        payload.validate_shape(schema_version)?;
+    }
+    if let Some(payload) = &repository.updateinfo {
         payload.validate_shape(schema_version)?;
     }
     if let Some(payload) = &repository.file_provides {
@@ -538,7 +555,9 @@ fn metadata_digest(
     schema_version: u32,
 ) -> Result<String, PlanningError> {
     let mut digest = Sha256::new();
-    digest.update(if schema_version >= EXTENDED_SNAPSHOT_SCHEMA_VERSION {
+    digest.update(if schema_version >= SNAPSHOT_SCHEMA_VERSION {
+        b"dnfast-root-metadata-v5".as_slice()
+    } else if schema_version >= EXTENDED_SNAPSHOT_SCHEMA_VERSION {
         b"dnfast-root-metadata-v4".as_slice()
     } else {
         b"dnfast-root-metadata-v3".as_slice()
@@ -578,6 +597,13 @@ fn metadata_digest(
                     frame(&mut digest, &bytes.sha256, bytes.sha256.as_bytes())?;
                     digest.update(bytes.size.to_be_bytes());
                 }
+            }
+        }
+        if schema_version >= SNAPSHOT_SCHEMA_VERSION {
+            frame(&mut digest, "updateinfo", b"updateinfo")?;
+            if let Some(bytes) = repository.updateinfo.as_ref() {
+                frame(&mut digest, &bytes.sha256, bytes.sha256.as_bytes())?;
+                digest.update(bytes.size.to_be_bytes());
             }
         }
     }

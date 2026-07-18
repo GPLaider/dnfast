@@ -13,18 +13,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use response::{JsonOutput, Response, emit};
 
-const UNSUPPORTED_COMMANDS: &[&str] = &[
-    "environment",
-    "plugin",
-    "copr",
-    "system-upgrade",
-    "offline",
-    "autoremove",
-    "downgrade",
-    "reinstall",
-    "distro-sync",
-    "advisory",
-];
+const UNSUPPORTED_COMMANDS: &[&str] = &["plugin", "copr", "system-upgrade", "offline"];
 
 fn main() -> ExitCode {
     let arguments = match arguments() {
@@ -134,13 +123,19 @@ fn command_from_arguments(arguments: impl IntoIterator<Item = String>) -> Option
         "install" => Some("install"),
         "remove" => Some("remove"),
         "upgrade" => Some("upgrade"),
+        "downgrade" => Some("downgrade"),
+        "reinstall" => Some("reinstall"),
+        "distro-sync" => Some("distro-sync"),
+        "autoremove" => Some("autoremove"),
         "daemon" => Some("daemon"),
         "repo" => Some("repo"),
         "history" => Some("history"),
         "search" => Some("search"),
         "doctor" => Some("doctor"),
         "group" => Some("group"),
+        "environment" => Some("environment"),
         "module" => Some("module"),
+        "advisory" => Some("advisory"),
         _ => Some("cli"),
     }
 }

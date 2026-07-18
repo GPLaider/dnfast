@@ -70,7 +70,11 @@ pub fn require_equal(
             staged.policy.best(),
         ),
         Action::Upgrade => context.solve_upgrade_many(&names, staged.policy.best()),
+        Action::Downgrade => context.solve_downgrade_many(&names),
+        Action::Reinstall => context.solve_reinstall_many(&names),
+        Action::DistroSync => context.solve_distro_sync_many(&names, staged.policy.best()),
         Action::Remove => context.solve_erase_many(&names),
+        Action::Autoremove => context.solve_autoremove_many(&names),
     }
     .map_err(native)?;
     let metadata = staged

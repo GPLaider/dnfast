@@ -109,7 +109,9 @@ impl PlanBuilder<'_> {
                     .ok_or_else(|| PlanError::InstalledMissing(resolved.name.clone()))
             })
             .transpose()?;
-        let relation = if resolved.requested {
+        let relation = if self.intent.action() == dnfast_core::Action::Autoremove {
+            RequestedRelation::Dependency
+        } else if resolved.requested {
             RequestedRelation::Requested
         } else if resolved.provenance.is_some() {
             RequestedRelation::Dependency
@@ -124,7 +126,10 @@ impl PlanBuilder<'_> {
         };
         match resolved.operation {
             ResolvedOperation::Remove => self.remove(resolved, installed, relation),
-            ResolvedOperation::Install | ResolvedOperation::Upgrade => {
+            ResolvedOperation::Install
+            | ResolvedOperation::Upgrade
+            | ResolvedOperation::Downgrade
+            | ResolvedOperation::Reinstall => {
                 self.install_or_upgrade(resolved, installed, relation)
             }
         }
@@ -143,6 +148,7 @@ impl PlanBuilder<'_> {
         }
         if !resolved.required_by_remaining.is_empty()
             || (relation != RequestedRelation::Requested
+                && self.intent.action() != dnfast_core::Action::Autoremove
                 && !resolved.introduced_by_requested
                 && resolved.provenance.is_none())
         {
@@ -200,28 +206,55 @@ impl PlanBuilder<'_> {
         if candidate.name != resolved.name {
             return Err(PlanError::Invalid("candidate name mismatch"));
         }
-        if matches!(resolved.operation, ResolvedOperation::Upgrade) {
+        if matches!(
+            resolved.operation,
+            ResolvedOperation::Upgrade
+                | ResolvedOperation::Downgrade
+                | ResolvedOperation::Reinstall
+        ) {
             let previous =
                 installed.ok_or_else(|| PlanError::InstalledMissing(resolved.name.clone()))?;
             let installed_vendor = resolved
                 .installed_vendor
                 .as_deref()
                 .ok_or(PlanError::Invalid("missing installed vendor"))?;
-            self.policy
-                .validate_planned_upgrade(
-                    previous.evra(),
-                    &candidate.evra,
+            let replacement = match resolved.operation {
+                ResolvedOperation::Upgrade => dnfast_core::CandidateAction::upgrade(
+                    previous.evra().clone(),
+                    candidate.evra.clone(),
                     installed_vendor,
                     &candidate.vendor,
-                )
-                .map_err(|error| PlanError::Unsafe(error.to_string()))?;
+                ),
+                ResolvedOperation::Downgrade => dnfast_core::CandidateAction::downgrade(
+                    previous.evra().clone(),
+                    candidate.evra.clone(),
+                    installed_vendor,
+                    &candidate.vendor,
+                ),
+                ResolvedOperation::Reinstall => dnfast_core::CandidateAction::reinstall(
+                    previous.evra().clone(),
+                    candidate.evra.clone(),
+                    installed_vendor,
+                    &candidate.vendor,
+                ),
+                ResolvedOperation::Install | ResolvedOperation::Remove => unreachable!(),
+            };
+            match resolved.operation {
+                ResolvedOperation::Upgrade => self.policy.validate_upgrade(&replacement),
+                ResolvedOperation::Downgrade => self.policy.validate_downgrade(&replacement),
+                ResolvedOperation::Reinstall => self.policy.validate_reinstall(&replacement),
+                ResolvedOperation::Install | ResolvedOperation::Remove => unreachable!(),
+            }
+            .map_err(|error| PlanError::Unsafe(error.to_string()))?;
         } else if installed.is_some() {
             return Err(PlanError::Invalid("install action already installed"));
         }
-        let operation = if matches!(resolved.operation, ResolvedOperation::Upgrade) {
-            "upgrade"
-        } else {
-            "install"
+        let operation = match resolved.operation {
+            ResolvedOperation::Install => "install",
+            ResolvedOperation::Upgrade => "upgrade",
+            ResolvedOperation::Downgrade => "downgrade",
+            ResolvedOperation::Reinstall => "reinstall",
+            ResolvedOperation::Remove => unreachable!(),
         };
         Ok(ExplainedAction {
             operation: operation.into(),
@@ -419,6 +452,64 @@ fn core_action(action: &ExplainedAction) -> Result<PackageAction, PlanError> {
             action.reason,
         )),
         "upgrade" => PackageAction::upgrade_with_identity(
+            &action.name,
+            action
+                .installed_evra
+                .clone()
+                .ok_or(PlanError::Invalid("missing installed EVRA"))?,
+            action.target_evra.clone(),
+            action
+                .repo_id
+                .as_deref()
+                .ok_or(PlanError::Invalid("missing repo"))?,
+            action
+                .installed_vendor
+                .as_deref()
+                .ok_or(PlanError::Invalid("missing installed vendor"))?,
+            action
+                .vendor
+                .as_deref()
+                .ok_or(PlanError::Invalid("missing candidate vendor"))?,
+            action.reason,
+            action
+                .installed_instance
+                .ok_or(PlanError::Invalid("missing installed instance"))?,
+            action
+                .installed_header_sha256
+                .as_deref()
+                .ok_or(PlanError::Invalid("missing installed header"))?,
+        )
+        .map_err(|error| PlanError::Canonical(error.to_string())),
+        "downgrade" => PackageAction::downgrade_with_identity(
+            &action.name,
+            action
+                .installed_evra
+                .clone()
+                .ok_or(PlanError::Invalid("missing installed EVRA"))?,
+            action.target_evra.clone(),
+            action
+                .repo_id
+                .as_deref()
+                .ok_or(PlanError::Invalid("missing repo"))?,
+            action
+                .installed_vendor
+                .as_deref()
+                .ok_or(PlanError::Invalid("missing installed vendor"))?,
+            action
+                .vendor
+                .as_deref()
+                .ok_or(PlanError::Invalid("missing candidate vendor"))?,
+            action.reason,
+            action
+                .installed_instance
+                .ok_or(PlanError::Invalid("missing installed instance"))?,
+            action
+                .installed_header_sha256
+                .as_deref()
+                .ok_or(PlanError::Invalid("missing installed header"))?,
+        )
+        .map_err(|error| PlanError::Canonical(error.to_string())),
+        "reinstall" => PackageAction::reinstall_with_identity(
             &action.name,
             action
                 .installed_evra

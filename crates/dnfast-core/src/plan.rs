@@ -14,6 +14,8 @@ pub const MAX_PLAN_ACTIONS: usize = 100_000;
 pub enum PackageOperation {
     Install,
     Upgrade,
+    Downgrade,
+    Reinstall,
     Remove,
 }
 
@@ -87,6 +89,12 @@ impl PackageAction {
     }
     pub const fn reason(&self) -> PackageReason {
         self.reason
+    }
+    pub const fn installed_instance(&self) -> Option<u64> {
+        self.installed_instance
+    }
+    pub fn installed_header_sha256(&self) -> Option<&Sha256Digest> {
+        self.installed_header_sha256.as_ref()
     }
     pub fn install(
         name: impl Into<String>,
@@ -175,6 +183,52 @@ impl PackageAction {
     ) -> Self {
         Self {
             operation: PackageOperation::Upgrade,
+            name: name.into(),
+            target_evra,
+            installed_evra: Some(installed_evra),
+            installed_instance: None,
+            installed_header_sha256: None,
+            installed_vendor: Some(installed_vendor.into()),
+            candidate_vendor: Some(candidate_vendor.into()),
+            repo_id: Some(repo_id.into()),
+            reason,
+            provenance: None,
+        }
+    }
+    pub fn downgrade(
+        name: impl Into<String>,
+        installed_evra: Evra,
+        target_evra: Evra,
+        repo_id: impl Into<String>,
+        installed_vendor: impl Into<String>,
+        candidate_vendor: impl Into<String>,
+        reason: PackageReason,
+    ) -> Self {
+        Self {
+            operation: PackageOperation::Downgrade,
+            name: name.into(),
+            target_evra,
+            installed_evra: Some(installed_evra),
+            installed_instance: None,
+            installed_header_sha256: None,
+            installed_vendor: Some(installed_vendor.into()),
+            candidate_vendor: Some(candidate_vendor.into()),
+            repo_id: Some(repo_id.into()),
+            reason,
+            provenance: None,
+        }
+    }
+    pub fn reinstall(
+        name: impl Into<String>,
+        installed_evra: Evra,
+        target_evra: Evra,
+        repo_id: impl Into<String>,
+        installed_vendor: impl Into<String>,
+        candidate_vendor: impl Into<String>,
+        reason: PackageReason,
+    ) -> Self {
+        Self {
+            operation: PackageOperation::Reinstall,
             name: name.into(),
             target_evra,
             installed_evra: Some(installed_evra),
@@ -292,6 +346,64 @@ impl PackageAction {
             provenance: None,
         })
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn downgrade_with_identity(
+        name: impl Into<String>,
+        installed_evra: Evra,
+        target_evra: Evra,
+        repo_id: impl Into<String>,
+        installed_vendor: impl Into<String>,
+        candidate_vendor: impl Into<String>,
+        reason: PackageReason,
+        instance: u64,
+        header_sha256: impl Into<String>,
+    ) -> Result<Self, DomainError> {
+        Ok(Self {
+            operation: PackageOperation::Downgrade,
+            name: name.into(),
+            target_evra,
+            installed_evra: Some(installed_evra),
+            installed_instance: Some(instance),
+            installed_header_sha256: Some(Sha256Digest::parse(
+                header_sha256,
+                "installed_header_sha256",
+            )?),
+            installed_vendor: Some(installed_vendor.into()),
+            candidate_vendor: Some(candidate_vendor.into()),
+            repo_id: Some(repo_id.into()),
+            reason,
+            provenance: None,
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn reinstall_with_identity(
+        name: impl Into<String>,
+        installed_evra: Evra,
+        target_evra: Evra,
+        repo_id: impl Into<String>,
+        installed_vendor: impl Into<String>,
+        candidate_vendor: impl Into<String>,
+        reason: PackageReason,
+        instance: u64,
+        header_sha256: impl Into<String>,
+    ) -> Result<Self, DomainError> {
+        Ok(Self {
+            operation: PackageOperation::Reinstall,
+            name: name.into(),
+            target_evra,
+            installed_evra: Some(installed_evra),
+            installed_instance: Some(instance),
+            installed_header_sha256: Some(Sha256Digest::parse(
+                header_sha256,
+                "installed_header_sha256",
+            )?),
+            installed_vendor: Some(installed_vendor.into()),
+            candidate_vendor: Some(candidate_vendor.into()),
+            repo_id: Some(repo_id.into()),
+            reason,
+            provenance: None,
+        })
+    }
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -315,11 +427,14 @@ impl PackageAction {
         }
         self.target_evra.validate()?;
         match self.operation {
-            PackageOperation::Install | PackageOperation::Upgrade
+            PackageOperation::Install
+            | PackageOperation::Upgrade
+            | PackageOperation::Downgrade
+            | PackageOperation::Reinstall
                 if self.repo_id.as_deref().is_none_or(str::is_empty) =>
             {
                 Err(DomainError::InvalidPlan(
-                    "install/upgrade action requires repo",
+                    "install/replacement action requires repo",
                 ))
             }
             PackageOperation::Remove if self.repo_id.is_some() => {
@@ -351,6 +466,8 @@ impl PackageAction {
                 ))
             }
             PackageOperation::Upgrade
+            | PackageOperation::Downgrade
+            | PackageOperation::Reinstall
                 if self.installed_evra.is_none()
                     || self.installed_vendor.is_none()
                     || self.candidate_vendor.as_deref().is_none_or(str::is_empty)
@@ -358,7 +475,7 @@ impl PackageAction {
                     || self.installed_header_sha256.is_none() =>
             {
                 Err(DomainError::InvalidPlan(
-                    "upgrade requires installed and candidate identity",
+                    "replacement requires installed and candidate identity",
                 ))
             }
             PackageOperation::Remove
@@ -374,14 +491,21 @@ impl PackageAction {
             PackageOperation::Remove if self.candidate_vendor.is_some() => Err(
                 DomainError::InvalidPlan("remove cannot carry candidate vendor"),
             ),
-            PackageOperation::Install | PackageOperation::Upgrade if self.provenance.is_some() => {
+            PackageOperation::Install
+            | PackageOperation::Upgrade
+            | PackageOperation::Downgrade
+            | PackageOperation::Reinstall
+                if self.provenance.is_some() =>
+            {
                 Err(DomainError::InvalidPlan(
-                    "install/upgrade cannot carry side-effect provenance",
+                    "install/replacement cannot carry side-effect provenance",
                 ))
             }
-            PackageOperation::Install | PackageOperation::Upgrade | PackageOperation::Remove => {
-                Ok(())
-            }
+            PackageOperation::Install
+            | PackageOperation::Upgrade
+            | PackageOperation::Downgrade
+            | PackageOperation::Reinstall
+            | PackageOperation::Remove => Ok(()),
         }
     }
 }
@@ -584,6 +708,15 @@ impl PlanEnvelope {
                     PackageOperation::Install | PackageOperation::Upgrade
                 ) | (Action::Upgrade, PackageOperation::Upgrade)
                     | (Action::Remove, PackageOperation::Remove)
+                    | (Action::Downgrade, PackageOperation::Downgrade)
+                    | (Action::Reinstall, PackageOperation::Reinstall)
+                    | (
+                        Action::DistroSync,
+                        PackageOperation::Upgrade
+                            | PackageOperation::Downgrade
+                            | PackageOperation::Reinstall
+                    )
+                    | (Action::Autoremove, PackageOperation::Remove)
             );
             let side_effect = matches!((&action.provenance, action.operation),
                 (Some(ActionProvenance::ObsoletedBy { parent_action_identity }), PackageOperation::Remove)
@@ -596,6 +729,13 @@ impl PlanEnvelope {
             }
             if ordinary && action.provenance.is_some() {
                 return Err(DomainError::InvalidPlan("unexpected action provenance"));
+            }
+            if self.intent.action() == Action::Autoremove
+                && !action.reason.is_autoremove_candidate()
+            {
+                return Err(DomainError::UnsafeAction(
+                    "autoremove requires dependency reason",
+                ));
             }
             match action.operation {
                 PackageOperation::Remove => policy.validate_removal(&action.name, action.reason)?,
@@ -616,6 +756,42 @@ impl PlanEnvelope {
                             .ok_or(DomainError::InvalidPlan("missing candidate vendor"))?,
                     );
                     policy.validate_upgrade(&candidate)?;
+                }
+                PackageOperation::Downgrade => {
+                    let candidate = crate::CandidateAction::downgrade(
+                        action
+                            .installed_evra
+                            .clone()
+                            .ok_or(DomainError::InvalidPlan("missing installed EVRA"))?,
+                        action.target_evra.clone(),
+                        action
+                            .installed_vendor
+                            .clone()
+                            .ok_or(DomainError::InvalidPlan("missing installed vendor"))?,
+                        action
+                            .candidate_vendor
+                            .clone()
+                            .ok_or(DomainError::InvalidPlan("missing candidate vendor"))?,
+                    );
+                    policy.validate_downgrade(&candidate)?;
+                }
+                PackageOperation::Reinstall => {
+                    let candidate = crate::CandidateAction::reinstall(
+                        action
+                            .installed_evra
+                            .clone()
+                            .ok_or(DomainError::InvalidPlan("missing installed EVRA"))?,
+                        action.target_evra.clone(),
+                        action
+                            .installed_vendor
+                            .clone()
+                            .ok_or(DomainError::InvalidPlan("missing installed vendor"))?,
+                        action
+                            .candidate_vendor
+                            .clone()
+                            .ok_or(DomainError::InvalidPlan("missing candidate vendor"))?,
+                    );
+                    policy.validate_reinstall(&candidate)?;
                 }
                 PackageOperation::Install => {}
             }

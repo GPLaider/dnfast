@@ -112,6 +112,8 @@ fn compact_relation(item: &dnfast_metadata::Relation) -> String {
 pub enum ResolvedOperation {
     Install,
     Upgrade,
+    Downgrade,
+    Reinstall,
     Remove,
 }
 

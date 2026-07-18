@@ -272,6 +272,7 @@ pub(crate) fn garbage_collect_blobs(
                 repository.file_provides.as_ref(),
                 repository.group.as_ref(),
                 repository.modules.as_ref(),
+                repository.updateinfo.as_ref(),
             ];
             for descriptor in descriptors.into_iter().flatten() {
                 if !valid_digest(&descriptor.sha256) {

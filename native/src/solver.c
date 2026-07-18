@@ -8,6 +8,7 @@
 #ifdef DNFAST_NATIVE_REAL
 #include <solv/pool.h>
 #include <solv/poolarch.h>
+#include <solv/evr.h>
 #include <solv/problems.h>
 #include <solv/queue.h>
 #include <solv/repo.h>
@@ -321,9 +322,242 @@ static int action_is_final_active(const dnfast_context *context, size_t index,
                 type == SOLVER_TRANSACTION_CHANGE ||
                 type == SOLVER_TRANSACTION_UPGRADE ||
                 type == SOLVER_TRANSACTION_OBSOLETES;
+        case 3:
+            return type == SOLVER_TRANSACTION_DOWNGRADE;
+        case 4:
+            return type == SOLVER_TRANSACTION_REINSTALL ||
+                type == SOLVER_TRANSACTION_CHANGE ||
+                type == SOLVER_TRANSACTION_MULTIREINSTALL;
+        case 5:
+            return type == SOLVER_TRANSACTION_DOWNGRADE ||
+                type == SOLVER_TRANSACTION_CHANGE ||
+                type == SOLVER_TRANSACTION_UPGRADE ||
+                type == SOLVER_TRANSACTION_OBSOLETES ||
+                type == SOLVER_TRANSACTION_REINSTALL ||
+                type == SOLVER_TRANSACTION_MULTIREINSTALL;
+        case 6:
+            return type == SOLVER_TRANSACTION_ERASE;
         default:
             return 0;
     }
+}
+
+static Id operation_job(uint8_t operation, uint8_t best) {
+    switch (operation) {
+        case 0:
+            return SOLVER_INSTALL | (best ? SOLVER_FORCEBEST : 0);
+        case 1:
+            return SOLVER_ERASE;
+        case 2:
+            return SOLVER_UPDATE | SOLVER_FORCEBEST;
+        case 3:
+            return SOLVER_DISTUPGRADE | SOLVER_TARGETED | SOLVER_FORCEBEST;
+        case 4:
+            return SOLVER_INSTALL | SOLVER_ORUPDATE | SOLVER_TARGETED |
+                SOLVER_FORCEBEST;
+        case 5:
+            return SOLVER_DISTUPGRADE | SOLVER_TARGETED |
+                (best ? SOLVER_FORCEBEST : 0);
+        case 6:
+            return SOLVER_ERASE;
+        default:
+            return SOLVER_NOOP;
+    }
+}
+
+static dnfast_status exact_installed_selector(
+    dnfast_context *context, Queue *selector, Id *installed_out,
+    dnfast_error *error) {
+    Queue selected;
+    Id installed = 0;
+    queue_init(&selected);
+    selection_solvables(context->pool, selector, &selected);
+    for (int index = 0; index < selected.count; ++index) {
+        Id id = selected.elements[index];
+        Solvable *item = pool_id2solvable(context->pool, id);
+        if (item == NULL || item->repo != context->pool->installed) continue;
+        if (installed != 0 && installed != id) {
+            queue_free(&selected);
+            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                    "libsolv", "autoremove",
+                                    "candidate matches multiple installed packages");
+        }
+        installed = id;
+    }
+    queue_free(&selected);
+    if (installed == 0)
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "libsolv", "autoremove",
+                                "autoremove candidate is not installed");
+    queue_empty(selector);
+    queue_push2(selector, SOLVER_SOLVABLE, installed);
+    *installed_out = installed;
+    return DNFAST_STATUS_OK;
+}
+
+static int queue_contains_id(const Queue *queue, Id id) {
+    for (int index = 0; index < queue->count; ++index)
+        if (queue->elements[index] == id) return 1;
+    return 0;
+}
+
+static dnfast_status prepare_autoremove_jobs(
+    dnfast_context *context, Queue *job, Queue *selectors,
+    size_t selector_count, dnfast_error *error) {
+    Queue candidates;
+    Queue roots;
+    Queue unneeded;
+    queue_init(&candidates);
+    queue_init(&roots);
+    queue_init(&unneeded);
+    for (size_t index = 0; index < selector_count; ++index) {
+        if (selectors[index].count != 2 ||
+            (selectors[index].elements[0] & SOLVER_SELECTMASK) != SOLVER_SOLVABLE) {
+            queue_free(&candidates);
+            queue_free(&roots);
+            queue_free(&unneeded);
+            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                    "libsolv", "autoremove",
+                                    "autoremove selector is not exact");
+        }
+        Id id = selectors[index].elements[1];
+        if (queue_contains_id(&candidates, id)) {
+            queue_free(&candidates);
+            queue_free(&roots);
+            queue_free(&unneeded);
+            return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                    "solver", "autoremove",
+                                    "duplicate autoremove candidate");
+        }
+        queue_push(&candidates, id);
+    }
+    Repo *system = context->pool->installed;
+    if (system == NULL) {
+        queue_free(&candidates);
+        queue_free(&roots);
+        queue_free(&unneeded);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "libsolv", "autoremove",
+                                "installed repository is absent");
+    }
+    for (Id id = system->start; id < system->end; ++id) {
+        Solvable *item = pool_id2solvable(context->pool, id);
+        if (item == NULL || item->repo != system || queue_contains_id(&candidates, id))
+            continue;
+        queue_push2(&roots, SOLVER_USERINSTALLED | SOLVER_SOLVABLE, id);
+    }
+    Solver *probe = solver_create(context->pool);
+    if (probe == NULL || solver_solve(probe, &roots) != 0) {
+        if (probe != NULL) solver_free(probe);
+        queue_free(&candidates);
+        queue_free(&roots);
+        queue_free(&unneeded);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "libsolv", "solver_get_unneeded",
+                                "unneeded-package calculation failed");
+    }
+    solver_get_unneeded(probe, &unneeded, 0);
+    solver_free(probe);
+    queue_empty(job);
+    for (int index = 0; index < candidates.count; ++index) {
+        Id id = candidates.elements[index];
+        if (queue_contains_id(&unneeded, id))
+            queue_push2(job, SOLVER_ERASE | SOLVER_SOLVABLE, id);
+    }
+    queue_free(&candidates);
+    queue_free(&roots);
+    queue_free(&unneeded);
+    return DNFAST_STATUS_OK;
+}
+
+static dnfast_status exact_replacement_candidate(
+    dnfast_context *context, Queue *selector, uint8_t operation,
+    Id *candidate_out, dnfast_error *error) {
+    Queue selected;
+    Id installed = 0;
+    Id candidate = 0;
+    queue_init(&selected);
+    selection_solvables(context->pool, selector, &selected);
+    for (int index = 0; index < selected.count; ++index) {
+        Id id = selected.elements[index];
+        Solvable *item = pool_id2solvable(context->pool, id);
+        if (item == NULL || item->repo != context->pool->installed) continue;
+        if (installed != 0 && installed != id) {
+            queue_free(&selected);
+            return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                    "libsolv", "replacement",
+                                    "selector matches multiple installed packages");
+        }
+        installed = id;
+    }
+    if (installed == 0 && context->pool->installed != NULL) {
+        Repo *system = context->pool->installed;
+        for (Id id = system->start; id < system->end; ++id) {
+            Solvable *old = pool_id2solvable(context->pool, id);
+            if (old == NULL || old->repo != system) continue;
+            int matched = 0;
+            for (int index = 0; index < selected.count; ++index) {
+                Solvable *available = pool_id2solvable(
+                    context->pool, selected.elements[index]);
+                if (available != NULL && available->repo != system &&
+                    available->name == old->name && available->arch == old->arch) {
+                    matched = 1;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            if (installed != 0 && installed != id) {
+                queue_free(&selected);
+                return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                        "libsolv", "replacement",
+                                        "selector maps to multiple installed packages");
+            }
+            installed = id;
+        }
+    }
+    if (installed == 0) {
+        queue_free(&selected);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "libsolv", "replacement",
+                                "replacement target is not installed");
+    }
+    Solvable *old = pool_id2solvable(context->pool, installed);
+    for (int index = 0; index < selected.count; ++index) {
+        Id id = selected.elements[index];
+        Solvable *item = pool_id2solvable(context->pool, id);
+        if (item == NULL || item->repo == NULL ||
+            item->repo == context->pool->installed || item->name != old->name ||
+            item->arch != old->arch || item->vendor != old->vendor)
+            continue;
+        int comparison = pool_evrcmp(context->pool, item->evr, old->evr,
+                                     EVRCMP_COMPARE);
+        if ((operation == 3 && comparison >= 0) ||
+            (operation == 4 && comparison != 0))
+            continue;
+        if (candidate == 0) {
+            candidate = id;
+            continue;
+        }
+        Solvable *current = pool_id2solvable(context->pool, candidate);
+        int version = pool_evrcmp(context->pool, item->evr, current->evr,
+                                 EVRCMP_COMPARE);
+        if (version > 0 ||
+            (version == 0 && item->repo->priority > current->repo->priority) ||
+            (version == 0 && item->repo->priority == current->repo->priority &&
+             item->repo->subpriority > current->repo->subpriority) ||
+            (version == 0 && item->repo->priority == current->repo->priority &&
+             item->repo->subpriority == current->repo->subpriority && id < candidate))
+            candidate = id;
+    }
+    queue_free(&selected);
+    if (candidate == 0)
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "libsolv", "replacement",
+                                operation == 3
+                                    ? "no older same-identity repository package"
+                                    : "exact installed EVRA is absent from repositories");
+    *candidate_out = candidate;
+    return DNFAST_STATUS_OK;
 }
 
 static void free_selector_provenance(char **requested_specs,
@@ -454,10 +688,11 @@ static dnfast_status solve_operation(dnfast_context *context,
     if (status != DNFAST_STATUS_OK) return status;
     status = dnfast_callback_check(&context->callbacks, error);
     if (status != DNFAST_STATUS_OK) return status;
-    if (request == NULL || request->abi_version != DNFAST_NATIVE_ABI_VERSION || operation > 2 ||
-        (request->name_count == 0 && operation != 2) ||
+    if (request == NULL || request->abi_version != DNFAST_NATIVE_ABI_VERSION || operation > 6 ||
+        (request->name_count == 0 && operation != 2 && operation != 5) ||
         (request->name_count != 0 && request->names == NULL) ||
-        (mapped_count != 0 && mapped == NULL))
+        (mapped_count != 0 && mapped == NULL) ||
+        (mapped_count != 0 && operation != 0))
         return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
                                 "solver", NULL, "invalid solve request");
     dnfast_solver_clear(context);
@@ -479,9 +714,11 @@ static dnfast_status solve_operation(dnfast_context *context,
         return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
                                 "dnfast", "calloc", "selector allocation failed");
     }
-    if (request->name_count == 0)
-        queue_push2(&job, SOLVER_UPDATE | SOLVER_SOLVABLE_ALL |
+    if (request->name_count == 0) {
+        Id command = operation == 5 ? SOLVER_DISTUPGRADE : SOLVER_UPDATE;
+        queue_push2(&job, command | SOLVER_SOLVABLE_ALL |
                     (request->best ? SOLVER_FORCEBEST : 0), 0);
+    }
     for (size_t name_index = 0; name_index < request->name_count; ++name_index) {
         int start = job.count;
         const dnfast_selector_providers *mapping = NULL;
@@ -601,13 +838,7 @@ static dnfast_status solve_operation(dnfast_context *context,
             queue_push2(&job, how, what);
             queue_free(&providers);
             selector_relation_kinds[name_index] = 0;
-            if (operation == 0)
-                job.elements[start] |= SOLVER_INSTALL |
-                                       (request->best ? SOLVER_FORCEBEST : 0);
-            else if (operation == 1)
-                job.elements[start] |= SOLVER_ERASE;
-            else
-                job.elements[start] |= SOLVER_UPDATE | SOLVER_FORCEBEST;
+            job.elements[start] |= operation_job(operation, request->best);
             continue;
         }
         int selector_flags = SELECTION_NAME | SELECTION_PROVIDES | SELECTION_REL;
@@ -644,18 +875,48 @@ static dnfast_status solve_operation(dnfast_context *context,
         }
         selector_relation_kinds[name_index] =
             ISRELDEP(job.elements[start + 1]) ? 1 : 0;
-        for (int index = start; index < job.count; index += 2) {
-            if (operation == 0)
-                job.elements[index] |= SOLVER_INSTALL |
-                                       (request->best ? SOLVER_FORCEBEST : 0);
-            else if (operation == 1) job.elements[index] |= SOLVER_ERASE;
-            else job.elements[index] |= SOLVER_UPDATE | SOLVER_FORCEBEST;
+        if (operation == 3 || operation == 4) {
+            Id candidate = 0;
+            status = exact_replacement_candidate(
+                context, &selectors[name_index], operation, &candidate, error);
+            if (status != DNFAST_STATUS_OK) goto cleanup;
+            queue_empty(&selectors[name_index]);
+            queue_push2(&selectors[name_index], SOLVER_SOLVABLE, candidate);
+            job.elements[start] = SOLVER_SOLVABLE |
+                operation_job(operation, request->best) |
+                SOLVER_SETEVR | SOLVER_SETARCH | SOLVER_SETVENDOR;
+            job.elements[start + 1] = candidate;
+            continue;
         }
+        if (operation == 6) {
+            Id installed = 0;
+            status = exact_installed_selector(
+                context, &selectors[name_index], &installed, error);
+            if (status != DNFAST_STATUS_OK) goto cleanup;
+            job.elements[start] = SOLVER_NOOP | SOLVER_SOLVABLE;
+            job.elements[start + 1] = installed;
+            continue;
+        }
+        for (int index = start; index < job.count; index += 2) {
+            job.elements[index] |= operation_job(operation, request->best);
+        }
+    }
+    if (operation == 6) {
+        status = prepare_autoremove_jobs(context, &job, selectors,
+                                         request->name_count, error);
+        if (status != DNFAST_STATUS_OK) goto cleanup;
     }
     context->solver = solver_create(context->pool);
     if (!request->install_weak_deps)
         solver_set_flag(context->solver, SOLVER_FLAG_IGNORE_RECOMMENDED, 1);
     solver_set_flag(context->solver, SOLVER_FLAG_STRICT_REPO_PRIORITY, 1);
+    if (operation == 3 || operation == 5) {
+        solver_set_flag(context->solver, SOLVER_FLAG_DUP_ALLOW_DOWNGRADE, 1);
+        solver_set_flag(context->solver, SOLVER_FLAG_DUP_ALLOW_ARCHCHANGE, 0);
+        solver_set_flag(context->solver, SOLVER_FLAG_DUP_ALLOW_VENDORCHANGE, 0);
+        solver_set_flag(context->solver, SOLVER_FLAG_DUP_ALLOW_NAMECHANGE, 0);
+        solver_set_flag(context->solver, SOLVER_FLAG_KEEP_ORPHANS, 1);
+    }
     uint64_t solve_started = monotonic_micros();
     if (solver_solve(context->solver, &job) != 0) status = copy_problems(context, error);
     else {

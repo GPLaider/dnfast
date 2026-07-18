@@ -1,3 +1,4 @@
+mod advisory;
 mod group;
 mod history;
 mod output;
@@ -17,8 +18,8 @@ use dnfast_metadata::search;
 
 use crate::{
     args::{
-        Commands, DaemonCommand, GroupCommand, HistoryCommand, ModuleCommand, MutationArgs,
-        PlanAction, RepoCommand,
+        AdvisoryCommand, Commands, DaemonCommand, GroupCommand, HistoryCommand, ModuleCommand,
+        MutationArgs, PlanAction, RepoCommand,
     },
     environment::{cache_directory, library_present},
     rendering::escaped_field,
@@ -74,6 +75,10 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
         Commands::Install(arguments) => run_convenience(PlanAction::Install, arguments),
         Commands::Remove(arguments) => run_convenience(PlanAction::Remove, arguments),
         Commands::Upgrade(arguments) => run_convenience(PlanAction::Upgrade, arguments),
+        Commands::Downgrade(arguments) => run_convenience(PlanAction::Downgrade, arguments),
+        Commands::Reinstall(arguments) => run_convenience(PlanAction::Reinstall, arguments),
+        Commands::DistroSync(arguments) => run_convenience(PlanAction::DistroSync, arguments),
+        Commands::Autoremove(arguments) => run_convenience(PlanAction::Autoremove, arguments),
         Commands::Daemon { command } => run_daemon(command),
         Commands::Repo { command } => match command {
             RepoCommand::List {
@@ -110,6 +115,13 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
             GroupCommand::Install(arguments) => group::install(arguments),
             GroupCommand::Remove(arguments) => group::remove(arguments),
         },
+        Commands::Environment { command } => match command {
+            GroupCommand::List { repositories } => group::list(repositories),
+            GroupCommand::Info { repositories, id } => group::info(repositories, &id),
+            GroupCommand::Install(arguments) => group::install(arguments),
+            GroupCommand::Remove(arguments) => group::remove(arguments),
+        }
+        .map(|response| response.with_command("environment")),
         Commands::Module { command } => match command {
             ModuleCommand::List { repositories } => group::module_list(repositories),
             ModuleCommand::Info { repositories, spec } => group::module_info(repositories, &spec),
@@ -117,6 +129,14 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
             ModuleCommand::Enable(arguments) => group::module_mutation("enable", arguments),
             ModuleCommand::Reset(arguments) => group::module_mutation("reset", arguments),
             ModuleCommand::Disable(arguments) => group::module_mutation("disable", arguments),
+        },
+        Commands::Advisory { command } => match command {
+            AdvisoryCommand::List(arguments) => advisory::list(arguments),
+            AdvisoryCommand::Info {
+                repositories,
+                advisories,
+            } => advisory::info(repositories, advisories),
+            AdvisoryCommand::Upgrade(arguments) => advisory::upgrade(arguments),
         },
     }
 }
@@ -128,13 +148,19 @@ pub(crate) fn name(command: &Commands) -> &'static str {
         Commands::Install(_) => "install",
         Commands::Remove(_) => "remove",
         Commands::Upgrade(_) => "upgrade",
+        Commands::Downgrade(_) => "downgrade",
+        Commands::Reinstall(_) => "reinstall",
+        Commands::DistroSync(_) => "distro-sync",
+        Commands::Autoremove(_) => "autoremove",
         Commands::Daemon { .. } => "daemon",
         Commands::Repo { .. } => "repo",
         Commands::History { .. } => "history",
         Commands::Doctor { .. } => "doctor",
         Commands::Search { .. } => "search",
         Commands::Group { .. } => "group",
+        Commands::Environment { .. } => "environment",
         Commands::Module { .. } => "module",
+        Commands::Advisory { .. } => "advisory",
     }
 }
 
@@ -166,11 +192,21 @@ fn run_convenience(action: PlanAction, arguments: MutationArgs) -> Result<Respon
 
 fn run_convenience_with_plan(
     action: PlanAction,
-    arguments: MutationArgs,
+    mut arguments: MutationArgs,
     on_execute: impl FnOnce(Option<&dnfast_solver::CanonicalSolverPlan>) -> Result<(), AppFailure>,
 ) -> Result<Response, AppFailure> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(AppFailure::new(1, "mutation requires root"));
+    }
+    if matches!(action, PlanAction::Autoremove) {
+        arguments.packages = autoremove_packages(arguments.packages)?;
+        if arguments.packages.is_empty() {
+            on_execute(None)?;
+            return Ok(Response::completed(
+                "autoremove",
+                "no changes; no recorded dependency package is unneeded",
+            ));
+        }
     }
     let assume_no = arguments.assumeno;
     let native_action = Action::from(action);
@@ -269,11 +305,52 @@ fn run_convenience_with_plan(
     }
 }
 
+fn autoremove_packages(requested: Vec<String>) -> Result<Vec<String>, AppFailure> {
+    let snapshot = dnfast_planning::PlanningSnapshot::open_system()
+        .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    snapshot
+        .revalidate_runtime_bindings()
+        .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    let candidates = dnfast_state::ReasonStateStore::open_system()
+        .and_then(|store| {
+            store.autoremove_candidates(
+                &snapshot.payload().inventory,
+                &snapshot.payload().policy.solver,
+            )
+        })
+        .map_err(|error| AppFailure::new(1, error.to_string()))?;
+    if requested.is_empty() {
+        return Ok(candidates);
+    }
+    let allowed = candidates
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(package) = requested
+        .iter()
+        .find(|package| !allowed.contains(package.as_str()))
+    {
+        return Err(AppFailure::with_error_code(
+            1,
+            "unsafe_autoremove",
+            format!("autoremove candidate is not exact dependency-reason state: {package}"),
+        ));
+    }
+    let mut requested = requested;
+    requested.sort();
+    requested.dedup();
+    Ok(requested)
+}
+
 const fn action_name(action: PlanAction) -> &'static str {
     match action {
         PlanAction::Install => "install",
         PlanAction::Remove => "remove",
         PlanAction::Upgrade => "upgrade",
+        PlanAction::Downgrade => "downgrade",
+        PlanAction::Reinstall => "reinstall",
+        PlanAction::DistroSync => "distro-sync",
+        PlanAction::Autoremove => "autoremove",
     }
 }
 
@@ -576,6 +653,10 @@ fn aborted_plan_response(
         Action::Install => "install",
         Action::Upgrade => "upgrade",
         Action::Remove => "remove",
+        Action::Downgrade => "downgrade",
+        Action::Reinstall => "reinstall",
+        Action::DistroSync => "distro-sync",
+        Action::Autoremove => "autoremove",
     };
     let digest = plan
         .digest()

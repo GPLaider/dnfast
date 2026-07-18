@@ -23,13 +23,21 @@ impl PackageReason {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CandidateAction {
-    Upgrade {
+    Replace {
+        operation: ReplacementOperation,
         installed: Evra,
         candidate: Evra,
         installed_vendor: String,
         candidate_vendor: String,
     },
     Deferred(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplacementOperation {
+    Upgrade,
+    Downgrade,
+    Reinstall,
 }
 
 impl CandidateAction {
@@ -39,18 +47,41 @@ impl CandidateAction {
         installed_vendor: impl Into<String>,
         candidate_vendor: impl Into<String>,
     ) -> Self {
-        Self::Upgrade {
+        Self::Replace {
+            operation: ReplacementOperation::Upgrade,
             installed,
             candidate,
             installed_vendor: installed_vendor.into(),
             candidate_vendor: candidate_vendor.into(),
         }
     }
-    pub const fn downgrade() -> Self {
-        Self::Deferred("downgrade")
+    pub fn downgrade(
+        installed: Evra,
+        candidate: Evra,
+        installed_vendor: impl Into<String>,
+        candidate_vendor: impl Into<String>,
+    ) -> Self {
+        Self::Replace {
+            operation: ReplacementOperation::Downgrade,
+            installed,
+            candidate,
+            installed_vendor: installed_vendor.into(),
+            candidate_vendor: candidate_vendor.into(),
+        }
     }
-    pub const fn reinstall() -> Self {
-        Self::Deferred("reinstall")
+    pub fn reinstall(
+        installed: Evra,
+        candidate: Evra,
+        installed_vendor: impl Into<String>,
+        candidate_vendor: impl Into<String>,
+    ) -> Self {
+        Self::Replace {
+            operation: ReplacementOperation::Reinstall,
+            installed,
+            candidate,
+            installed_vendor: installed_vendor.into(),
+            candidate_vendor: candidate_vendor.into(),
+        }
     }
     pub const fn distro_sync() -> Self {
         Self::Deferred("distro-sync")
@@ -220,7 +251,7 @@ impl SolverPolicy {
     }
     pub const fn validate_action(&self, action: &CandidateAction) -> Result<(), DomainError> {
         match action {
-            CandidateAction::Upgrade { .. } => Ok(()),
+            CandidateAction::Replace { .. } => Ok(()),
             CandidateAction::Deferred(name) => Err(DomainError::UnsafeAction(name)),
         }
     }
@@ -270,7 +301,8 @@ impl SolverPolicy {
         ))
     }
     pub fn validate_upgrade(&self, action: &CandidateAction) -> Result<(), DomainError> {
-        let CandidateAction::Upgrade {
+        let CandidateAction::Replace {
+            operation: ReplacementOperation::Upgrade,
             installed,
             candidate,
             installed_vendor,
@@ -289,6 +321,67 @@ impl SolverPolicy {
         }
         if !candidate.is_strictly_newer_than(installed) {
             return Err(DomainError::UnsafeAction("candidate is not newer"));
+        }
+        Ok(())
+    }
+    pub fn validate_downgrade(&self, action: &CandidateAction) -> Result<(), DomainError> {
+        let CandidateAction::Replace {
+            operation: ReplacementOperation::Downgrade,
+            installed,
+            candidate,
+            installed_vendor,
+            candidate_vendor,
+        } = action
+        else {
+            return self.validate_action(action);
+        };
+        self.validate_replacement_identity(
+            installed,
+            candidate,
+            installed_vendor,
+            candidate_vendor,
+        )?;
+        if !installed.is_strictly_newer_than(candidate) {
+            return Err(DomainError::UnsafeAction("candidate is not older"));
+        }
+        Ok(())
+    }
+    pub fn validate_reinstall(&self, action: &CandidateAction) -> Result<(), DomainError> {
+        let CandidateAction::Replace {
+            operation: ReplacementOperation::Reinstall,
+            installed,
+            candidate,
+            installed_vendor,
+            candidate_vendor,
+        } = action
+        else {
+            return self.validate_action(action);
+        };
+        self.validate_replacement_identity(
+            installed,
+            candidate,
+            installed_vendor,
+            candidate_vendor,
+        )?;
+        if installed != candidate {
+            return Err(DomainError::UnsafeAction("reinstall candidate differs"));
+        }
+        Ok(())
+    }
+    fn validate_replacement_identity(
+        &self,
+        installed: &Evra,
+        candidate: &Evra,
+        installed_vendor: &str,
+        candidate_vendor: &str,
+    ) -> Result<(), DomainError> {
+        installed.validate()?;
+        candidate.validate()?;
+        if installed.arch() != candidate.arch() {
+            return Err(DomainError::UnsafeAction("architecture switch"));
+        }
+        if installed_vendor != candidate_vendor {
+            return Err(DomainError::UnsafeAction("vendor switch"));
         }
         Ok(())
     }

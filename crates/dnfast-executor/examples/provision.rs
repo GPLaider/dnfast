@@ -208,7 +208,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             policy.best(),
         )?,
         Action::Upgrade => native.solve_upgrade_many(&[&name], policy.best())?,
+        Action::Downgrade => native.solve_downgrade_many(&[&name])?,
+        Action::Reinstall => native.solve_reinstall_many(&[&name])?,
+        Action::DistroSync => native.solve_distro_sync_many(&[&name], policy.best())?,
         Action::Remove => native.solve_erase_many(&[&name])?,
+        Action::Autoremove => native.solve_autoremove_many(&[&name])?,
     };
     let metadata = materialized
         .iter()

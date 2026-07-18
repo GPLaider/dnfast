@@ -33,6 +33,7 @@ pub struct RepomdRecords {
     pub filelists: MetadataRecord,
     pub group: Option<AuxiliaryRecord>,
     pub modules: Option<AuxiliaryRecord>,
+    pub updateinfo: Option<AuxiliaryRecord>,
 }
 
 pub fn parse_repomd(input: &[u8]) -> Result<PrimaryRecord, MetadataError> {
@@ -51,6 +52,7 @@ pub fn parse_repomd_records(input: &[u8]) -> Result<RepomdRecords, MetadataError
         filelists,
         group: parsed.group,
         modules: parsed.modules,
+        updateinfo: parsed.updateinfo,
     })
 }
 
@@ -60,6 +62,7 @@ struct Document {
     filelists: Option<MetadataRecord>,
     group: Option<AuxiliaryRecord>,
     modules: Option<AuxiliaryRecord>,
+    updateinfo: Option<AuxiliaryRecord>,
     root_seen: bool,
     root_closed: bool,
     declaration_seen: bool,
@@ -258,15 +261,16 @@ fn finish_record(
     if kind == "filelists" && !collect_filelists {
         return Ok(());
     }
-    if matches!(kind.as_str(), "group" | "modules") {
+    if matches!(kind.as_str(), "group" | "modules" | "updateinfo") {
         if !collect_filelists {
             return Ok(());
         }
         let record = build_auxiliary(builder, 512 * 1024 * 1024)?;
-        let slot = if kind == "group" {
-            &mut document.group
-        } else {
-            &mut document.modules
+        let slot = match kind.as_str() {
+            "group" => &mut document.group,
+            "modules" => &mut document.modules,
+            "updateinfo" => &mut document.updateinfo,
+            _ => unreachable!(),
         };
         if slot.replace(record).is_some() {
             return Err(MetadataError::DuplicateRecord(kind));
@@ -412,16 +416,18 @@ mod tests {
     }
 
     #[test]
-    fn optional_group_and_modules_records_are_exact_checksum_bound_records() {
+    fn optional_auxiliary_records_are_exact_checksum_bound_records() {
         let extra = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             record("group", 'c', "repodata/comps.xml.zst", 30, false),
             record("group_zck", 'd', "repodata/comps.xml.zck", 40, false),
             record("modules", 'e', "repodata/modules.yaml.zst", 50, false),
+            record("updateinfo", 'f', "repodata/updateinfo.xml.zst", 60, false),
         );
         let parsed = parse_repomd_records(&document(&extra)).expect("optional records");
         assert_eq!(parsed.group.expect("group").checksum, "c".repeat(64));
         assert_eq!(parsed.modules.expect("modules").size, 50);
+        assert_eq!(parsed.updateinfo.expect("updateinfo").size, 60);
     }
 
     #[test]
@@ -448,5 +454,7 @@ mod tests {
             )))
             .is_err()
         );
+        let updateinfo = record("updateinfo", 'f', "repodata/updateinfo.xml.zst", 60, false);
+        assert!(parse_repomd_records(&document(&format!("{updateinfo}{updateinfo}"))).is_err());
     }
 }

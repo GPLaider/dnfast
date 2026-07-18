@@ -4,18 +4,7 @@ use std::{
     process::{Command, Output},
 };
 
-const UNSUPPORTED: &[&str] = &[
-    "environment",
-    "plugin",
-    "copr",
-    "system-upgrade",
-    "offline",
-    "autoremove",
-    "downgrade",
-    "reinstall",
-    "distro-sync",
-    "advisory",
-];
+const UNSUPPORTED: &[&str] = &["plugin", "copr", "system-upgrade", "offline"];
 
 #[test]
 fn history_as_a_non_root_user_fails_before_journal_access() {

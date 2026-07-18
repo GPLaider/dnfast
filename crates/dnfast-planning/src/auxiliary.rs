@@ -5,6 +5,7 @@ const MAX_COMPS_OPEN_BYTES: u64 = 128 * 1024 * 1024;
 // The auxiliary decoder verifies the compressed checksum before opening and
 // enforces this bound while decompressing.
 const MAX_MODULES_OPEN_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_UPDATEINFO_OPEN_BYTES: u64 = 256 * 1024 * 1024;
 
 impl PlanningSnapshot {
     pub fn comps(
@@ -28,12 +29,28 @@ impl PlanningSnapshot {
             MAX_MODULES_OPEN_BYTES,
         )
     }
+
+    pub fn updateinfo(
+        &self,
+        repository: &PlanningRepository,
+    ) -> Result<Option<dnfast_metadata::UpdateInfo>, PlanningError> {
+        let bytes = auxiliary(
+            self,
+            repository,
+            AuxiliaryKind::Updateinfo,
+            MAX_UPDATEINFO_OPEN_BYTES,
+        )?;
+        bytes
+            .map(|bytes| dnfast_metadata::parse_updateinfo(&bytes).map_err(metadata))
+            .transpose()
+    }
 }
 
 #[derive(Clone, Copy)]
 enum AuxiliaryKind {
     Group,
     Modules,
+    Updateinfo,
 }
 
 fn auxiliary(
@@ -53,6 +70,7 @@ fn auxiliary(
     ) = match kind {
         AuxiliaryKind::Group => (records.group.as_ref(), repository.group.as_ref()),
         AuxiliaryKind::Modules => (records.modules.as_ref(), repository.modules.as_ref()),
+        AuxiliaryKind::Updateinfo => (records.updateinfo.as_ref(), repository.updateinfo.as_ref()),
     };
     match (record, descriptor) {
         (None, None) => Ok(None),
@@ -77,6 +95,7 @@ fn label(kind: AuxiliaryKind) -> &'static str {
     match kind {
         AuxiliaryKind::Group => "group metadata",
         AuxiliaryKind::Modules => "module metadata",
+        AuxiliaryKind::Updateinfo => "updateinfo metadata",
     }
 }
 

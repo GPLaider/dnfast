@@ -1081,7 +1081,11 @@ impl ResidentPlanner {
                 &mapped,
             ),
             Action::Upgrade => cached.context.solve_upgrade_many(&names, policy.best()),
+            Action::Downgrade => cached.context.solve_downgrade_many(&names),
+            Action::Reinstall => cached.context.solve_reinstall_many(&names),
+            Action::DistroSync => cached.context.solve_distro_sync_many(&names, policy.best()),
             Action::Remove => cached.context.solve_erase_many(&names),
+            Action::Autoremove => cached.context.solve_autoremove_many(&names),
         }
         .map_err(planning)?;
         cached.trim_pending = true;
@@ -1883,6 +1887,12 @@ fn selected_decision_evidence(
 ) -> Result<Vec<(String, NativePackageEvidence)>, DaemonError> {
     let mut action_repositories = BTreeMap::new();
     for (identity, repository) in result.actions.iter().zip(&result.repositories) {
+        // A reinstall emits equal new and installed NEVRAs. Only repository
+        // actions can require other transaction actions; installed providers
+        // use Decision::provider_installed and never need this lookup.
+        if repository == "@System" {
+            continue;
+        }
         if action_repositories
             .insert(identity.as_str(), repository.as_str())
             .is_some()
@@ -2071,6 +2081,10 @@ fn parse_action(value: &str) -> Result<Action, DaemonError> {
         "install" => Ok(Action::Install),
         "upgrade" => Ok(Action::Upgrade),
         "remove" => Ok(Action::Remove),
+        "downgrade" => Ok(Action::Downgrade),
+        "reinstall" => Ok(Action::Reinstall),
+        "distro-sync" => Ok(Action::DistroSync),
+        "autoremove" => Ok(Action::Autoremove),
         _ => Err(DaemonError::Protocol("invalid transaction action".into())),
     }
 }
@@ -2080,6 +2094,10 @@ const fn action_name(action: Action) -> &'static str {
         Action::Install => "install",
         Action::Upgrade => "upgrade",
         Action::Remove => "remove",
+        Action::Downgrade => "downgrade",
+        Action::Reinstall => "reinstall",
+        Action::DistroSync => "distro-sync",
+        Action::Autoremove => "autoremove",
     }
 }
 

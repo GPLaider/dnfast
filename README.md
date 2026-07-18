@@ -23,6 +23,13 @@ sudo dnfast apply /var/lib/dnfast/bash-plan.json --assumeyes
 sudo dnfast install bash --assumeyes
 sudo dnfast remove bash --assumeyes
 sudo dnfast upgrade --assumeyes
+sudo dnfast downgrade bash --assumeno
+sudo dnfast reinstall bash --assumeno
+sudo dnfast distro-sync --assumeno
+sudo dnfast autoremove --assumeno
+dnfast advisory list --security
+dnfast advisory info FEDORA-2026-example
+sudo dnfast advisory upgrade --assumeno FEDORA-2026-example
 sudo dnfast history list --source all
 sudo dnfast history info 018f1f2e-7b3c-7abc-8def-0123456789ab
 sudo dnfast history info dnf5:10
@@ -73,8 +80,9 @@ enable/reset/disable consume checksum-bound modulemd and exclude artifacts from 
 repositories without module metadata list no streams. `module install NAME[:STREAM]/PROFILE`
 installs a profile only from the active/default stream; an explicitly inactive stream must first
 be enabled.
-Plugin, COPR, system-upgrade, offline, autoremove, downgrade, reinstall,
-distro-sync, and advisory commands are not implemented and fail closed.
+Downgrade, reinstall, distro-sync, reason-bounded autoremove, and Fedora updateinfo advisory
+list/info/upgrade are implemented through the same exact native solve and verified transaction
+boundary. Plugin, COPR, system-upgrade, and offline commands are not implemented and fail closed.
 `dnfast` does not claim DNF5 policy or state compatibility.
 
 ## Native build and test

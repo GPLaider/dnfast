@@ -375,6 +375,9 @@ impl RootPlanningPublisher {
         let profile = load_system_mutation_profile()
             .map_err(|error| PlanningError::Input(error.to_string()))?;
         let snapshot = self.open_snapshot()?;
+        if !snapshot.has_current_schema() {
+            return Ok(false);
+        }
         if snapshot.payload().configuration != normalized_configuration(&profile)?
             || now_unix < snapshot.published_at_unix()
         {
@@ -729,6 +732,12 @@ fn reuse_unchanged_generations(
     refreshed_repository_ids: Option<&[String]>,
     refreshed_generations: &[(String, String)],
 ) -> Result<Option<PlanningSnapshot>, PlanningError> {
+    // A schema migration may add checksum-bound roles. Cloning an older
+    // repository payload into the new envelope would falsely claim the new
+    // schema while omitting those roles, so force one complete reconstruction.
+    if !current.has_current_schema() {
+        return Ok(None);
+    }
     let configuration = normalized_configuration(profile)?;
     if current.payload().configuration != configuration {
         return Ok(None);
@@ -792,6 +801,18 @@ fn reuse_unchanged_generations(
         else {
             return Ok(None);
         };
+        let repomd = current.materialize_payload(&previous.repomd)?;
+        let records = dnfast_metadata::parse_repomd_records(&repomd)
+            .map_err(|error| PlanningError::Cache(error.to_string()))?;
+        if !auxiliary_descriptor_matches(records.group.as_ref(), previous.group.as_ref())
+            || !auxiliary_descriptor_matches(records.modules.as_ref(), previous.modules.as_ref())
+            || !auxiliary_descriptor_matches(
+                records.updateinfo.as_ref(),
+                previous.updateinfo.as_ref(),
+            )
+        {
+            return Ok(None);
+        }
         if previous.priority != u32::from(configured.priority)
             || previous.cost != configured.cost
             || previous.file_provides.is_none()
@@ -880,6 +901,19 @@ fn reuse_unchanged_generations(
     Ok(Some(snapshot))
 }
 
+fn auxiliary_descriptor_matches(
+    record: Option<&dnfast_metadata::AuxiliaryRecord>,
+    descriptor: Option<&crate::model::PlanningBytes>,
+) -> bool {
+    match (record, descriptor) {
+        (None, None) => true,
+        (Some(record), Some(descriptor)) => {
+            record.checksum == descriptor.sha256 && record.size == descriptor.size
+        }
+        _ => false,
+    }
+}
+
 fn policy_for(
     host: Architecture,
     profile: &MutationProfile,
@@ -946,28 +980,39 @@ fn repository_payload(
         .map_err(|error| PlanningError::Cache(error.to_string()))?;
     let records = dnfast_metadata::parse_repomd_records(generation.repomd().bytes())
         .map_err(|error| PlanningError::Cache(error.to_string()))?;
-    let group = records
-        .group
-        .as_ref()
-        .map(|record| cache.open_auxiliary(record))
-        .transpose()
-        .map_err(|error| PlanningError::Cache(error.to_string()))?;
-    let modules = records
-        .modules
-        .as_ref()
-        .map(|record| cache.open_auxiliary(record))
-        .transpose()
-        .map_err(|error| PlanningError::Cache(error.to_string()))?;
-    generation_payload(
-        repository, generation, group, modules, trust, bundle, blob_store,
-    )
+    let auxiliary = AuxiliaryPayloads {
+        group: records
+            .group
+            .as_ref()
+            .map(|record| cache.open_auxiliary(record))
+            .transpose()
+            .map_err(|error| PlanningError::Cache(error.to_string()))?,
+        modules: records
+            .modules
+            .as_ref()
+            .map(|record| cache.open_auxiliary(record))
+            .transpose()
+            .map_err(|error| PlanningError::Cache(error.to_string()))?,
+        updateinfo: records
+            .updateinfo
+            .as_ref()
+            .map(|record| cache.open_auxiliary(record))
+            .transpose()
+            .map_err(|error| PlanningError::Cache(error.to_string()))?,
+    };
+    generation_payload(repository, generation, auxiliary, trust, bundle, blob_store)
+}
+
+struct AuxiliaryPayloads {
+    group: Option<dnfast_cache::VerifiedBytes>,
+    modules: Option<dnfast_cache::VerifiedBytes>,
+    updateinfo: Option<dnfast_cache::VerifiedBytes>,
 }
 
 fn generation_payload(
     repository: &RepoConfig,
     generation: VerifiedCompleteGeneration,
-    group: Option<dnfast_cache::VerifiedBytes>,
-    modules: Option<dnfast_cache::VerifiedBytes>,
+    auxiliary: AuxiliaryPayloads,
     trust: RepoTrustPolicy,
     bundle: KeyBundle,
     blob_store: Option<&TrustedDirectory>,
@@ -987,7 +1032,12 @@ fn generation_payload(
         ] {
             crate::snapshot_store::publish_blob(planning, payload.sha256(), payload.bytes())?;
         }
-        for payload in group.iter().chain(modules.iter()) {
+        for payload in auxiliary
+            .group
+            .iter()
+            .chain(auxiliary.modules.iter())
+            .chain(auxiliary.updateinfo.iter())
+        {
             crate::snapshot_store::publish_blob(planning, payload.sha256(), payload.bytes())?;
         }
     }
@@ -1005,10 +1055,16 @@ fn generation_payload(
         primary: crate::model::PlanningBytes::from_verified(generation.primary()),
         filelists: crate::model::PlanningBytes::from_verified(generation.filelists()),
         file_provides: Some(file_provides),
-        group: group
+        group: auxiliary
+            .group
             .as_ref()
             .map(crate::model::PlanningBytes::from_verified),
-        modules: modules
+        modules: auxiliary
+            .modules
+            .as_ref()
+            .map(crate::model::PlanningBytes::from_verified),
+        updateinfo: auxiliary
+            .updateinfo
             .as_ref()
             .map(crate::model::PlanningBytes::from_verified),
         trust,

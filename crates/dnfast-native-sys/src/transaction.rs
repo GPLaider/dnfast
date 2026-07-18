@@ -56,6 +56,28 @@ pub enum TransactionPhase {
     Started,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionInstallMode {
+    Install = 0,
+    Upgrade = 1,
+    Reinstall = 2,
+    Downgrade = 3,
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::TransactionInstallMode;
+
+    #[test]
+    fn install_modes_have_fixed_native_values() {
+        assert_eq!(TransactionInstallMode::Install as u8, 0);
+        assert_eq!(TransactionInstallMode::Upgrade as u8, 1);
+        assert_eq!(TransactionInstallMode::Reinstall as u8, 2);
+        assert_eq!(TransactionInstallMode::Downgrade as u8, 3);
+    }
+}
+
 unsafe extern "C" {
     fn dnfast_transaction_add_install(
         context: *mut RawContext,
@@ -99,11 +121,34 @@ impl Context {
         size: u64,
         upgrade: bool,
     ) -> Result<(), NativeError> {
+        self.transaction_add_install_mode(
+            keyring,
+            fd,
+            expected,
+            digest,
+            size,
+            if upgrade {
+                TransactionInstallMode::Upgrade
+            } else {
+                TransactionInstallMode::Install
+            },
+        )
+    }
+
+    pub fn transaction_add_install_mode(
+        &mut self,
+        keyring: &Keyring,
+        fd: i32,
+        expected: &VerifiedPackage,
+        digest: &[u8; 32],
+        size: u64,
+        mode: TransactionInstallMode,
+    ) -> Result<(), NativeError> {
         let expected = RawInstall {
             package: RawVerifiedPackage::from_verified(expected)?,
             artifact_sha256: *digest,
             artifact_size: size,
-            upgrade: u8::from(upgrade),
+            upgrade: mode as u8,
         };
         let mut error = empty_error();
         // SAFETY: [Category 8 — FFI boundary UB] all pointers remain live for this

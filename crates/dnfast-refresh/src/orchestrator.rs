@@ -148,6 +148,7 @@ impl<'a, T: Transport + Sync> Refresher<'a, T> {
         {
             self.ensure_auxiliary(&origin, records.group.as_ref())?;
             self.ensure_auxiliary(&origin, records.modules.as_ref())?;
+            self.ensure_auxiliary(&origin, records.updateinfo.as_ref())?;
             trace_memory(&format!("refresh:{repository}:generation-reused"));
             return Ok(RefreshOutcome {
                 digest: snapshot.digest,
@@ -181,6 +182,7 @@ impl<'a, T: Transport + Sync> Refresher<'a, T> {
         };
         self.ensure_auxiliary(&origin, records.group.as_ref())?;
         self.ensure_auxiliary(&origin, records.modules.as_ref())?;
+        self.ensure_auxiliary(&origin, records.updateinfo.as_ref())?;
         trace_memory(&format!("refresh:{repository}:artifacts-received"));
         let _publication_permit = METADATA_PUBLICATION_PERMIT
             .lock()

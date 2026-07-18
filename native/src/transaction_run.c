@@ -74,7 +74,8 @@ static int add_install(rpmts ts, dnfast_transaction_item *item) {
         !header_matches(header, &item->expected.package) ||
         dnfast_verify_payload_digest(item->retained_fd, header) != 0;
     if (!failed)
-        failed = rpmtsAddInstallElement(ts, header, item, item->expected.upgrade, NULL) != 0;
+        failed = rpmtsAddInstallElement(ts, header, item,
+                                        item->expected.upgrade != 0, NULL) != 0;
     header = headerFree(header);
     if (fd != NULL) Fclose(fd);
     return failed;
@@ -149,13 +150,34 @@ static void clear_problems(dnfast_context *context) {
     context->transaction_problem_count = 0;
 }
 
-static int collect_problems(dnfast_context *context, rpmts ts) {
+static int problem_is_authorized(const dnfast_context *context,
+                                 rpmProblem problem,
+                                 rpmprobFilterFlags filters) {
+    rpmProblemType type = rpmProblemGetType(problem);
+    fnpyKey key = rpmProblemGetKey(problem);
+    for (size_t index = 0; index < context->transaction_item_count; ++index) {
+        const dnfast_transaction_item *item = context->transaction_items[index];
+        if (item->erase || (fnpyKey)item != key) continue;
+        return (type == RPMPROB_PKG_INSTALLED && item->expected.upgrade == 2 &&
+                (filters & RPMPROB_FILTER_REPLACEPKG) != 0) ||
+            (type == RPMPROB_OLDPACKAGE && item->expected.upgrade == 3 &&
+             (filters & RPMPROB_FILTER_OLDPACKAGE) != 0);
+    }
+    return 0;
+}
+
+static int collect_problems(dnfast_context *context, rpmts ts,
+                            rpmprobFilterFlags filters) {
     clear_problems(context);
     rpmps problems = rpmtsProblems(ts);
     int count = problems == NULL ? 0 : rpmpsNumProblems(problems);
     rpmpsi iterator = count == 0 ? NULL : rpmpsInitIterator(problems);
+    int remaining = 0;
     for (int index = 0; index < count && rpmpsiNext(iterator) != NULL; ++index) {
-        char *text = rpmProblemString(rpmpsGetProblem(iterator));
+        rpmProblem problem = rpmpsGetProblem(iterator);
+        if (problem_is_authorized(context, problem, filters)) continue;
+        remaining++;
+        char *text = rpmProblemString(problem);
         void *grown = realloc(context->transaction_problems,
             (context->transaction_problem_count + 1) * sizeof(char *));
         if (text == NULL || grown == NULL) { free(text); count = -1; break; }
@@ -164,19 +186,33 @@ static int collect_problems(dnfast_context *context, rpmts ts) {
     }
     rpmpsFreeIterator(iterator);
     rpmpsFree(problems);
-    if (count > 0 && context->transaction_problem_count == 0 &&
+    if (remaining > 0 && context->transaction_problem_count == 0 &&
         (context->transaction_problems = calloc(1, sizeof(char *))) != NULL) {
         const char *message = "rpm reported non-iterable transaction problems";
         context->transaction_problems[0] = malloc(strlen(message) + 1);
         if (context->transaction_problems[0] != NULL) { strcpy(context->transaction_problems[0], message); context->transaction_problem_count = 1; }
     }
-    return count;
+    return remaining;
+}
+
+static rpmprobFilterFlags authorized_filters(const dnfast_context *context) {
+    rpmprobFilterFlags filters = RPMPROB_FILTER_NONE;
+    for (size_t index = 0; index < context->transaction_item_count; ++index) {
+        const dnfast_transaction_item *item = context->transaction_items[index];
+        if (item->erase) continue;
+        if (item->expected.upgrade == 2)
+            filters |= RPMPROB_FILTER_REPLACEPKG;
+        else if (item->expected.upgrade == 3)
+            filters |= RPMPROB_FILTER_OLDPACKAGE;
+    }
+    return filters;
 }
 
 static int attempt(dnfast_context *context, int test, int run, int32_t *result) {
     rpmts ts = rpmtsCreate();
     rpmtxn transaction = NULL;
     int stage = 1;
+    rpmprobFilterFlags filters = authorized_filters(context);
     context->transaction_callback_failed = 0;
     int failed = ts == NULL || rpmtsSetRootDir(ts, "/") != 0 ||
         rpmtsSetKeyring(ts, context->transaction_keyring) != 0;
@@ -196,7 +232,7 @@ static int attempt(dnfast_context *context, int test, int run, int32_t *result) 
             (dnfast_transaction_reverify(context, item) != 0 || add_install(ts, item));
     }
     stage = 4; if (!failed) failed = context->transaction_fail_callback == 4 ||
-        rpmtsCheck(ts) != 0 || collect_problems(context, ts) != 0;
+        rpmtsCheck(ts) != 0 || collect_problems(context, ts, filters) != 0;
     stage = 5; if (!failed) failed = context->transaction_fail_callback == 5 || rpmtsOrder(ts) != 0;
     if (!failed && run) {
         if (!test) {
@@ -209,8 +245,8 @@ static int attempt(dnfast_context *context, int test, int run, int32_t *result) 
     if (!failed && run) {
         if (test) context->transaction_counts.test_run++;
         else context->transaction_counts.real_run++;
-        *result = rpmtsRun(ts, NULL, RPMPROB_FILTER_NONE);
-        int problems_failed = collect_problems(context, ts) != 0;
+        *result = rpmtsRun(ts, NULL, filters);
+        int problems_failed = collect_problems(context, ts, filters) != 0;
         if (*result != 0 || problems_failed || context->transaction_callback_failed) failed = 1;
     }
     for (size_t index = 0; index < context->transaction_item_count; ++index) {

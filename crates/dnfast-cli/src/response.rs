@@ -57,6 +57,11 @@ pub(crate) struct Response {
 }
 
 impl Response {
+    pub(crate) fn with_command(mut self, command: &str) -> Self {
+        self.command = command.into();
+        self
+    }
+
     pub(crate) fn failed(
         command: &str,
         exit_code: u8,

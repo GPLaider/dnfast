@@ -67,12 +67,20 @@ pub(crate) fn validate_inputs(
         if !identities.insert(identity) {
             return Err(PlanError::DuplicateAction(action.name.clone()));
         }
-        let upgrade_all_root = action.requested
+        let all_replacement_root = action.requested
             && action.requested_spec.is_none()
-            && builder.intent.action() == Action::Upgrade
+            && matches!(
+                builder.intent.action(),
+                Action::Upgrade | Action::DistroSync
+            )
             && requested.is_empty()
-            && action.operation == ResolvedOperation::Upgrade;
-        if action.requested != action.requested_spec.is_some() && !upgrade_all_root {
+            && matches!(
+                action.operation,
+                ResolvedOperation::Upgrade
+                    | ResolvedOperation::Downgrade
+                    | ResolvedOperation::Reinstall
+            );
+        if action.requested != action.requested_spec.is_some() && !all_replacement_root {
             return Err(PlanError::Invalid("requested action provenance differs"));
         }
         if action.requested_relation && !action.requested {
@@ -86,7 +94,10 @@ pub(crate) fn validate_inputs(
                     }
                     *covered.entry(spec.as_str()).or_default() += 1;
                 }
-                None if builder.intent.action() == Action::Upgrade && requested.is_empty() => {}
+                None if matches!(
+                    builder.intent.action(),
+                    Action::Upgrade | Action::DistroSync
+                ) && requested.is_empty() => {}
                 None => {
                     return Err(PlanError::Invalid(
                         "requested action lacks selector provenance",
@@ -196,6 +207,17 @@ fn validate_kind(intent: Action, action: &ResolvedAction) -> Result<(), PlanErro
                 matches!(action.operation, ResolvedOperation::Remove) && action.provenance.is_none()
             }
             Action::Upgrade => matches!(action.operation, ResolvedOperation::Upgrade),
+            Action::Downgrade => matches!(action.operation, ResolvedOperation::Downgrade),
+            Action::Reinstall => matches!(action.operation, ResolvedOperation::Reinstall),
+            Action::DistroSync => matches!(
+                action.operation,
+                ResolvedOperation::Upgrade
+                    | ResolvedOperation::Downgrade
+                    | ResolvedOperation::Reinstall
+            ),
+            Action::Autoremove => {
+                matches!(action.operation, ResolvedOperation::Remove) && action.provenance.is_none()
+            }
         };
     if valid {
         Ok(())

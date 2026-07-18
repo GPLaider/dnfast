@@ -19,7 +19,7 @@ pub use inventory::{
 mod keyring;
 pub use keyring::{Keyring, VerifiedPackage};
 mod transaction;
-pub use transaction::{TransactionCounts, TransactionPhase};
+pub use transaction::{TransactionCounts, TransactionInstallMode, TransactionPhase};
 mod callback_state;
 mod error_impl;
 use callback_state::{CallbackState, interrupt_trampoline, transaction_start_trampoline};
@@ -341,6 +341,10 @@ pub enum SolveOperation {
     Install,
     Erase,
     Upgrade,
+    Downgrade,
+    Reinstall,
+    DistroSync,
+    Autoremove,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -915,7 +919,12 @@ impl Context {
         operation: SolveOperation,
         mappings: &[SelectorProviders],
     ) -> Result<SolveOutput, NativeError> {
-        if names.is_empty() && operation != SolveOperation::Upgrade {
+        if names.is_empty()
+            && !matches!(
+                operation,
+                SolveOperation::Upgrade | SolveOperation::DistroSync
+            )
+        {
             return Err(NativeError {
                 status: 1,
                 component: "dnfast".into(),
@@ -982,6 +991,10 @@ impl Context {
             SolveOperation::Install => 0,
             SolveOperation::Erase => 1,
             SolveOperation::Upgrade => 2,
+            SolveOperation::Downgrade => 3,
+            SolveOperation::Reinstall => 4,
+            SolveOperation::DistroSync => 5,
+            SolveOperation::Autoremove => 6,
         };
         // SAFETY: [Category 8 — FFI boundary UB] request is valid for this
         // synchronous call and native result storage remains context-owned.

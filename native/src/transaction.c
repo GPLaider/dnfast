@@ -103,7 +103,7 @@ dnfast_status dnfast_transaction_add_install(
     const dnfast_transaction_install *expected,
     dnfast_error *error) {
     if (context == NULL || keyring == NULL || retained_fd < 0 ||
-        expected == NULL || expected->upgrade > 1)
+        expected == NULL || expected->upgrade > 3)
         return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
                                 "rpm", "transaction", "invalid install action");
 #ifdef DNFAST_NATIVE_REAL

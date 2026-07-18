@@ -97,7 +97,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         KeyringInstalled::from_repository(&policy, &repo, std::slice::from_ref(&key))?,
         &before,
     )?;
-    rejected.add_install(&artifact, &verified, false)?;
+    rejected.add_install(
+        &artifact,
+        &verified,
+        dnfast_native::TransactionInstallMode::Install,
+    )?;
     rejected.bind_journal(Rc::clone(&failed))?;
     rejected.prepare_checked_transaction()?;
     rejected.test_checked_transaction()?;
@@ -117,7 +121,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let journal = Rc::new(store.create(&id, digest)?);
     let mut execution =
         ExecutorInventory::begin(dnfast_core::Architecture::Aarch64, keyring, &before)?;
-    execution.add_install(&artifact, &verified, false)?;
+    execution.add_install(
+        &artifact,
+        &verified,
+        dnfast_native::TransactionInstallMode::Install,
+    )?;
     execution.bind_journal(Rc::clone(&journal))?;
     execution.prepare_checked_transaction()?;
     assert!(execution.fixture_authority_is_held());

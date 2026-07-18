@@ -159,6 +159,7 @@ mod tests {
                 file_provides: None,
                 group: None,
                 modules: None,
+                updateinfo: None,
                 trust,
                 keys: vec![PlanningKey {
                     bundle_path: bundle_path.into(),

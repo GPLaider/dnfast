@@ -61,11 +61,12 @@ fn run_inner(
         .collect::<Result<Vec<_>, ExecutorError>>()?;
     trace_phase(trace, started, "keyrings");
     let mut verified = Vec::new();
-    for action in plan
-        .actions()
-        .iter()
-        .filter(|action| matches!(action.operation.as_str(), "install" | "upgrade"))
-    {
+    for action in plan.actions().iter().filter(|action| {
+        matches!(
+            action.operation.as_str(),
+            "install" | "upgrade" | "downgrade" | "reinstall"
+        )
+    }) {
         let repository_id = action
             .repo_id
             .as_deref()
@@ -115,12 +116,14 @@ fn run_inner(
                 repository.trust.signing_subkey_rule(),
             )
             .map_err(native_trust)?;
-        verified.push((
-            position,
-            cached,
-            verified_artifact,
-            action.operation == "upgrade",
-        ));
+        let mode = match action.operation.as_str() {
+            "install" => dnfast_native::TransactionInstallMode::Install,
+            "upgrade" => dnfast_native::TransactionInstallMode::Upgrade,
+            "downgrade" => dnfast_native::TransactionInstallMode::Downgrade,
+            "reinstall" => dnfast_native::TransactionInstallMode::Reinstall,
+            _ => unreachable!("filtered operation"),
+        };
+        verified.push((position, cached, verified_artifact, mode));
     }
     trace_phase(trace, started, "artifacts");
     let bundles = staged
@@ -169,8 +172,8 @@ fn run_inner(
                     .map_err(|error| ExecutorError::Plan(error.to_string()))?;
                 executor.add_erase(installed).map_err(inventory_error)?;
             }
-            "install" | "upgrade" => {
-                let (position, cached, verified_artifact, upgrade) = verified
+            "install" | "upgrade" | "downgrade" | "reinstall" => {
+                let (position, cached, verified_artifact, mode) = verified
                     .iter()
                     .find(|(position, _, _, _)| {
                         staged.artifacts[*position].expected.name == action.name
@@ -178,7 +181,7 @@ fn run_inner(
                     .ok_or_else(|| ExecutorError::Plan("verified artifact is absent".into()))?;
                 let _ = position;
                 executor
-                    .add_install(cached, verified_artifact, *upgrade)
+                    .add_install(cached, verified_artifact, *mode)
                     .map_err(inventory_error)?;
             }
             _ => return Err(ExecutorError::Plan("unknown planned operation".into())),
@@ -246,7 +249,15 @@ fn run_inner(
     mount_root
         .verify_unchanged()
         .map_err(|error| ExecutorError::MountStateful(error.to_string()))?;
-    Ok(executor.inventory().clone())
+    let after = executor.inventory().clone();
+    dnfast_state::ReasonStateStore::open_system()
+        .and_then(|store| store.record_success(inventory, &after, plan.proposal(), &staged.policy))
+        .map_err(|error| {
+            ExecutorError::Plan(format!(
+                "package reason state persistence failed after successful transaction: {error}"
+            ))
+        })?;
+    Ok(after)
 }
 
 fn trace_phase(enabled: bool, started: Instant, phase: &str) {
@@ -322,11 +333,12 @@ fn expected_incremental_identities(
             )
         })
         .collect::<Vec<_>>();
-    for action in plan
-        .actions()
-        .iter()
-        .filter(|action| matches!(action.operation.as_str(), "install" | "upgrade"))
-    {
+    for action in plan.actions().iter().filter(|action| {
+        matches!(
+            action.operation.as_str(),
+            "install" | "upgrade" | "downgrade" | "reinstall"
+        )
+    }) {
         expected.push((
             action.name.clone(),
             action.target_evra.clone(),

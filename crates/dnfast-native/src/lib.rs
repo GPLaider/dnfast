@@ -11,6 +11,7 @@ pub use inventory::{
 mod checked_transaction;
 mod transaction;
 mod trust;
+pub use dnfast_native_sys::TransactionInstallMode;
 pub use transaction::{
     TransactionCounts, TransactionFailureClass, TransactionProblem, TransactionProblemError,
 };
@@ -401,6 +402,50 @@ impl NativeContext {
             false,
             best,
             dnfast_native_sys::SolveOperation::Upgrade,
+            &[],
+        )
+    }
+
+    pub fn solve_downgrade_many(&mut self, names: &[&str]) -> Result<SolveResult, NativeError> {
+        self.solve_operation(
+            names,
+            false,
+            true,
+            dnfast_native_sys::SolveOperation::Downgrade,
+            &[],
+        )
+    }
+
+    pub fn solve_reinstall_many(&mut self, names: &[&str]) -> Result<SolveResult, NativeError> {
+        self.solve_operation(
+            names,
+            false,
+            true,
+            dnfast_native_sys::SolveOperation::Reinstall,
+            &[],
+        )
+    }
+
+    pub fn solve_distro_sync_many(
+        &mut self,
+        names: &[&str],
+        best: bool,
+    ) -> Result<SolveResult, NativeError> {
+        self.solve_operation(
+            names,
+            false,
+            best,
+            dnfast_native_sys::SolveOperation::DistroSync,
+            &[],
+        )
+    }
+
+    pub fn solve_autoremove_many(&mut self, names: &[&str]) -> Result<SolveResult, NativeError> {
+        self.solve_operation(
+            names,
+            false,
+            false,
+            dnfast_native_sys::SolveOperation::Autoremove,
             &[],
         )
     }
