@@ -84,6 +84,20 @@ impl RpmDbReceiptCache {
         }
     }
 
+    /// Revalidates a generation that was already accepted by [`Self::check`].
+    ///
+    /// This is intentionally stricter than comparing an RPMDB cookie: the
+    /// database must still be checksum-protected, its WAL must be quiescent,
+    /// every measured file-generation field must match, and the protected
+    /// receipt must still contain the exact descriptor.  Callers can use this
+    /// between two adjacent phases without opening librpm a second time.
+    pub fn is_current(&self, expected: &RpmDbVerifiedGeneration) -> Result<bool, CacheError> {
+        Ok(matches!(
+            self.check(&expected.binding)?,
+            RpmDbReceiptCheck::Hit(ref current) if current == expected
+        ))
+    }
+
     pub fn publish(&self, expected: &RpmDbVerifiedGeneration) -> Result<(), CacheError> {
         let Some(current) = self.describe(&expected.binding)? else {
             return Err(CacheError::Corrupt(
@@ -390,6 +404,19 @@ mod tests {
             cache.check(&binding()).expect("recheck"),
             RpmDbReceiptCheck::Hit(_)
         ));
+        assert!(!cache.is_current(&generation).expect("revalidate"));
+    }
+
+    #[test]
+    fn accepted_generation_can_be_revalidated_without_librpm() {
+        let (_root, cache, _database) = fixture();
+        let generation = match cache.check(&binding()).expect("check") {
+            RpmDbReceiptCheck::Miss { generation, .. } => generation,
+            RpmDbReceiptCheck::Unsupported => return,
+            RpmDbReceiptCheck::Hit(_) => panic!("receipt unexpectedly present"),
+        };
+        cache.publish(&generation).expect("publish");
+        assert!(cache.is_current(&generation).expect("revalidate"));
     }
 
     #[test]

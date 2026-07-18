@@ -14,7 +14,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dnfast_cache::{
     ArtifactCache, ArtifactSpec, Digest as ArtifactDigest, HttpArtifactTransport,
-    RpmDbReceiptCache, RpmDbReceiptCheck, SolvCache, TransactionRequest,
+    RpmDbReceiptCache, RpmDbReceiptCheck, RpmDbVerifiedGeneration, SolvCache, TransactionRequest,
 };
 use dnfast_core::{
     Action, Architecture, CanonicalDocument, Evra, InstalledInventory, PackageSpec, SolverPolicy,
@@ -700,6 +700,7 @@ struct PendingInstalled {
     architecture: Architecture,
     context: NativeContext,
     snapshot: InventorySnapshot,
+    receipt_generation: Option<RpmDbVerifiedGeneration>,
 }
 
 struct ResidentPool {
@@ -712,6 +713,7 @@ struct ResidentPool {
     context: NativeContext,
     inventory: InstalledInventory,
     rpmdb_cookie: String,
+    rpmdb_generation: Option<RpmDbVerifiedGeneration>,
     last_solve: Option<CachedResidentSolve>,
     trim_pending: bool,
 }
@@ -775,6 +777,7 @@ impl ResidentPlanner {
             architecture,
             context,
             snapshot,
+            receipt_generation,
         });
         Ok(())
     }
@@ -941,15 +944,35 @@ impl ResidentPlanner {
             cached.repository_ids == repositories
                 && cached.integrity.planning_snapshot_sha256().as_str() == current_digest
         });
+        let mut receipt_missed = false;
         if same_generation {
             let cached = self.cached.as_mut().expect("resident pool");
-            let current = cached
-                .context
-                .read_installed_inventory_snapshot()
+            if let Some(generation) = cached.rpmdb_generation.as_ref() {
+                let current = RpmDbReceiptCache::new(
+                    SYSTEM_CACHE_PATH,
+                    SYSTEM_RPMDB_PATH,
+                    SYSTEM_RPMDB_WAL_PATH,
+                )
+                .is_current(generation)
                 .map_err(planning)?;
-            if cached.rpmdb_cookie == current.rpmdb_cookie {
-                return Ok(());
+                if current {
+                    return Ok(());
+                }
+                receipt_missed = true;
+            } else {
+                let current = cached
+                    .context
+                    .read_installed_inventory_snapshot()
+                    .map_err(planning)?;
+                if cached.rpmdb_cookie == current.rpmdb_cookie {
+                    return Ok(());
+                }
             }
+        }
+        if receipt_missed {
+            // A changed or damaged generation receipt must not fall back to a
+            // cookie-only acceptance during the rebuild below.
+            self.verified_rpmdb_cookie = None;
         }
         let snapshot = PlanningSnapshot::open_system().map_err(planning)?;
         let integrity = snapshot
@@ -1033,6 +1056,7 @@ impl ResidentPlanner {
         .map_err(planning)?;
         cached.inventory = inventory;
         cached.rpmdb_cookie.clone_from(&current.rpmdb_cookie);
+        cached.rpmdb_generation = None;
         cached.last_solve = None;
         self.verified_rpmdb_cookie = Some(current.rpmdb_cookie);
         Ok(())
@@ -1049,22 +1073,48 @@ fn build_pool(
     let trace = std::env::var_os("DNFASTD_TRACE").is_some();
     let started = Instant::now();
     let policy = snapshot.payload().policy.solver.clone();
-    let (mut context, mut current) = match pending_installed {
+    let (mut context, mut current, require_full_verify, rpmdb_generation) = match pending_installed
+    {
         Some(mut pending) if pending.architecture == policy.base_arch() => {
-            let live = pending
-                .context
-                .read_installed_inventory_snapshot()
-                .map_err(planning)?;
-            if same_inventory_generation(&pending.snapshot, &live)? {
-                (pending.context, live)
+            let receipt_current = match pending.receipt_generation.as_ref() {
+                Some(generation) => RpmDbReceiptCache::new(
+                    SYSTEM_CACHE_PATH,
+                    SYSTEM_RPMDB_PATH,
+                    SYSTEM_RPMDB_WAL_PATH,
+                )
+                .is_current(generation)
+                .map_err(planning)?,
+                None => false,
+            };
+            if receipt_current {
+                trace_phase(trace, started, "resident-build-rpmdb-generation-hit");
+                (
+                    pending.context,
+                    pending.snapshot,
+                    false,
+                    pending.receipt_generation,
+                )
             } else {
-                open_installed_context(policy.base_arch())?
+                let live = pending
+                    .context
+                    .read_installed_inventory_snapshot()
+                    .map_err(planning)?;
+                let require_full_verify = pending.receipt_generation.is_some();
+                if same_inventory_generation(&pending.snapshot, &live)? {
+                    (pending.context, live, require_full_verify, None)
+                } else {
+                    let (context, snapshot) = open_installed_context(policy.base_arch())?;
+                    (context, snapshot, require_full_verify, None)
+                }
             }
         }
-        _ => open_installed_context(policy.base_arch())?,
+        _ => {
+            let (context, snapshot) = open_installed_context(policy.base_arch())?;
+            (context, snapshot, false, None)
+        }
     };
     trace_phase(trace, started, "resident-build-context-open");
-    if verified_rpmdb_cookie != Some(current.rpmdb_cookie.as_str()) {
+    if require_full_verify || verified_rpmdb_cookie != Some(current.rpmdb_cookie.as_str()) {
         current = verify_rpmdb_unchanged(&mut context, current)?;
     }
     trace_phase(trace, started, "resident-build-rpmdb-verified");
@@ -1175,6 +1225,7 @@ fn build_pool(
             context,
             inventory,
             rpmdb_cookie,
+            rpmdb_generation,
             last_solve: None,
             // Pool construction is the other large transient allocation.
             // Reclaim it after the first response even when that response is
