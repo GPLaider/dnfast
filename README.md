@@ -59,9 +59,10 @@ import or claim compatibility with DNF5 history.
 
 Checksum-bound comps group/environment list, info, and install are implemented. Group install
 selects mandatory/default packages, conditionals whose requirements are selected or installed,
-and optional packages/groups only with `--with-optional`. Module commands expose an explicit
-fail-closed boundary: repositories without module metadata list no streams, while the presence of
-modulemd is rejected because this build does not yet interpret module stream policy safely.
+and optional packages/groups only with `--with-optional`. Module list/info and
+enable/reset/disable consume checksum-bound modulemd and exclude artifacts from inactive streams;
+repositories without module metadata list no streams. Dedicated `NAME:STREAM/PROFILE` installation
+is not yet implemented.
 Plugin, COPR, system-upgrade, offline, group removal, autoremove, downgrade, reinstall,
 distro-sync, and advisory commands are not implemented and fail closed.
 `dnfast` does not claim DNF5 policy or state compatibility.
