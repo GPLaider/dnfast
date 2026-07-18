@@ -40,7 +40,7 @@ use super::PreparationError;
 #[cfg(test)]
 pub(crate) use digest::metadata_digest;
 use digest::{artifact_key, descriptor};
-pub(crate) use digest::{metadata_digest_v4, trust_digest};
+pub(crate) use digest::{metadata_digest_v5, trust_digest};
 #[cfg(test)]
 pub(crate) use publication::{Publication, remove_generation};
 
@@ -127,6 +127,11 @@ impl InputDraft {
             repository.modules.as_ref(),
             &format!("repo-{index}-modules"),
         )?;
+        let updateinfo = self.write_optional_payload(
+            snapshot,
+            repository.updateinfo.as_ref(),
+            &format!("repo-{index}-updateinfo"),
+        )?;
         self.write_materialized_repository(
             repository,
             index,
@@ -134,6 +139,7 @@ impl InputDraft {
             file_provides,
             group,
             modules,
+            updateinfo,
         )
     }
 
@@ -171,6 +177,11 @@ impl InputDraft {
             repository.modules.as_ref(),
             &format!("{prefix}-modules"),
         )?;
+        let updateinfo = self.write_optional_payload(
+            snapshot,
+            repository.updateinfo.as_ref(),
+            &format!("{prefix}-updateinfo"),
+        )?;
         self.repository_input(
             repository,
             index,
@@ -180,6 +191,7 @@ impl InputDraft {
             file_provides,
             group,
             modules,
+            updateinfo,
         )
     }
 
@@ -192,9 +204,10 @@ impl InputDraft {
         let metadata = repository
             .materialize_native_xml()
             .map_err(|error| PreparationError::Snapshot(error.to_string()))?;
-        self.write_materialized_repository(repository, index, &metadata, None, None, None)
+        self.write_materialized_repository(repository, index, &metadata, None, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_materialized_repository(
         &mut self,
         repository: &PlanningRepository,
@@ -203,6 +216,7 @@ impl InputDraft {
         file_provides: Option<InputFile>,
         group: Option<InputFile>,
         modules: Option<InputFile>,
+        updateinfo: Option<InputFile>,
     ) -> Result<MaterializedRepository, PreparationError> {
         let prefix = format!("repo-{index}");
         let repomd = self.write_bytes(&format!("{prefix}-repomd"), metadata.repomd())?;
@@ -224,6 +238,7 @@ impl InputDraft {
             file_provides,
             group,
             modules,
+            updateinfo,
         )?;
         Ok(MaterializedRepository {
             input,
@@ -243,6 +258,7 @@ impl InputDraft {
         file_provides: Option<InputFile>,
         group: Option<InputFile>,
         modules: Option<InputFile>,
+        updateinfo: Option<InputFile>,
     ) -> Result<InputRepository, PreparationError> {
         let prefix = format!("repo-{index}");
         let trust_bytes = repository.trust.to_canonical_json().map_err(domain)?;
@@ -278,6 +294,7 @@ impl InputDraft {
             file_provides,
             group,
             modules,
+            updateinfo,
             trust: InputRepositoryTrust {
                 policy: trust_policy,
                 sha256: repository

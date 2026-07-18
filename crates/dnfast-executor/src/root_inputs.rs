@@ -111,8 +111,7 @@ fn validate_manifest(
     validate_retained_file(directory, &manifest.policy, owner)?;
     validate_repositories(directory, &manifest.repositories, owner)?;
     validate_selected_repository_bindings(&manifest.repositories, proposal)?;
-    if metadata_digest(&manifest.repositories, manifest.schema_version >= 4)?
-        != manifest.metadata_sha256
+    if metadata_digest(&manifest.repositories, manifest.schema_version)? != manifest.metadata_sha256
         || manifest.metadata_sha256 != proposal.metadata_sha256().as_str()
     {
         return Err(inputs("metadata digest mismatch"));
@@ -161,7 +160,7 @@ fn validate_selected_repository_bindings(
 }
 
 fn validate_manifest_shape(manifest: &InputManifest) -> Result<(), ExecutorError> {
-    if !matches!(manifest.schema_version, 3 | 4) || manifest.repositories.is_empty() {
+    if !matches!(manifest.schema_version, 3..=5) || manifest.repositories.is_empty() {
         return Err(inputs("required input is absent"));
     }
     if manifest.schema_version == 3
@@ -169,9 +168,18 @@ fn validate_manifest_shape(manifest: &InputManifest) -> Result<(), ExecutorError
             repository.file_provides.is_some()
                 || repository.group.is_some()
                 || repository.modules.is_some()
+                || repository.updateinfo.is_some()
         })
     {
         return Err(inputs("version three input contains extended metadata"));
+    }
+    if manifest.schema_version == 4
+        && manifest
+            .repositories
+            .iter()
+            .any(|repository| repository.updateinfo.is_some())
+    {
+        return Err(inputs("version four input contains updateinfo metadata"));
     }
     validate_repository_order(&manifest.repositories)?;
     if manifest
@@ -211,6 +219,7 @@ fn validate_repositories(
             .iter()
             .chain(repository.group.iter())
             .chain(repository.modules.iter())
+            .chain(repository.updateinfo.iter())
         {
             validate_file(file)?;
             validate_retained_file(directory, file, owner)?;
@@ -665,6 +674,7 @@ fn repository_files(repositories: &[InputRepository]) -> impl Iterator<Item = &I
             .chain(repository.file_provides.iter())
             .chain(repository.group.iter())
             .chain(repository.modules.iter())
+            .chain(repository.updateinfo.iter())
     })
 }
 
@@ -675,15 +685,15 @@ fn repository_trust_files(repositories: &[InputRepository]) -> impl Iterator<Ite
     })
 }
 
-fn metadata_digest(
+pub(crate) fn metadata_digest(
     repositories: &[InputRepository],
-    extended: bool,
+    schema_version: u32,
 ) -> Result<String, ExecutorError> {
     let mut digest = Sha256::new();
-    digest.update(if extended {
-        b"dnfast-root-metadata-v4".as_slice()
-    } else {
-        b"dnfast-root-metadata-v3".as_slice()
+    digest.update(match schema_version {
+        5 => b"dnfast-root-metadata-v5".as_slice(),
+        4 => b"dnfast-root-metadata-v4".as_slice(),
+        _ => b"dnfast-root-metadata-v3".as_slice(),
     });
     for repository in repositories {
         frame(&mut digest, &repository.id, repository.id.as_bytes())?;
@@ -712,7 +722,7 @@ fn metadata_digest(
             frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
             digest.update(file.size.to_be_bytes());
         }
-        if extended {
+        if schema_version >= 4 {
             for (role, file) in [
                 ("file-provides", repository.file_provides.as_ref()),
                 ("group", repository.group.as_ref()),
@@ -723,6 +733,13 @@ fn metadata_digest(
                     frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
                     digest.update(file.size.to_be_bytes());
                 }
+            }
+        }
+        if schema_version >= 5 {
+            frame(&mut digest, "updateinfo", b"updateinfo")?;
+            if let Some(file) = repository.updateinfo.as_ref() {
+                frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
+                digest.update(file.size.to_be_bytes());
             }
         }
     }
@@ -920,6 +937,7 @@ mod tests {
             file_provides: None,
             group: None,
             modules: None,
+            updateinfo: None,
             trust: InputRepositoryTrust {
                 policy: InputFile {
                     name: format!("{id}-trust"),
@@ -969,6 +987,7 @@ mod tests {
             file_provides: None,
             group: None,
             modules: None,
+            updateinfo: None,
             trust: InputRepositoryTrust {
                 policy: InputFile {
                     name: "fedora-trust".into(),
@@ -1035,6 +1054,7 @@ mod tests {
             file_provides: None,
             group: None,
             modules: None,
+            updateinfo: None,
             trust: InputRepositoryTrust {
                 policy: InputFile {
                     name: "fedora-trust".into(),
@@ -1134,6 +1154,7 @@ mod tests {
             file_provides: None,
             group: None,
             modules: None,
+            updateinfo: None,
             trust: InputRepositoryTrust {
                 policy: InputFile {
                     name: "fedora-trust".into(),

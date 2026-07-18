@@ -105,6 +105,7 @@ fn retained_fd3_handoff_opens_the_root_published_generation() {
         file_provides: None,
         group: None,
         modules: None,
+        updateinfo: None,
         trust: InputRepositoryTrust {
             policy: trust_file,
             sha256: trust_sha256.clone(),

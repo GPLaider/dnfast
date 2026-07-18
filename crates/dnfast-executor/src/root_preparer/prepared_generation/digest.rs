@@ -8,24 +8,24 @@ use super::super::PreparationError;
 pub(crate) fn metadata_digest(
     repositories: &[InputRepository],
 ) -> Result<String, PreparationError> {
-    metadata_digest_version(repositories, false)
+    metadata_digest_version(repositories, 3)
 }
 
-pub(crate) fn metadata_digest_v4(
+pub(crate) fn metadata_digest_v5(
     repositories: &[InputRepository],
 ) -> Result<String, PreparationError> {
-    metadata_digest_version(repositories, true)
+    metadata_digest_version(repositories, 5)
 }
 
 fn metadata_digest_version(
     repositories: &[InputRepository],
-    extended: bool,
+    schema_version: u32,
 ) -> Result<String, PreparationError> {
     let mut digest = Sha256::new();
-    digest.update(if extended {
-        b"dnfast-root-metadata-v4".as_slice()
-    } else {
-        b"dnfast-root-metadata-v3".as_slice()
+    digest.update(match schema_version {
+        5 => b"dnfast-root-metadata-v5".as_slice(),
+        4 => b"dnfast-root-metadata-v4".as_slice(),
+        _ => b"dnfast-root-metadata-v3".as_slice(),
     });
     for repository in repositories {
         frame(&mut digest, &repository.id, repository.id.as_bytes())?;
@@ -54,7 +54,7 @@ fn metadata_digest_version(
             frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
             digest.update(file.size.to_be_bytes());
         }
-        if extended {
+        if schema_version >= 4 {
             for (role, file) in [
                 ("file-provides", repository.file_provides.as_ref()),
                 ("group", repository.group.as_ref()),
@@ -65,6 +65,13 @@ fn metadata_digest_version(
                     frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
                     digest.update(file.size.to_be_bytes());
                 }
+            }
+        }
+        if schema_version >= 5 {
+            frame(&mut digest, "updateinfo", b"updateinfo")?;
+            if let Some(file) = repository.updateinfo.as_ref() {
+                frame(&mut digest, &file.sha256, file.sha256.as_bytes())?;
+                digest.update(file.size.to_be_bytes());
             }
         }
     }
@@ -119,4 +126,55 @@ fn frame(digest: &mut Sha256, name: &str, bytes: &[u8]) -> Result<(), Preparatio
     );
     digest.update(bytes);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metadata_digest_v5;
+    use crate::{
+        input_model::{InputFile, InputOrigin, InputRepository, InputRepositoryTrust},
+        root_inputs,
+    };
+
+    fn file(name: &str, byte: char) -> InputFile {
+        InputFile {
+            name: name.into(),
+            sha256: byte.to_string().repeat(64),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn v5_digest_matches_root_validation_and_binds_updateinfo() {
+        let mut repository = InputRepository {
+            id: "main".into(),
+            priority: 99,
+            cost: 1000,
+            generation_sha256: "a".repeat(64),
+            origin: InputOrigin {
+                repomd_url: "https://main.example/repodata/repomd.xml".into(),
+                sha256: "b".repeat(64),
+            },
+            repomd: file("repomd", 'a'),
+            primary: file("primary", 'c'),
+            filelists: file("filelists", 'd'),
+            file_provides: None,
+            group: None,
+            modules: None,
+            updateinfo: Some(file("updateinfo", 'e')),
+            trust: InputRepositoryTrust {
+                policy: file("trust", 'f'),
+                sha256: "f".repeat(64),
+                keys: Vec::new(),
+            },
+        };
+
+        let prepared = metadata_digest_v5(std::slice::from_ref(&repository)).unwrap();
+        let validated = root_inputs::metadata_digest(std::slice::from_ref(&repository), 5).unwrap();
+        assert_eq!(prepared, validated);
+
+        repository.updateinfo = None;
+        let without_updateinfo = metadata_digest_v5(std::slice::from_ref(&repository)).unwrap();
+        assert_ne!(prepared, without_updateinfo);
+    }
 }

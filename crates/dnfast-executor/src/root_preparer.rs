@@ -20,7 +20,7 @@ mod root_state;
 #[cfg(test)]
 mod tests;
 
-use prepared_generation::{InputDraft, metadata_digest_v4, trust_digest};
+use prepared_generation::{InputDraft, metadata_digest_v5, trust_digest};
 use root_state::{
     current_snapshot, revalidate_snapshot_and_inventory, selected_ids, selected_repositories,
 };
@@ -301,9 +301,9 @@ fn prepare_into_draft(
     let policy_file =
         draft.write_bytes("policy.json", &policy.to_canonical_json().map_err(domain)?)?;
     let manifest = InputManifest {
-        schema_version: 4,
+        schema_version: 5,
         policy: policy_file,
-        metadata_sha256: metadata_digest_v4(&repository_inputs)?,
+        metadata_sha256: metadata_digest_v5(&repository_inputs)?,
         trust_sha256: trust_digest(&repository_inputs)?,
         repositories: repository_inputs,
         artifacts,

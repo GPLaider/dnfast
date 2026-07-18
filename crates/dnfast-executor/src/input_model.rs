@@ -28,6 +28,8 @@ pub(crate) struct InputRepository {
     pub(crate) group: Option<InputFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) modules: Option<InputFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) updateinfo: Option<InputFile>,
     pub(crate) trust: InputRepositoryTrust,
 }
 

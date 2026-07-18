@@ -486,6 +486,7 @@ mod tests {
                 file_provides: None,
                 group: None,
                 modules: None,
+                updateinfo: None,
                 trust: InputRepositoryTrust {
                     policy: descriptor("trust"),
                     sha256: "c".repeat(64),
