@@ -632,6 +632,7 @@ main() {
   start_guest_https_fixture
   bootstrap_root_snapshot
   run_public_matrix
+  record 'public_qemu_matrix_status=passed'
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
