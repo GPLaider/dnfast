@@ -194,10 +194,21 @@ fn validate_reachable(actions: &[ResolvedAction]) -> Result<(), PlanError> {
 }
 
 fn validate_kind(intent: Action, action: &ResolvedAction) -> Result<(), PlanError> {
-    let side_effect = action.provenance.is_some()
+    let obsoletion_side_effect = action.provenance.is_some()
         && action.operation == ResolvedOperation::Remove
         && intent != Action::Remove;
-    let valid = side_effect
+    // An upgrade may legitimately add a new package (for example a renamed
+    // library or a newly introduced dependency).  Accept it only when the
+    // native causal graph ties it to another selected action; reachability
+    // validation below then proves the chain reaches an explicit/all-package
+    // upgrade root.  A bare unrelated install therefore remains fail-closed.
+    let dependency_install = matches!(intent, Action::Upgrade | Action::DistroSync)
+        && action.operation == ResolvedOperation::Install
+        && !action.requested
+        && action.requested_spec.is_none()
+        && !action.dependency_edges.is_empty();
+    let valid = obsoletion_side_effect
+        || dependency_install
         || match intent {
             Action::Install => matches!(
                 action.operation,
@@ -385,4 +396,42 @@ fn action_identity(action: &ResolvedAction) -> Option<String> {
             candidate.evra.arch().as_rpm_arch()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_kind;
+    use crate::{DependencyEdge, DependencyKind, ResolvedAction, ResolvedOperation};
+    use dnfast_core::Action;
+
+    fn install(dependency_edges: Vec<DependencyEdge>) -> ResolvedAction {
+        ResolvedAction {
+            operation: ResolvedOperation::Install,
+            name: "replacement-library".into(),
+            requested: false,
+            requested_spec: None,
+            requested_relation: false,
+            candidate: None,
+            installed_instance: None,
+            installed_header_sha256: None,
+            installed_vendor: None,
+            dependency_edges,
+            provenance: None,
+            required_by_remaining: vec![],
+            unresolved_dependencies: vec![],
+            introduced_by_requested: false,
+            solver_rule: "test".into(),
+        }
+    }
+
+    #[test]
+    fn upgrade_accepts_only_causally_attached_install_side_effects() {
+        let causal = install(vec![DependencyEdge {
+            parent: "upgraded-parent".into(),
+            kind: DependencyKind::Strong,
+        }]);
+        assert!(validate_kind(Action::Upgrade, &causal).is_ok());
+        assert!(validate_kind(Action::DistroSync, &causal).is_ok());
+        assert!(validate_kind(Action::Upgrade, &install(vec![])).is_err());
+    }
 }

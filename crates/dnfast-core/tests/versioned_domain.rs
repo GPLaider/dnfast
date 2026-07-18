@@ -215,6 +215,43 @@ fn x86_64_install_remove_and_upgrade_plans_are_executable() {
 }
 
 #[test]
+fn upgrade_accepts_dependency_install_but_rejects_unrelated_user_install() {
+    let policy = SolverPolicy::fedora44_x86_64(vec![], vec![]);
+    let intent = TransactionIntent::from_package_names(Action::Upgrade, &[]).unwrap();
+    let policy_digest = digest('a');
+    let trust_digest = digest('b');
+    let inventory_digest = digest('c');
+    let metadata_digest = digest('d');
+    let bindings = [
+        policy_digest.as_str(),
+        trust_digest.as_str(),
+        inventory_digest.as_str(),
+        metadata_digest.as_str(),
+    ];
+    let dependency = PackageAction::install_with_vendor(
+        "replacement-library",
+        Evra::new(0, "2", "1", Architecture::X86_64),
+        "fedora",
+        "Fedora",
+        PackageReason::Dependency,
+    );
+    let unrelated = PackageAction::install_with_vendor(
+        "unrelated",
+        Evra::new(0, "1", "1", Architecture::X86_64),
+        "fedora",
+        "Fedora",
+        PackageReason::User,
+    );
+    let dependency_plan =
+        dnfast_core::CanonicalPlan::new(intent.clone(), integrity(bindings), 10, vec![dependency])
+            .unwrap();
+    let unrelated_plan =
+        dnfast_core::CanonicalPlan::new(intent, integrity(bindings), 10, vec![unrelated]).unwrap();
+    assert!(dependency_plan.validate_executable(&policy, 0).is_ok());
+    assert!(unrelated_plan.validate_executable(&policy, 0).is_err());
+}
+
+#[test]
 fn canonical_bytes_are_identical_one_hundred_times_and_safety_fields_change_digest() {
     let first = RepoTrustPolicy::new(
         "fedora",

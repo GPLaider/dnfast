@@ -29,13 +29,49 @@ char *dnfast_solvable_identity(Pool *pool, Solvable *item) {
     return value;
 }
 
+static int identity_order(Pool *pool, Id left_id, Id right_id) {
+    Solvable *left = pool_id2solvable(pool, left_id);
+    Solvable *right = pool_id2solvable(pool, right_id);
+    int order = strcmp(pool_id2str(pool, left->name),
+                       pool_id2str(pool, right->name));
+    if (order == 0)
+        order = strcmp(pool_id2str(pool, left->evr),
+                       pool_id2str(pool, right->evr));
+    if (order == 0)
+        order = strcmp(pool_id2str(pool, left->arch),
+                       pool_id2str(pool, right->arch));
+    return order;
+}
+
 static int selected_provider(dnfast_context *context, Id dependency, Id *provider) {
     Pool *pool = context->pool;
     Id candidate, offset, found = 0;
     FOR_PROVIDES(candidate, offset, dependency) {
+        Solvable *candidate_item;
+        Solvable *found_item;
+        int order;
         if (solver_get_decisionlevel(context->solver, candidate) <= 0) continue;
-        if (found != 0 && found != candidate) return -1;
-        found = candidate;
+        if (found == 0) {
+            found = candidate;
+            continue;
+        }
+        if (found == candidate) continue;
+        order = identity_order(pool, candidate, found);
+        /* Two selected solvables with the same canonical identity make the
+         * transaction evidence ambiguous and remain fail-closed.  Distinct
+         * packages may legitimately provide the same Fedora capability. */
+        if (order == 0) return -1;
+        candidate_item = pool_id2solvable(pool, candidate);
+        found_item = pool_id2solvable(pool, found);
+        /* A provider that remains installed already satisfies the relation;
+         * otherwise choose the canonical identity so pool insertion order
+         * cannot change the causal evidence. */
+        if ((candidate_item->repo == pool->installed &&
+             found_item->repo != pool->installed) ||
+            (candidate_item->repo == found_item->repo && order < 0) ||
+            (candidate_item->repo != pool->installed &&
+             found_item->repo != pool->installed && order < 0))
+            found = candidate;
     }
     *provider = found;
     return found == 0 ? 0 : 1;
@@ -110,7 +146,7 @@ dnfast_status dnfast_decisions_collect(dnfast_context *context, dnfast_error *er
                 if (strncmp(pool_dep2str(context->pool, dependencies.elements[offset]), "rpmlib(", 7) == 0) continue;
                 Id provider = 0;
                 int found = selected_provider(context, dependencies.elements[offset], &provider);
-                if (found < 0) { queue_free(&dependencies); return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE, "libsolv", "provider", "ambiguous selected provider"); }
+                if (found < 0) { queue_free(&dependencies); return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE, "libsolv", "provider", "duplicate selected provider identity"); }
                 if (found > 0 && !append(context, item, dependencies.elements[offset], provider, (uint8_t)kind)) { queue_free(&dependencies); return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE, "dnfast", "malloc", "decision allocation failed"); }
             }
         }

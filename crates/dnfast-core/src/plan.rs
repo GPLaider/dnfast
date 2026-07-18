@@ -701,6 +701,17 @@ impl PlanEnvelope {
             .filter_map(PackageAction::action_identity)
             .collect::<HashSet<_>>();
         for action in &self.actions {
+            // The signed solver plan and the mandatory root re-solve prove the
+            // causal graph.  At this domain boundary retain the corresponding
+            // narrow rule: upgrade/distro-sync may add only packages already
+            // classified with a dependency reason, never a user/root install.
+            let dependency_install =
+                matches!(self.intent.action(), Action::Upgrade | Action::DistroSync)
+                    && action.operation == PackageOperation::Install
+                    && matches!(
+                        action.reason,
+                        PackageReason::Dependency | PackageReason::WeakDependency
+                    );
             let ordinary = matches!(
                 (self.intent.action(), action.operation),
                 (
@@ -717,7 +728,7 @@ impl PlanEnvelope {
                             | PackageOperation::Reinstall
                     )
                     | (Action::Autoremove, PackageOperation::Remove)
-            );
+            ) || dependency_install;
             let side_effect = matches!((&action.provenance, action.operation),
                 (Some(ActionProvenance::ObsoletedBy { parent_action_identity }), PackageOperation::Remove)
                     if self.intent.action() != Action::Remove && parent_identities.contains(parent_action_identity)

@@ -164,7 +164,14 @@ grep -q $'decision\tstrong\tinstalled\tdnfast-app-0:1.0-1.noarch\tdnfast-dep-0:1
 awk 'BEGIN { block="" } /<metadata / { sub(/packages="25"/, "packages=\"3\""); print; next } /<package type=/ { block=$0 ORS; next } block != "" { block=block $0 ORS; if ($0 ~ /<\/package>/) { if (block ~ /<name>dnfast-dep<\/name>/) printf "%s%s", block, block; else if (block ~ /<name>dnfast-upgrade<\/name>/ && block ~ /ver="1.0"/) printf "%s", block; block="" }; next } { print }' "$LIMIT_PRIMARY" >"$TMP/installed-ambiguous.xml"
 AMBIGUOUS_SYSTEM="@System,$LIMIT_REPOMD,$TMP/installed-ambiguous.xml,$LIMIT_FILELISTS,9999,0"
 if solve dnfast-app no-weak "$AMBIGUOUS_SYSTEM" "$MAIN" >"$TMP/ambiguous-provider.out" 2>&1; then exit 1; fi
-grep -q 'ambiguous selected provider' "$TMP/ambiguous-provider.out"
+grep -q 'duplicate selected provider identity' "$TMP/ambiguous-provider.out"
+awk 'BEGIN { block="" } /<metadata / { sub(/packages="25"/, "packages=\"2\""); print; next } /<package type=/ { block=$0 ORS; next } block != "" { block=block $0 ORS; if ($0 ~ /<\/package>/) { if (block ~ /<name>dnfast-(cost|priority)<\/name>/) printf "%s", block; block="" }; next } { print }' "$LIMIT_PRIMARY" >"$TMP/installed-distinct-providers.xml"
+DISTINCT_SYSTEM="@System,$LIMIT_REPOMD,$TMP/installed-distinct-providers.xml,$LIMIT_FILELISTS,9999,0"
+sed 's/name="dnfast-dep" flags="GE"/name="dnfast-tie" flags="GE"/' "$LIMIT_PRIMARY" >"$TMP/distinct-provider-primary.xml"
+DISTINCT_REPO="distinct,$LIMIT_REPOMD,$TMP/distinct-provider-primary.xml,$LIMIT_FILELISTS,99,1000"
+DISTINCT_PROVIDER=$(solve dnfast-app no-weak "$DISTINCT_SYSTEM" "$DISTINCT_REPO")
+grep -q $'action\tinstall\tdistinct\tdnfast-app-0:1.0-1.noarch' <<<"$DISTINCT_PROVIDER"
+grep -q $'decision\tstrong\tinstalled\tdnfast-app-0:1.0-1.noarch\tdnfast-cost-0:1.0-1.noarch\tdnfast-tie >= 1.0' <<<"$DISTINCT_PROVIDER"
 UPGRADE=$(DNFAST_BEST=1 solve dnfast-upgrade no-weak "$SYSTEM" "$MAIN")
 grep -q $'action\tupgraded\t@System\tdnfast-upgrade-0:1.0-1.noarch' <<<"$UPGRADE"
 grep -q $'action\tupgrade\tmain\tdnfast-upgrade-0:2.0-1.noarch' <<<"$UPGRADE"
@@ -218,7 +225,8 @@ printf '%s\n' 'assert transitive=true' 'assert rich=true' 'assert file-provide=t
   'assert installed-install-is-idempotent=true' \
   'assert transactional-limit-recovery=true' 'assert installed-upgrade-obsoletion=true' \
   'assert causal-strong-weak-installed=true' \
-  'assert ambiguous-installed-provider-rejected=true' \
+  'assert duplicate-installed-provider-rejected=true' \
+  'assert distinct-selected-providers-canonical=true' \
   'assert native-obsolete-counterparts=true' \
   'assert downgrade-reinstall-distro-sync=true' \
   'assert reason-bounded-autoremove=true' \

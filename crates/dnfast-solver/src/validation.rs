@@ -38,6 +38,8 @@ pub enum PlanError {
     InstalledMissing(String),
     #[error("installed package identity is ambiguous: {0}")]
     AmbiguousInstalled(String),
+    #[error("unpaired native old action: {0}")]
+    UnpairedNativeOld(String),
     #[error("unsafe action: {0}")]
     Unsafe(String),
     #[error("canonical document failed: {0}")]

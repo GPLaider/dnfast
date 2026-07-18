@@ -765,13 +765,61 @@ fn pair_actions(
             }
         }
     }
-    if raw.iter().enumerate().any(|(index, item)| {
+    // libsolv may classify a new package as an upgrade of its same-name old
+    // package while that one new package also obsoletes additional installed
+    // packages.  transaction_obs_pkg on each old-side step retains the exact
+    // new counterpart even though the active step is not itself classified as
+    // SOLVER_TRANSACTION_OBSOLETES.  Preserve every such removal explicitly.
+    for old in 0..raw.len() {
+        if raw[old].kind != "obsoleted" || paired.contains(&old) {
+            continue;
+        }
+        let counterpart = raw[old]
+            .transaction_counterpart_nevra
+            .as_deref()
+            .ok_or_else(|| PlanError::UnpairedNativeOld(raw[old].nevra.clone()))?;
+        let matches = raw
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.repository != "@System"
+                    && item.nevra == counterpart
+                    && matches!(
+                        item.kind.as_str(),
+                        "install" | "upgrade" | "downgrade" | "reinstall" | "change" | "obsoletes"
+                    )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [active] = matches.as_slice() else {
+            return Err(PlanError::UnpairedNativeOld(format!(
+                "identity={} counterpart={} active_matches={}",
+                raw[old].nevra,
+                counterpart,
+                matches.len()
+            )));
+        };
+        let parent = format!("{}:{}", raw[*active].repository, raw[*active].nevra);
+        paired.insert(old);
+        raw[old].kind = "erase".into();
+        raw[old].provenance = Some(crate::ActionProvenance::ObsoletedBy {
+            parent_action_identity: parent,
+        });
+    }
+    if let Some((_, item)) = raw.iter().enumerate().find(|(index, item)| {
         matches!(
             item.kind.as_str(),
             "upgraded" | "downgraded" | "reinstalled" | "changed" | "obsoleted"
-        ) && !paired.contains(&index)
+        ) && !paired.contains(index)
     }) {
-        return Err(PlanError::Invalid("unpaired native old action"));
+        return Err(PlanError::UnpairedNativeOld(format!(
+            "kind={} identity={} counterpart={}",
+            item.kind,
+            item.nevra,
+            item.transaction_counterpart_nevra
+                .as_deref()
+                .unwrap_or("none")
+        )));
     }
     Ok(raw
         .into_iter()
@@ -946,5 +994,61 @@ mod tests {
             assert_eq!(paired[0].installed_header_sha256, Some("a".repeat(64)));
             assert_eq!(paired[0].old_nevra.as_deref(), Some(old));
         }
+    }
+
+    #[test]
+    fn upgrade_pairs_additional_old_side_obsoletes_to_the_exact_new_action() {
+        let package = |name: &str, instance: u64, digest: char| {
+            dnfast_core::InstalledPackage::new(
+                name,
+                dnfast_core::Evra::new(0, "1", "1", dnfast_core::Architecture::X86_64),
+                "Fedora",
+                instance,
+                1,
+                digest.to_string().repeat(64),
+            )
+            .unwrap()
+        };
+        let inventory = dnfast_core::InstalledInventory::new(
+            "sqlite",
+            "6",
+            vec![package("demo", 7, 'a'), package("demo-plugin", 8, 'b')],
+        )
+        .unwrap();
+        let action = |kind: &str, repository: &str, nevra: &str, counterpart: &str| NativeAction {
+            kind: kind.into(),
+            repository: repository.into(),
+            nevra: nevra.into(),
+            old_nevra: None,
+            installed_instance: None,
+            installed_header_sha256: None,
+            requested_spec: None,
+            requested_relation: false,
+            provenance: None,
+            transaction_counterpart_nevra: Some(counterpart.into()),
+        };
+        let target = "demo-0:2-1.x86_64";
+        let old = "demo-0:1-1.x86_64";
+        let plugin = "demo-plugin-0:1-1.x86_64";
+        let paired = pair_actions(
+            vec![
+                action("upgrade", "fedora", target, old),
+                action("upgraded", "@System", old, target),
+                action("obsoleted", "@System", plugin, target),
+            ],
+            &inventory,
+        )
+        .unwrap();
+        assert_eq!(paired.len(), 2);
+        assert_eq!(paired[0].kind, "upgrade");
+        assert_eq!(paired[0].old_nevra.as_deref(), Some(old));
+        assert_eq!(paired[1].kind, "erase");
+        assert_eq!(paired[1].installed_instance, Some(8));
+        assert_eq!(
+            paired[1].provenance,
+            Some(crate::ActionProvenance::ObsoletedBy {
+                parent_action_identity: format!("fedora:{target}")
+            })
+        );
     }
 }
