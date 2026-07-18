@@ -4,15 +4,32 @@ use dnfast_solver::CanonicalSolverPlan;
 
 use crate::{ExecutorError, MountRoot, StagedInputs};
 
+pub struct ExecutionState<'a> {
+    reason_store: &'a dnfast_state::ReasonStateStore,
+    journal: Rc<dnfast_state::TransactionJournal>,
+}
+
+impl<'a> ExecutionState<'a> {
+    pub fn new(
+        reason_store: &'a dnfast_state::ReasonStateStore,
+        journal: Rc<dnfast_state::TransactionJournal>,
+    ) -> Self {
+        Self {
+            reason_store,
+            journal,
+        }
+    }
+}
+
 pub fn run(
     plan: &CanonicalSolverPlan,
     staged: &mut StagedInputs,
     inventory: &dnfast_core::InstalledInventory,
-    journal: Rc<dnfast_state::TransactionJournal>,
+    state: ExecutionState<'_>,
     root: &str,
     mount_root: &MountRoot,
 ) -> Result<dnfast_core::InstalledInventory, ExecutorError> {
-    run_inner(plan, staged, inventory, None, journal, root, mount_root)
+    run_inner(plan, staged, inventory, None, state, root, mount_root)
 }
 
 pub fn run_token_bound(
@@ -20,7 +37,7 @@ pub fn run_token_bound(
     staged: &mut StagedInputs,
     inventory: &dnfast_core::InstalledInventory,
     rpmdb_cookie: &str,
-    journal: Rc<dnfast_state::TransactionJournal>,
+    state: ExecutionState<'_>,
     root: &str,
     mount_root: &MountRoot,
 ) -> Result<dnfast_core::InstalledInventory, ExecutorError> {
@@ -29,7 +46,7 @@ pub fn run_token_bound(
         staged,
         inventory,
         Some(rpmdb_cookie),
-        journal,
+        state,
         root,
         mount_root,
     )
@@ -40,21 +57,12 @@ fn run_inner(
     staged: &mut StagedInputs,
     inventory: &dnfast_core::InstalledInventory,
     rpmdb_cookie: Option<&str>,
-    journal: Rc<dnfast_state::TransactionJournal>,
+    state: ExecutionState<'_>,
     root: &str,
     mount_root: &MountRoot,
 ) -> Result<dnfast_core::InstalledInventory, ExecutorError> {
     let trace = std::env::var_os("DNFASTD_TRACE").is_some();
     let started = Instant::now();
-    // Open and retain the exact root-owned reason-state directory before any
-    // RPM transaction can become stateful.  A fresh installation may not have
-    // created it yet, and discovering that only after rpmtsRun succeeds would
-    // report a failed command after changing RPMDB.  The retained descriptor
-    // also prevents the post-transaction write from resolving a replacement
-    // path.
-    let reason_store = dnfast_state::ReasonStateStore::open_system().map_err(|error| {
-        ExecutorError::Plan(format!("package reason state preflight failed: {error}"))
-    })?;
     trace_phase(trace, started, "reason-state-preflight");
     let isolated_keyrings = staged
         .repositories
@@ -167,7 +175,9 @@ fn run_inner(
     }
     .map_err(inventory_error)?;
     trace_phase(trace, started, "inventory-begin");
-    executor.bind_journal(journal).map_err(inventory_error)?;
+    executor
+        .bind_journal(state.journal)
+        .map_err(inventory_error)?;
     for action in plan.actions() {
         match action.operation.as_str() {
             "remove" => {
@@ -260,7 +270,8 @@ fn run_inner(
         .verify_unchanged()
         .map_err(|error| ExecutorError::MountStateful(error.to_string()))?;
     let after = executor.inventory().clone();
-    reason_store
+    state
+        .reason_store
         .record_success(inventory, &after, plan.proposal(), &staged.policy)
         .map_err(|error| {
             ExecutorError::Plan(format!(

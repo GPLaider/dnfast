@@ -17,7 +17,7 @@ mod staging;
 
 pub use compact_inputs::{CompactExecution, CompactTransactionInputs};
 pub use error::ExecutorError;
-pub use execute::{run as execute_checked_transaction, run_token_bound};
+pub use execute::{ExecutionState, run as execute_checked_transaction, run_token_bound};
 pub use mount_root::MountRoot;
 pub use plan_fd::{InheritedPlan, MAX_PLAN_BYTES, open_plan, validate_plan_path};
 pub use recovery::recover_pending_transactions;

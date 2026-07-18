@@ -3,6 +3,7 @@ use dnfast_core::{
     PackageReason, PlanIntegrity, RepositoryBinding, Sha256Digest, SolverPolicy, TransactionIntent,
 };
 use dnfast_state::ReasonStateStore;
+use std::os::unix::fs::PermissionsExt;
 
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -77,6 +78,53 @@ fn missing_or_protected_reason_state_fails_closed() {
     assert!(
         store
             .autoremove_candidates(&installed, &policy)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn retained_reason_state_fd_is_not_redirected_by_path_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reasons");
+    let retained = directory.path().join("retained");
+    let store = ReasonStateStore::open(&path).unwrap();
+
+    std::fs::rename(&path, &retained).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let policy = SolverPolicy::fedora44_x86_64(vec![], vec![]);
+    let before = inventory(vec![package("root", "1", 1, A)]);
+    let after = inventory(vec![
+        package("root", "1", 1, A),
+        package("dependency", "1", 2, B),
+    ]);
+    let install = plan(
+        Action::Install,
+        &["root"],
+        vec![PackageAction::install_with_vendor(
+            "dependency",
+            evra("1"),
+            "fedora",
+            "Fedora",
+            PackageReason::Dependency,
+        )],
+    );
+    store
+        .record_success(&before, &after, &install, &policy)
+        .unwrap();
+
+    assert!(retained.join("state.json").is_file());
+    assert!(!path.join("state.json").exists());
+    assert_eq!(
+        store.autoremove_candidates(&after, &policy).unwrap(),
+        vec!["dependency"]
+    );
+    assert!(
+        ReasonStateStore::open(&path)
+            .unwrap()
+            .autoremove_candidates(&after, &policy)
             .unwrap()
             .is_empty()
     );

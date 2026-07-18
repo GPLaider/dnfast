@@ -11,8 +11,8 @@ use std::{
 };
 
 use dnfast_executor::{
-    CompactTransactionInputs, ExecutorError, InheritedPlan, MountRoot, RootInputs, Staging,
-    execute_checked_transaction, recover_pending_transactions, require_root_resolve_equal,
+    CompactTransactionInputs, ExecutionState, ExecutorError, InheritedPlan, MountRoot, RootInputs,
+    Staging, execute_checked_transaction, recover_pending_transactions, require_root_resolve_equal,
     run_token_bound,
 };
 use serde::Serialize;
@@ -75,6 +75,14 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
             return Ok(Outcome::Aborted(proposal));
         }
         detach_standard_input()?;
+        // Open this root-owned state before entering the non-recursive root
+        // bind.  Fedora may mount /var separately, so resolving the path from
+        // inside that chroot can legitimately report ENOENT.  Retaining the
+        // descriptor also prevents a path replacement between RPM mutation
+        // and reason-state publication.
+        let reason_store = dnfast_state::ReasonStateStore::open_system().map_err(|error| {
+            ExecutorError::Plan(format!("package reason state preflight failed: {error}"))
+        })?;
         compact.revalidate_runtime(&proposal)?;
         let id = dnfast_state::TransactionId::parse(staging.id())
             .map_err(|error| ExecutorError::Plan(error.to_string()))?;
@@ -92,7 +100,7 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
             &mut staged,
             &inventory,
             &rpmdb_cookie,
-            Rc::new(journal),
+            ExecutionState::new(&reason_store, Rc::new(journal)),
             "/",
             &root,
         );
@@ -120,6 +128,9 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
         return Ok(Outcome::Aborted(proposal));
     }
     detach_standard_input()?;
+    let reason_store = dnfast_state::ReasonStateStore::open_system().map_err(|error| {
+        ExecutorError::Plan(format!("package reason state preflight failed: {error}"))
+    })?;
     let id = dnfast_state::TransactionId::parse(staging.id())
         .map_err(|error| ExecutorError::Plan(error.to_string()))?;
     let digest = proposal
@@ -134,7 +145,7 @@ fn run(arguments: Vec<String>) -> Result<Outcome, ExecutorError> {
         &proposal,
         &mut staged,
         &inventory,
-        Rc::new(journal),
+        ExecutionState::new(&reason_store, Rc::new(journal)),
         "/",
         &root,
     );

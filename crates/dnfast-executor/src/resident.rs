@@ -36,7 +36,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    CompactExecution, ExecutorError, MountRoot, StagedArtifact, StagedInputs, Staging,
+    CompactExecution, ExecutionState, ExecutorError, MountRoot, StagedArtifact, StagedInputs,
+    Staging,
     execute::run_token_bound,
     recover_pending_transactions,
     staged_inputs::{StagedRepository, apply_module_artifact_policy},
@@ -751,6 +752,12 @@ impl DaemonState {
         let staging = Staging::create(&plan_bytes).map_err(executor)?;
         let mut staged = direct_staged_inputs(&solved)?;
         let mut root = MountRoot::create(&staging).map_err(executor)?;
+        // Pin the host /var-backed state before entering the non-recursive
+        // transaction root bind.  This is both a fresh-system preflight and
+        // the capability used for the post-RPM atomic publication.
+        let reason_store = dnfast_state::ReasonStateStore::open_system().map_err(|error| {
+            DaemonError::Execution(format!("package reason state preflight failed: {error}"))
+        })?;
         trace_phase(self.trace, started, "stage");
         let id = dnfast_state::TransactionId::parse(staging.id())
             .map_err(|error| DaemonError::Execution(error.to_string()))?;
@@ -766,7 +773,7 @@ impl DaemonState {
             &mut staged,
             &solved.inventory,
             &solved.rpmdb_cookie,
-            Rc::new(journal),
+            ExecutionState::new(&reason_store, Rc::new(journal)),
             "/",
             &root,
         );
