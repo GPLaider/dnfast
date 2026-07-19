@@ -24,6 +24,7 @@ jobs:
           workspace_gid=$(stat -c '%g' "$GITHUB_WORKSPACE")
           ci_home="$RUNNER_TEMP/dnfast-home"
           install -d -o "$workspace_uid" -g "$workspace_gid" "$ci_home"
+          chown -R "$workspace_uid:$workspace_gid" "$GITHUB_WORKSPACE"
           printf 'CI_UID=%s\nCI_GID=%s\nCI_HOME=%s\n' \
             "$workspace_uid" "$workspace_gid" "$ci_home" >> "$GITHUB_ENV"
       - name: Format
