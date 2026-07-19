@@ -17,7 +17,7 @@ jobs:
       - name: Install native toolchain
         run: >-
           dnf5 install -y cargo clang clippy gcc libmodulemd-devel libsolv-devel
-          nettle-devel pkgconf-pkg-config rpm-devel rust rustfmt zstd
+          nettle-devel pkgconf-pkg-config rpm-devel rust rustfmt util-linux zstd
       - name: Match the checkout owner
         run: |
           workspace_uid=$(stat -c '%u' "$GITHUB_WORKSPACE")
