@@ -5,8 +5,8 @@ Summary:        Independent fail-closed RPM package manager for Fedora
 
 License:        GPL-2.0-or-later
 URL:            https://github.com/GPLaider/dnfast
-Source0:        %{name}-%{version}.tar.gz
-Source1:        %{name}-%{version}-vendor.tar.gz
+Source0:        https://github.com/GPLaider/%{name}/releases/download/v%{version}/%{name}-%{version}.tar.gz
+Source1:        https://github.com/GPLaider/%{name}/releases/download/v%{version}/%{name}-%{version}-vendor.tar.gz
 
 # The native ABI and full host/KVM gates are currently verified only on this architecture.
 ExclusiveArch:  x86_64
@@ -24,17 +24,16 @@ BuildRequires:  pkgconfig(rpm) = 6.0.1
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  zstd
 
-Requires:       libdnf5
 Requires:       rpm
-Requires:       sqlite-libs
+Requires:       libsqlite3.so.0()(64bit)
 Requires:       systemd
 
 %description
-dnfast is an independent RPM package manager for Fedora. It verifies rpm-md
-metadata and selected RPMs, resolves transactions directly with libsolv, and
-applies approved transactions directly with librpm. Its supported command
-surface is intentionally smaller than DNF5 and fails closed for unsupported
-operations.
+dnfast is an independent RPM package manager for Fedora. It verifies repository
+metadata and selected RPMs, resolves transactions with Fedora's dependency
+solver libraries, and applies approved transactions with RPM libraries. Its
+supported command surface is intentionally smaller than DNF5 and fails closed
+for unsupported operations.
 
 %prep
 %autosetup -n %{name}-%{version}
