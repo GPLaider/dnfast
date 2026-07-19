@@ -9,6 +9,19 @@ transactions directly with librpm. It does not invoke DNF or DNF5 to solve or ap
 > recovery. `dnfast` is not a drop-in replacement for DNF5 and intentionally supports fewer policy
 > and plugin surfaces.
 
+## Install from COPR
+
+The technical preview is published for Fedora 44 x86_64:
+
+```bash
+sudo dnf5 install dnf5-plugins
+sudo dnf5 copr enable gplaider/dnfast
+sudo dnf5 install dnfast
+```
+
+The package installs `dnfastd.service` in a disabled and inactive state. Keep it that way unless
+you explicitly want the opt-in resident daemon described below.
+
 The implemented command surface is deliberately smaller than DNF5:
 
 ```bash
