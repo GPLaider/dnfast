@@ -18,17 +18,33 @@ jobs:
         run: >-
           dnf5 install -y cargo clang clippy gcc libmodulemd-devel libsolv-devel
           nettle-devel pkgconf-pkg-config rpm-devel rust rustfmt zstd
+      - name: Match the checkout owner
+        run: |
+          workspace_uid=$(stat -c '%u' "$GITHUB_WORKSPACE")
+          workspace_gid=$(stat -c '%g' "$GITHUB_WORKSPACE")
+          ci_home="$RUNNER_TEMP/dnfast-home"
+          install -d -o "$workspace_uid" -g "$workspace_gid" "$ci_home"
+          printf 'CI_UID=%s\nCI_GID=%s\nCI_HOME=%s\n' \
+            "$workspace_uid" "$workspace_gid" "$ci_home" >> "$GITHUB_ENV"
       - name: Format
-        run: cargo fmt --all -- --check
+        run: >-
+          setpriv --reuid="$CI_UID" --regid="$CI_GID" --clear-groups
+          env HOME="$CI_HOME" cargo fmt --all -- --check
       - name: Check
         env:
           DNFAST_NATIVE_REAL: "1"
-        run: cargo check --locked --workspace --all-targets
+        run: >-
+          setpriv --reuid="$CI_UID" --regid="$CI_GID" --clear-groups
+          env HOME="$CI_HOME" cargo check --locked --workspace --all-targets
       - name: Clippy
         env:
           DNFAST_NATIVE_REAL: "1"
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: >-
+          setpriv --reuid="$CI_UID" --regid="$CI_GID" --clear-groups
+          env HOME="$CI_HOME" cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         env:
           DNFAST_NATIVE_REAL: "1"
-        run: cargo test --locked --workspace --all-targets -- --test-threads=1
+        run: >-
+          setpriv --reuid="$CI_UID" --regid="$CI_GID" --clear-groups
+          env HOME="$CI_HOME" cargo test --locked --workspace --all-targets -- --test-threads=1
