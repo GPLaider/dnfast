@@ -6,12 +6,12 @@ use crate::{
     Cache,
     fs_safety::{
         AnchoredDirectory, MAX_MANIFEST_BYTES, read_anchored, read_regular, reject_symlink,
-        validate_name, verify_file,
+        validate_name, verify_file, verify_file_retained,
     },
     model::{
         CacheError, CompleteSnapshot, CurrentPointer, Manifest, SelectedOrigin, Snapshot,
-        SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration, io_error, metadata_error,
-        sha256, valid_digest,
+        SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration, VerifiedFile, VerifiedSource,
+        io_error, metadata_error, sha256, valid_digest,
     },
 };
 
@@ -75,7 +75,7 @@ impl Cache {
             .map_err(|error| CacheError::Corrupt(error.to_string()))?;
         match probe.version {
             None | Some(1) => return Err(CacheError::CacheUpgradeRequired),
-            Some(2 | 3) => {}
+            Some(2..=5) => {}
             Some(_) => return Err(CacheError::Corrupt("unsupported manifest version".into())),
         }
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
@@ -117,7 +117,7 @@ impl Cache {
             .map_err(|error| CacheError::Corrupt(error.to_string()))?;
         match probe.version {
             None | Some(1) => return Err(CacheError::CacheUpgradeRequired),
-            Some(2 | 3) => {}
+            Some(2..=5) => {}
             Some(_) => return Err(CacheError::Corrupt("unsupported manifest version".into())),
         }
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
@@ -183,7 +183,7 @@ impl Cache {
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|error| CacheError::Corrupt(error.to_string()))?;
         validate_manifest(&object, &manifest)?;
-        if !matches!(manifest.version, 2 | 3)
+        if !matches!(manifest.version, 2..=5)
             || manifest.repomd.sha256 != digest
             || manifest.integrity != SnapshotIntegrity::CompleteMetadata
         {
@@ -192,14 +192,29 @@ impl Cache {
             ));
         }
         let repomd = verified_bytes(&anchored, &manifest.repomd)?;
-        let primary = verified_bytes(&anchored, &manifest.primary)?;
-        let filelists = verified_bytes(
+        let primary = verified_file(&anchored, &manifest.primary)?;
+        let filelists = verified_file(
             &anchored,
             manifest
                 .filelists
                 .as_ref()
                 .ok_or_else(|| CacheError::Corrupt("missing filelists".into()))?,
         )?;
+        let primary_identities: Option<Vec<dnfast_metadata::PrimaryPackageIdentity>> = manifest
+            .primary_identities
+            .as_ref()
+            .map(|record| decode_json(&anchored, record))
+            .transpose()?;
+        let primary_files = manifest
+            .primary_files
+            .as_ref()
+            .map(|record| verified_bytes(&anchored, record))
+            .transpose()?;
+        if let (Some(identities), Some(primary_files)) =
+            (primary_identities.as_ref(), primary_files.as_ref())
+        {
+            validate_primary_files(primary_files.bytes(), identities.len())?;
+        }
         let records = parse_repomd_records(repomd.bytes()).map_err(metadata_error)?;
         if records.primary.checksum != primary.sha256()
             || records.primary.size != primary.size()
@@ -232,6 +247,8 @@ impl Cache {
             repomd,
             primary,
             filelists,
+            primary_identities,
+            primary_files,
             repomd_authentication: crate::model::RepomdAuthentication::TransportOnly,
         })
     }
@@ -276,6 +293,23 @@ impl Cache {
                 .map_err(metadata_error)?;
                 let parsed_solver = dnfast_metadata::parse_primary_records(opened.as_slice())
                     .map_err(metadata_error)?;
+                if matches!(manifest.version, 4 | 5) {
+                    let projected: Vec<dnfast_metadata::PrimaryPackageIdentity> = decode_json(
+                        object,
+                        manifest.primary_identities.as_ref().ok_or_else(|| {
+                            CacheError::Corrupt("missing primary identity projection".into())
+                        })?,
+                    )?;
+                    let parsed_identities = parsed_solver
+                        .iter()
+                        .map(primary_identity)
+                        .collect::<Vec<_>>();
+                    if projected != parsed_identities {
+                        return Err(CacheError::Corrupt(
+                            "primary identity projection mismatch".into(),
+                        ));
+                    }
+                }
                 let (solver_inputs, filelists) = if manifest.version == 2 {
                     let solver = manifest
                         .solver_inputs
@@ -299,7 +333,7 @@ impl Cache {
                 } else {
                     if manifest.solver_inputs.is_some() || manifest.filelists_index.is_some() {
                         return Err(CacheError::Corrupt(
-                            "version three manifest contains derived indexes".into(),
+                            "raw-metadata manifest contains legacy derived indexes".into(),
                         ));
                     }
                     (parsed_solver, parsed)
@@ -394,12 +428,25 @@ fn verified_bytes(
     object: &AnchoredDirectory,
     record: &crate::model::FileRecord,
 ) -> Result<VerifiedBytes, CacheError> {
-    let bytes = verify_file(object, record)?;
+    let (bytes, file) = verify_file_retained(object, record)?;
     Ok(VerifiedBytes {
         sha256: record.sha256.clone(),
         size: record.size,
         bytes,
+        source: Some(VerifiedSource::new(file)?),
     })
+}
+
+fn verified_file(
+    object: &AnchoredDirectory,
+    record: &crate::model::FileRecord,
+) -> Result<VerifiedFile, CacheError> {
+    let (bytes, file) = verify_file_retained(object, record)?;
+    // `verify_file_retained` has checked the exact length and SHA-256 while
+    // holding this descriptor. The retained identity capability lets callers
+    // reread or reflink later without keeping this large temporary vector.
+    drop(bytes);
+    VerifiedFile::new(record.sha256.clone(), record.size, file)
 }
 
 fn decode_json<T: serde::de::DeserializeOwned>(
@@ -410,6 +457,27 @@ fn decode_json<T: serde::de::DeserializeOwned>(
         .map_err(|error| CacheError::Corrupt(error.to_string()))
 }
 
+fn validate_primary_files(bytes: &[u8], package_count: usize) -> Result<(), CacheError> {
+    const RECORD_SIZE: usize = 32 + std::mem::size_of::<u32>();
+    if bytes.len() % RECORD_SIZE != 0 {
+        return Err(CacheError::Corrupt(
+            "primary file projection has a partial record".into(),
+        ));
+    }
+    let mut previous = None::<&[u8]>;
+    for record in bytes.chunks_exact(RECORD_SIZE) {
+        let ordinal = u32::from_be_bytes(record[32..].try_into().expect("fixed record"));
+        if ordinal as usize >= package_count || previous.is_some_and(|previous| previous >= record)
+        {
+            return Err(CacheError::Corrupt(
+                "primary file projection records are invalid".into(),
+            ));
+        }
+        previous = Some(record);
+    }
+    Ok(())
+}
+
 fn search_package(record: &dnfast_metadata::CompletePackage) -> dnfast_metadata::Package {
     dnfast_metadata::Package {
         name: record.name.clone(),
@@ -418,6 +486,19 @@ fn search_package(record: &dnfast_metadata::CompletePackage) -> dnfast_metadata:
         version: record.version.clone(),
         release: record.release.clone(),
         summary: record.summary.clone(),
+    }
+}
+
+fn primary_identity(
+    record: &dnfast_metadata::CompletePackage,
+) -> dnfast_metadata::PrimaryPackageIdentity {
+    dnfast_metadata::PrimaryPackageIdentity {
+        checksum: record.checksum.clone(),
+        name: record.name.clone(),
+        arch: record.arch.clone(),
+        epoch: record.epoch.clone(),
+        version: record.version.clone(),
+        release: record.release.clone(),
     }
 }
 
@@ -445,6 +526,8 @@ fn validate_manifest(object: &std::path::Path, manifest: &Manifest) -> Result<()
             if manifest.filelists.is_some()
                 || manifest.filelists_index.is_some()
                 || manifest.solver_inputs.is_some()
+                || manifest.primary_identities.is_some()
+                || manifest.primary_files.is_some()
             {
                 return Err(CacheError::Corrupt(
                     "search-only manifest has complete records".into(),
@@ -460,6 +543,32 @@ fn validate_manifest(object: &std::path::Path, manifest: &Manifest) -> Result<()
                     .ok_or_else(|| CacheError::Corrupt("missing filelists".into()))?,
                 "filelists",
             )?;
+            if matches!(manifest.version, 4 | 5) {
+                add_record(
+                    &mut expected,
+                    manifest.primary_identities.as_ref().ok_or_else(|| {
+                        CacheError::Corrupt("missing primary identity projection".into())
+                    })?,
+                    "primary-identities.json",
+                )?;
+            } else if manifest.primary_identities.is_some() {
+                return Err(CacheError::Corrupt(
+                    "legacy manifest contains primary identity projection".into(),
+                ));
+            }
+            if manifest.version == 5 {
+                add_record(
+                    &mut expected,
+                    manifest.primary_files.as_ref().ok_or_else(|| {
+                        CacheError::Corrupt("missing primary file projection".into())
+                    })?,
+                    "primary-files.bin",
+                )?;
+            } else if manifest.primary_files.is_some() {
+                return Err(CacheError::Corrupt(
+                    "legacy manifest contains primary file projection".into(),
+                ));
+            }
             if manifest.version == 2 {
                 add_record(
                     &mut expected,
@@ -479,7 +588,7 @@ fn validate_manifest(object: &std::path::Path, manifest: &Manifest) -> Result<()
                 )?;
             } else if manifest.filelists_index.is_some() || manifest.solver_inputs.is_some() {
                 return Err(CacheError::Corrupt(
-                    "version three manifest contains derived indexes".into(),
+                    "raw-metadata manifest contains legacy derived indexes".into(),
                 ));
             }
         }

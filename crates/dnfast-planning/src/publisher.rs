@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::OnceLock,
     time::Instant,
 };
 
@@ -138,6 +138,13 @@ impl RootPlanningPublisher {
             host_architecture,
         )?;
         let inventory = installed.inventory;
+        // The native inventory context owns the complete RPMDB/libsolv arena.
+        // Planning below builds repository caches in independent contexts and
+        // needs only the canonical Rust inventory, so retaining this context
+        // would add the whole installed-repository arena to their peak RSS.
+        drop(context);
+        dnfast_native::release_unused_memory();
+        trace_memory("planning:installed-context-released");
         let refreshed_repository_ids = refreshed_generations.map(|generations| {
             generations
                 .iter()
@@ -713,34 +720,28 @@ fn snapshot_from(
         .collect::<Result<Vec<_>, _>>()
         .map_err(domain)?;
     let policy = policy_for(host_architecture, profile, preferences)?;
-    // Each repository has an independent checksum-bound generation and
-    // independent file-provides spools. Build them concurrently so a large
-    // Fedora base repository overlaps the smaller updates repository instead
-    // of making first publication pay both parse/sort passes serially. The
-    // resulting workers are joined in canonical repository order.
-    let repositories = std::thread::scope(|scope| {
-        enabled
-            .into_iter()
-            .map(|repository| {
-                scope.spawn(move || {
-                    repository_payload(
-                        repository,
-                        cache,
-                        published_at_unix,
-                        host_architecture,
-                        storage,
-                    )
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|worker| {
-                worker
-                    .join()
-                    .map_err(|_| PlanningError::Io("repository planning worker panicked".into()))?
-            })
-            .collect::<Result<Vec<_>, PlanningError>>()
-    })?;
+    // libsolv pools are intentionally thread-affine and memory-heavy. Build
+    // one repository at a time so a cold publication never stacks Fedora and
+    // updates pools in one process; each repository still overlaps its small
+    // file-provides capability projection with its native cache writer.
+    let mut pending_solv_commits = Vec::new();
+    let mut repositories = Vec::with_capacity(enabled.len());
+    for repository in enabled {
+        repositories.push(repository_payload(
+            repository,
+            cache,
+            published_at_unix,
+            host_architecture,
+            storage,
+            &mut pending_solv_commits,
+        )?);
+    }
+    // Native pools are built sequentially to cap RSS, but once libsolv has
+    // serialized an immutable O_TMPFILE its fsync/hash/link work owns no pool
+    // memory.  Let those I/O-only commits overlap the next repository parse,
+    // then fail closed before any snapshot can reference the cache batch.
+    join_solv_commits(pending_solv_commits)?;
+    trace_memory("planning:solv-commits-finished");
     // Repository workers transiently hold decompression, sort, and staging
     // buffers hundreds of MiB larger than the published descriptors. Return
     // those free glibc arenas before the libsolv prewarm phase so the two
@@ -1003,6 +1004,7 @@ fn repository_payload(
     valid_at_unix: u64,
     host_architecture: Architecture,
     storage: PlanningStorage<'_>,
+    pending_solv_commits: &mut Vec<PendingSolvCommit>,
 ) -> Result<PlanningRepository, PlanningError> {
     if !repository.sslverify
         || !repository.gpgcheck
@@ -1067,6 +1069,7 @@ fn repository_payload(
         bundle,
         host_architecture,
         storage,
+        pending_solv_commits,
     )
 }
 
@@ -1076,37 +1079,34 @@ struct AuxiliaryPayloads {
     updateinfo: Option<dnfast_cache::VerifiedBytes>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generation_payload(
     repository: &RepoConfig,
-    generation: VerifiedCompleteGeneration,
+    mut generation: VerifiedCompleteGeneration,
     auxiliary: AuxiliaryPayloads,
     trust: RepoTrustPolicy,
     bundle: KeyBundle,
     host_architecture: Architecture,
     storage: PlanningStorage<'_>,
+    pending_solv_commits: &mut Vec<PendingSolvCommit>,
 ) -> Result<PlanningRepository, PlanningError> {
-    // Primary-only libsolv materialization and filelists hashing consume
-    // independent immutable inputs. On a first publication, overlap them so
-    // full absolute-file readiness does not pay both CPU passes serially.
-    let file_provides = std::thread::scope(|scope| {
-        let solv_worker = storage.solv_cache_root.map(|cache_root| {
-            scope.spawn(|| {
-                prewarm_repository_generation_solv_cache(
-                    repository,
-                    &generation,
-                    cache_root,
-                    host_architecture,
-                )
-            })
-        });
-        let file_provides = crate::file_provides::build(&generation, storage.blobs)?;
-        if let Some(worker) = solv_worker {
-            worker
-                .join()
-                .map_err(|_| PlanningError::Io("repository solv-cache worker panicked".into()))??;
-        }
-        Ok::<_, PlanningError>(file_provides)
-    })?;
+    let file_provides = crate::file_provides::build(&generation, storage.blobs)?;
+    // The compact capability now owns the checksum and primary-path evidence.
+    // Drop the source projections before libsolv expands primary metadata.
+    // Do not force a per-repository malloc trim here: the next native build
+    // can reuse these arenas, while trimming them made each Fedora repository
+    // pay roughly one second of avoidable page-walk/release latency.
+    generation.discard_primary_identities();
+    generation.discard_primary_files();
+    if let Some(cache_root) = storage.solv_cache_root {
+        prewarm_repository_generation_solv_cache(
+            repository,
+            &generation,
+            cache_root,
+            host_architecture,
+            pending_solv_commits,
+        )?;
+    }
     let keys = planning_keys(&bundle)?;
     if generation.repository() != repository.id {
         return Err(PlanningError::Cache(
@@ -1114,28 +1114,16 @@ fn generation_payload(
         ));
     }
     if let Some(planning) = storage.blobs {
-        for payload in [
-            generation.repomd(),
-            generation.primary(),
-            generation.filelists(),
-        ] {
-            crate::snapshot_store::publish_blob_deferred(
-                planning,
-                payload.sha256(),
-                payload.bytes(),
-            )?;
-        }
+        crate::snapshot_store::publish_verified_blob_deferred(planning, generation.repomd())?;
+        crate::snapshot_store::publish_verified_file_deferred(planning, generation.primary())?;
+        crate::snapshot_store::publish_verified_file_deferred(planning, generation.filelists())?;
         for payload in auxiliary
             .group
             .iter()
             .chain(auxiliary.modules.iter())
             .chain(auxiliary.updateinfo.iter())
         {
-            crate::snapshot_store::publish_blob_deferred(
-                planning,
-                payload.sha256(),
-                payload.bytes(),
-            )?;
+            crate::snapshot_store::publish_verified_blob_deferred(planning, payload)?;
         }
     }
     let origin = generation.origin();
@@ -1149,8 +1137,8 @@ fn generation_payload(
             sha256: digest(origin.repomd_url().as_bytes()),
         },
         repomd: crate::model::PlanningBytes::from_verified(generation.repomd()),
-        primary: crate::model::PlanningBytes::from_verified(generation.primary()),
-        filelists: crate::model::PlanningBytes::from_verified(generation.filelists()),
+        primary: crate::model::PlanningBytes::from_verified_file(generation.primary()),
+        filelists: crate::model::PlanningBytes::from_verified_file(generation.filelists()),
         file_provides: Some(file_provides),
         group: auxiliary
             .group
@@ -1350,6 +1338,7 @@ fn prewarm_repository_generation_solv_cache(
     generation: &VerifiedCompleteGeneration,
     cache_root: &Path,
     architecture: Architecture,
+    pending_solv_commits: &mut Vec<PendingSolvCommit>,
 ) -> Result<(), PlanningError> {
     let (binding, binding_sha256) = repository_solv_cache_binding_from_parts(
         &repository.id,
@@ -1363,15 +1352,10 @@ fn prewarm_repository_generation_solv_cache(
     if main_ready {
         return Ok(());
     }
-    // libsolv's writers transiently retain an entire repository pool. Keep
-    // repository-level source validation parallel, but do not stack those
-    // high-memory native builders in one process.
-    static SOLV_BUILD_LIMIT: Mutex<()> = Mutex::new(());
-    let _build = SOLV_BUILD_LIMIT
-        .lock()
-        .map_err(|_| PlanningError::Io("repository solv-cache lock is poisoned".into()))?;
-    // A concurrent publisher may have completed the immutable entry while
-    // this worker waited for the in-process memory gate.
+    // Each worker owns an independent, thread-affine libsolv Pool. Building
+    // repository caches concurrently overlaps Fedora and updates parsing on
+    // multi-core hosts; the immutable cache commit still converges races by
+    // binding digest.
     main_ready = cache_entry_ready(&cache, &binding_sha256)?;
     if main_ready {
         return Ok(());
@@ -1388,12 +1372,19 @@ fn prewarm_repository_generation_solv_cache(
     let mut primary_output = std::fs::File::create(&primary_path)
         .map_err(|error| PlanningError::Io(error.to_string()))?;
     dnfast_metadata::copy_primary_record_verified(
-        generation.primary().bytes(),
+        generation
+            .primary()
+            .reader()
+            .map_err(|error| PlanningError::Cache(error.to_string()))?,
         &records.primary,
         &mut primary_output,
     )
     .map_err(|error| PlanningError::Input(error.to_string()))?;
     drop(primary_output);
+    trace_memory(&format!(
+        "planning:solv-build-{}-primary-ready",
+        repository.id
+    ));
     std::fs::write(&filelists, []).map_err(|error| PlanningError::Io(error.to_string()))?;
     let path = |value: &Path| {
         value
@@ -1414,18 +1405,53 @@ fn prewarm_repository_generation_solv_cache(
                 .map_err(|error| PlanningError::Input(error.to_string()))?,
         })
         .map_err(|error| PlanningError::Input(error.to_string()))?;
+    trace_memory(&format!(
+        "planning:solv-build-{}-repository-loaded",
+        repository.id
+    ));
     let staged = cache
         .stage(&binding_sha256)
         .map_err(|error| PlanningError::Cache(error.to_string()))?;
     context
         .write_repository_solv(&repository.id, staged.file(), &binding)
         .map_err(|error| PlanningError::Input(error.to_string()))?;
-    staged
-        .commit()
-        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    trace_memory(&format!("planning:solv-build-{}-serialized", repository.id));
     drop(context);
-    dnfast_native::release_unused_memory();
+    // Tiny repositories do not create a meaningful retained arena, while a
+    // global malloc trim costs hundreds of milliseconds on this scale. Large
+    // primary repositories still trim before the next sequential pool.
+    if generation.primary().size() >= 1024 * 1024 {
+        dnfast_native::release_unused_memory();
+    }
+    let repository_id = repository.id.clone();
+    let worker = std::thread::spawn(move || {
+        staged
+            .commit()
+            .map(|_| ())
+            .map_err(|error| PlanningError::Cache(error.to_string()))
+    });
+    pending_solv_commits.push(PendingSolvCommit {
+        repository_id,
+        worker,
+    });
     trace_memory(&format!("planning:solv-build-{}-end", repository.id));
+    Ok(())
+}
+
+struct PendingSolvCommit {
+    repository_id: String,
+    worker: std::thread::JoinHandle<Result<(), PlanningError>>,
+}
+
+fn join_solv_commits(commits: Vec<PendingSolvCommit>) -> Result<(), PlanningError> {
+    for commit in commits {
+        commit.worker.join().map_err(|_| {
+            PlanningError::Io(format!(
+                "repository solv-cache commit worker panicked: {}",
+                commit.repository_id
+            ))
+        })??;
+    }
     Ok(())
 }
 

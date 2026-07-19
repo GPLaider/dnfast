@@ -5,7 +5,7 @@ use dnfast_metadata::AuxiliaryRecord;
 use crate::{
     Cache,
     fs_safety::{AnchoredDirectory, create_private_tree, sync_directory, write_synced},
-    model::{CacheError, VerifiedBytes, io_error, sha256, valid_digest},
+    model::{CacheError, VerifiedBytes, VerifiedSource, io_error, sha256, valid_digest},
 };
 
 const PAYLOAD_NAME: &str = "payload";
@@ -60,7 +60,8 @@ impl Cache {
             }
             other => other,
         })?;
-        let bytes = anchored.read(std::ffi::OsStr::new(PAYLOAD_NAME), record.size)?;
+        let (bytes, file) =
+            anchored.read_retained(std::ffi::OsStr::new(PAYLOAD_NAME), record.size)?;
         if bytes.len() as u64 != record.size || sha256(&bytes) != record.checksum {
             return Err(CacheError::Corrupt(
                 "auxiliary metadata object verification failed".into(),
@@ -70,6 +71,7 @@ impl Cache {
             sha256: record.checksum.clone(),
             size: record.size,
             bytes,
+            source: Some(VerifiedSource::new(file)?),
         })
     }
 }

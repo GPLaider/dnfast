@@ -36,8 +36,14 @@ fn verified_complete_generation_owns_revalidated_bytes_and_typed_origin() {
     // Then
     assert_eq!(generation.repository(), "main");
     assert_eq!(generation.repomd().bytes(), metadata.0);
-    assert_eq!(generation.primary().bytes(), metadata.1);
-    assert_eq!(generation.filelists().bytes(), metadata.2);
+    assert_eq!(
+        generation.primary().read_all().expect("primary"),
+        metadata.1
+    );
+    assert_eq!(
+        generation.filelists().read_all().expect("filelists"),
+        metadata.2
+    );
     assert_eq!(
         generation.origin().artifact_base(),
         "https://mirror.example/fedora"

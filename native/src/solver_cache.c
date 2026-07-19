@@ -237,8 +237,10 @@ dnfast_status dnfast_solver_write_repo_solv(
     if (writer == NULL) status = DNFAST_STATUS_NATIVE_FAILURE;
     if (writer != NULL) {
         repowriter_set_userdata(writer, userdata, (int)userdata_size);
-        if (repowriter_write(writer, stream) != 0 || fflush(stream) != 0 ||
-            fsync(fileno(stream)) != 0)
+        /* The Rust cache publication boundary hashes and fsyncs the retained
+           inode before linking it. Flushing stdio here is required for that
+           reader; a second fsync would only serialize the same bytes twice. */
+        if (repowriter_write(writer, stream) != 0 || fflush(stream) != 0)
             status = DNFAST_STATUS_NATIVE_FAILURE;
         repowriter_free(writer);
     }
@@ -349,8 +351,7 @@ dnfast_status dnfast_solver_write_repo_solv_extension(
         repowriter_set_repodatarange(writer, extension->repodataid,
                                      extension->repodataid + 1);
         repowriter_set_flags(writer, REPOWRITER_NO_STORAGE_SOLVABLE);
-        if (repowriter_write(writer, stream) != 0 || fflush(stream) != 0 ||
-            fsync(fileno(stream)) != 0)
+        if (repowriter_write(writer, stream) != 0 || fflush(stream) != 0)
             status = DNFAST_STATUS_NATIVE_FAILURE;
         repowriter_free(writer);
     }

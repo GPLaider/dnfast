@@ -22,6 +22,7 @@ pub use artifact_store::{ArtifactCache, ArtifactTransaction, CachedArtifact};
 pub use model::{
     CacheError, CompleteSnapshot, CurrentGenerationIdentity, OriginError, RepomdAuthentication,
     SelectedOrigin, Snapshot, SnapshotIntegrity, VerifiedBytes, VerifiedCompleteGeneration,
+    VerifiedFile, VerifiedFileReader,
 };
 pub use rpmdb_receipt::{
     RpmDbCurrentCheck, RpmDbCurrentReceipt, RpmDbReceiptCache, RpmDbReceiptCheck,

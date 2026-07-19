@@ -398,6 +398,14 @@ impl PlanningBytes {
         }
     }
 
+    pub(crate) fn from_verified_file(file: &dnfast_cache::VerifiedFile) -> Self {
+        Self {
+            sha256: file.sha256().into(),
+            size: file.size(),
+            base64: String::new(),
+        }
+    }
+
     pub(crate) fn decode_verified(
         &self,
         storage: Option<(&Path, u32)>,

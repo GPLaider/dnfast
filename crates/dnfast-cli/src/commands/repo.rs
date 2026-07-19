@@ -1,5 +1,6 @@
 use std::{
     path::PathBuf,
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +16,7 @@ use crate::{
     commands::AppFailure,
     environment::{repository_variables, system_repo_dirs},
     rendering::escaped_field,
+    response::{CLI_SCHEMA, Response, Status},
 };
 
 pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
@@ -57,11 +59,7 @@ pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
                 .refresh_with_metadata_trust(&repository.id, source, metadata_trust.as_ref())
                 .map_err(|error| error.to_string())
         },
-        |published_at_unix, refreshed_generations| {
-            publisher
-                .publish_after_verified_refresh(published_at_unix, refreshed_generations)
-                .map_err(|error| error.to_string())
-        },
+        publish_in_clean_process,
         now,
     )?;
     Ok(format!(
@@ -69,6 +67,82 @@ pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
         report.refreshed.join(", "),
         report.planning_snapshot,
     ))
+}
+
+/// Executes memory-heavy planning publication after an exec boundary. This
+/// prevents freed HTTP/XML arenas in the refresh coordinator from stacking
+/// with libsolv while preserving a one-shot, daemonless command.
+fn publish_in_clean_process(
+    published_at_unix: u64,
+    refreshed_generations: &[(String, String)],
+) -> Result<String, String> {
+    let mut command = Command::new("/proc/self/exe");
+    command
+        .arg("--json")
+        .arg("internal-publish-planning")
+        .arg("--published-at-unix")
+        .arg(published_at_unix.to_string())
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit());
+    if std::env::var_os("DNFAST_REFRESH_TRACE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        command.env("DNFAST_REFRESH_TRACE", "1");
+    }
+    for (repository, digest) in refreshed_generations {
+        command
+            .arg("--generation")
+            .arg(format!("{repository}={digest}"));
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("planning publisher exec failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "planning publisher failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim()
+        ));
+    }
+    let response: Response = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("planning publisher returned invalid JSON: {error}"))?;
+    if response.schema != CLI_SCHEMA
+        || response.command != "internal-publish-planning"
+        || response.status != Status::Planned
+        || response.exit_code != 0
+        || !response.errors.is_empty()
+    {
+        return Err("planning publisher returned a non-success response".into());
+    }
+    response
+        .message
+        .ok_or_else(|| "planning publisher omitted the snapshot digest".into())
+}
+
+pub(super) fn publish_internal(
+    published_at_unix: u64,
+    generations: Vec<String>,
+) -> Result<String, AppFailure> {
+    require_root_for("internal planning publication")?;
+    let mut parsed = generations
+        .into_iter()
+        .map(|generation| {
+            let (repository, digest) = generation.split_once('=').ok_or_else(|| {
+                AppFailure::new(2, "planning generation must be REPOSITORY=SHA256")
+            })?;
+            if repository.is_empty() || digest.is_empty() || digest.contains('=') {
+                return Err(AppFailure::new(
+                    2,
+                    "planning generation must be REPOSITORY=SHA256",
+                ));
+            }
+            Ok((repository.to_owned(), digest.to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    parsed.sort_by(|left, right| left.0.cmp(&right.0));
+    RootPlanningPublisher::system()
+        .map_err(planning_failure)?
+        .publish_after_verified_refresh(published_at_unix, &parsed)
+        .map_err(planning_failure)
 }
 
 fn expand_bootstrap_selection<Probe>(

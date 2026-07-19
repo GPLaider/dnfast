@@ -35,6 +35,14 @@ impl AnchoredDirectory {
     }
 
     pub(crate) fn read(&self, name: &std::ffi::OsStr, maximum: u64) -> Result<Vec<u8>, CacheError> {
+        self.read_retained(name, maximum).map(|(bytes, _)| bytes)
+    }
+
+    pub(crate) fn read_retained(
+        &self,
+        name: &std::ffi::OsStr,
+        maximum: u64,
+    ) -> Result<(Vec<u8>, File), CacheError> {
         let fd = openat(
             &self.fd,
             name,
@@ -42,7 +50,7 @@ impl AnchoredDirectory {
             Mode::empty(),
         )
         .map_err(errno)?;
-        read_owned(fd, maximum)
+        read_owned_retained(fd, maximum)
     }
 }
 
@@ -214,7 +222,7 @@ pub(crate) fn read_anchored(
     AnchoredDirectory::open(directory)?.read(name, maximum)
 }
 
-fn read_owned(fd: OwnedFd, maximum: u64) -> Result<Vec<u8>, CacheError> {
+fn read_owned_retained(fd: OwnedFd, maximum: u64) -> Result<(Vec<u8>, File), CacheError> {
     let before = fstat(&fd).map_err(errno)?;
     if before.st_nlink != 1
         || before.st_uid != rustix::process::geteuid().as_raw()
@@ -234,14 +242,31 @@ fn read_owned(fd: OwnedFd, maximum: u64) -> Result<Vec<u8>, CacheError> {
         return Err(CacheError::Corrupt("cache file exceeds limit".into()));
     }
     let mut bytes = Vec::with_capacity(capacity);
-    File::from(fd)
+    let mut file = File::from(fd);
+    Read::by_ref(&mut file)
         .take(limit)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
     if bytes.len() as u64 > maximum {
         return Err(CacheError::Corrupt("cache file exceeds limit".into()));
     }
-    Ok(bytes)
+    let after = fstat(&file).map_err(errno)?;
+    if before.st_dev != after.st_dev
+        || before.st_ino != after.st_ino
+        || before.st_mode != after.st_mode
+        || before.st_nlink != after.st_nlink
+        || before.st_uid != after.st_uid
+        || before.st_size != after.st_size
+        || before.st_mtime != after.st_mtime
+        || before.st_mtime_nsec != after.st_mtime_nsec
+        || before.st_ctime != after.st_ctime
+        || before.st_ctime_nsec != after.st_ctime_nsec
+    {
+        return Err(CacheError::Corrupt(
+            "cache file changed while it was verified".into(),
+        ));
+    }
+    Ok((bytes, file))
 }
 
 pub(crate) fn verify_file(
@@ -262,6 +287,26 @@ pub(crate) fn verify_file(
         )));
     }
     Ok(bytes)
+}
+
+pub(crate) fn verify_file_retained(
+    directory: &AnchoredDirectory,
+    record: &FileRecord,
+) -> Result<(Vec<u8>, File), CacheError> {
+    validate_name(&record.name)?;
+    if record.size > MAX_OBJECT_FILE_BYTES {
+        return Err(CacheError::Corrupt(
+            "object file exceeds global limit".into(),
+        ));
+    }
+    let (bytes, file) = directory.read_retained(std::ffi::OsStr::new(&record.name), record.size)?;
+    if bytes.len() as u64 != record.size || sha256(&bytes) != record.sha256 {
+        return Err(CacheError::Corrupt(format!(
+            "object verification failed: {}",
+            record.name
+        )));
+    }
+    Ok((bytes, file))
 }
 
 pub(crate) fn validate_name(name: &str) -> Result<(), CacheError> {

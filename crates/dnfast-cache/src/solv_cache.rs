@@ -104,8 +104,12 @@ impl StagedSolv {
     }
 
     pub fn commit(mut self) -> Result<CachedSolv, CacheError> {
-        self.file.sync_all().map_err(io_error)?;
+        // Hash the private inode first. Serialization has already dirtied all
+        // of its pages, so this CPU pass can overlap kernel writeback instead
+        // of blocking on a barrier and then rereading the same pages. Nothing
+        // becomes reachable until the subsequent durability barrier succeeds.
         let (sha256, size) = verify_stream(&mut self.file, None)?;
+        self.file.sync_all().map_err(io_error)?;
         let content_name = format!("{}-{sha256}.solv", self.binding);
         match linkat(
             &self.file,
@@ -133,7 +137,16 @@ impl StagedSolv {
             Ok(()) | Err(rustix::io::Errno::NOENT) => {}
             Err(error) => return Err(errno(error)),
         }
-        let existing = open_content(&self.directory, &self.binding, &content_name, &sha256)?;
+        // The final directory fsync below makes the content link, integrity
+        // cookie, and binding reference durable as one atomic cache batch.
+        // Avoid a redundant directory barrier inside cookie publication.
+        let existing = open_content_inner(
+            &self.directory,
+            &self.binding,
+            &content_name,
+            &sha256,
+            false,
+        )?;
         if existing.size != size {
             return Err(CacheError::Corrupt(
                 "published solv cache size differs".into(),
@@ -298,6 +311,16 @@ fn open_content(
     name: &str,
     expected_sha256: &str,
 ) -> Result<CachedSolv, CacheError> {
+    open_content_inner(directory, binding, name, expected_sha256, true)
+}
+
+fn open_content_inner(
+    directory: &OwnedFd,
+    binding: &str,
+    name: &str,
+    expected_sha256: &str,
+    sync_cookie_directory: bool,
+) -> Result<CachedSolv, CacheError> {
     let fd = match openat(
         directory,
         name,
@@ -388,6 +411,7 @@ fn open_content(
                     generation: FileGeneration::from_stat(&after_hash),
                     protection,
                 },
+                sync_cookie_directory,
             )?;
             match protection {
                 IntegrityProtection::FsVerity(_) => SolvVerification::FsVerity,
@@ -453,6 +477,7 @@ fn publish_integrity_cookie(
     directory: &OwnedFd,
     name: &str,
     cookie: &IntegrityCookie,
+    sync_directory: bool,
 ) -> Result<(), CacheError> {
     let (protection, digest) = match cookie.protection {
         IntegrityProtection::FsVerity(digest) => ("fsverity-sha256", hex::encode(digest)),
@@ -503,7 +528,10 @@ fn publish_integrity_cookie(
         }
         Err(error) => return Err(errno(error)),
     }
-    fsync(directory).map_err(errno)
+    if sync_directory {
+        fsync(directory).map_err(errno)?;
+    }
+    Ok(())
 }
 
 fn read_integrity_cookie(directory: &OwnedFd, name: &str) -> Result<IntegrityCookie, CacheError> {

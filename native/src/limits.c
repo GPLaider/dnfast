@@ -91,18 +91,21 @@ dnfast_status dnfast_limits_finalize_loaded_repo(dnfast_context *context,
     static const Id keys[] = {SOLVABLE_PROVIDES, SOLVABLE_REQUIRES,
         SOLVABLE_RECOMMENDS, SOLVABLE_SUGGESTS, SOLVABLE_SUPPLEMENTS,
         SOLVABLE_ENHANCES, SOLVABLE_CONFLICTS, SOLVABLE_OBSOLETES};
+    Queue values;
+    queue_init(&values);
     for (Id id = repo->start; id < repo->end; ++id) {
         uint64_t relations = 0;
         for (size_t key = 0; key < sizeof(keys) / sizeof(keys[0]); ++key) {
-            Queue values;
-            queue_init(&values);
+            queue_empty(&values);
             solvable_lookup_idarray(pool_id2solvable(context->pool, id), keys[key], &values);
             relations += (uint64_t)values.count;
-            queue_free(&values);
         }
-        if (relations > context->limits.max_relations_per_package)
+        if (relations > context->limits.max_relations_per_package) {
+            queue_free(&values);
             goto relation_limit;
+        }
     }
+    queue_free(&values);
     return dnfast_limits_accept_validated_repo(context, repo, metadata_bytes,
                                                error);
 relation_limit:

@@ -6,6 +6,7 @@ use quick_xml::{
     reader::NsReader,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     MAX_FILE_PATHS, MAX_FILES_PER_PACKAGE, MAX_XML_TEXT_BYTES, MetadataError,
@@ -64,7 +65,7 @@ pub struct Package {
     pub summary: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PrimaryPackageIdentity {
     pub checksum: String,
     pub name: String,
@@ -74,10 +75,17 @@ pub struct PrimaryPackageIdentity {
     pub release: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrimaryFileRecord {
+    pub path_sha256: [u8; 32],
+    pub package_ordinal: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedPrimary {
     pub packages: Vec<Package>,
     pub identities: Vec<PrimaryPackageIdentity>,
+    pub primary_files: Vec<PrimaryFileRecord>,
 }
 
 impl Package {
@@ -127,6 +135,7 @@ struct State {
     packages: Vec<CompletePackage>,
     search_packages: Vec<Package>,
     identities: Vec<PrimaryPackageIdentity>,
+    primary_files: Vec<PrimaryFileRecord>,
     retain_complete: bool,
     parsed_packages: u64,
     root_seen: bool,
@@ -165,6 +174,7 @@ pub fn parse_primary_validated<R: Read>(input: R) -> Result<ValidatedPrimary, Me
     Ok(ValidatedPrimary {
         packages: state.search_packages,
         identities: state.identities,
+        primary_files: state.primary_files,
     })
 }
 
@@ -440,6 +450,18 @@ impl State {
         } else {
             builder.epoch
         };
+        if !self.retain_complete {
+            let package_ordinal = u32::try_from(self.parsed_packages)
+                .map_err(|error| MetadataError::InvalidNumber(error.to_string()))?;
+            self.primary_files
+                .try_reserve(builder.files.len())
+                .map_err(|error| MetadataError::Io(error.to_string()))?;
+            self.primary_files
+                .extend(builder.files.iter().map(|path| PrimaryFileRecord {
+                    path_sha256: Sha256::digest(path.as_bytes()).into(),
+                    package_ordinal,
+                }));
+        }
         if self.retain_complete {
             self.packages.push(CompletePackage {
                 name: builder.name,

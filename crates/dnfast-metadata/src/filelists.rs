@@ -174,6 +174,306 @@ pub(crate) fn visit_filelists_xml_identities<R: BufRead>(
     validate_filelists_identities(primary, &filelists)
 }
 
+/// Scans a filelists document that has already passed the complete structural
+/// and primary-identity validation gate. The caller still supplies a reader
+/// that verifies the compressed and opened repomd checksums through EOF; this
+/// tokenizer only avoids rebuilding the full XML event graph for one exact
+/// path lookup.
+pub(crate) fn scan_validated_filelists_xml_path<R: BufRead>(
+    mut input: R,
+    target: &str,
+) -> Result<Vec<String>, MetadataError> {
+    let mut scanner = ValidatedPathScanner::new(target);
+    let mut buffer = [0_u8; 256 * 1024];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| MetadataError::Io(error.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        scanner.push(&buffer[..count])?;
+    }
+    scanner.finish()
+}
+
+struct ValidatedPathScanner<'a> {
+    target: &'a str,
+    tag: Vec<u8>,
+    file: Vec<u8>,
+    file_length: usize,
+    file_matches: bool,
+    file_complex: bool,
+    package_id: Option<String>,
+    providers: Vec<String>,
+    file_active: bool,
+    state: LexicalState,
+    quote: Option<u8>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LexicalState {
+    Text,
+    Tag,
+    Comment,
+    ProcessingInstruction,
+}
+
+impl<'a> ValidatedPathScanner<'a> {
+    fn new(target: &'a str) -> Self {
+        Self {
+            target,
+            tag: Vec::with_capacity(256),
+            file: Vec::with_capacity(256),
+            file_length: 0,
+            file_matches: true,
+            file_complex: false,
+            package_id: None,
+            providers: Vec::new(),
+            file_active: false,
+            state: LexicalState::Text,
+            quote: None,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), MetadataError> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if self.state == LexicalState::Text {
+                let remaining = &bytes[offset..];
+                let text_length = memchr::memchr(b'<', remaining).unwrap_or(remaining.len());
+                if self.file_active && text_length != 0 {
+                    self.push_file_bytes(&remaining[..text_length])?;
+                }
+                offset += text_length;
+                if offset == bytes.len() {
+                    break;
+                }
+                self.tag.clear();
+                self.quote = None;
+                self.state = LexicalState::Tag;
+                offset += 1;
+                // Regular file entries dominate Fedora filelists. Consume
+                // their two validated common tags as slices instead of
+                // growing and comparing a Vec byte by byte. A tag split at a
+                // reader boundary safely falls back to the lexical machine.
+                let tag = &bytes[offset..];
+                if tag.starts_with(b"file>") {
+                    self.begin_file();
+                    self.state = LexicalState::Text;
+                    offset += b"file>".len();
+                } else if tag.starts_with(b"/file>") {
+                    self.end_file()?;
+                    self.state = LexicalState::Text;
+                    offset += b"/file>".len();
+                }
+                continue;
+            }
+            let byte = bytes[offset];
+            offset += 1;
+            match self.state {
+                LexicalState::Text => unreachable!("text is handled in bulk"),
+                LexicalState::Tag => {
+                    self.tag.push(byte);
+                    if self.tag == b"!--" {
+                        self.state = LexicalState::Comment;
+                    } else if self.tag == b"?" {
+                        self.state = LexicalState::ProcessingInstruction;
+                    } else if let Some(quote) = self.quote {
+                        if byte == quote {
+                            self.quote = None;
+                        }
+                    } else if matches!(byte, b'\'' | b'"') {
+                        self.quote = Some(byte);
+                    } else if byte == b'>' {
+                        self.finish_tag()?;
+                        self.state = LexicalState::Text;
+                    }
+                }
+                LexicalState::Comment => {
+                    self.tag.push(byte);
+                    if self.tag.ends_with(b"-->") {
+                        self.state = LexicalState::Text;
+                    }
+                }
+                LexicalState::ProcessingInstruction => {
+                    self.tag.push(byte);
+                    if self.tag.ends_with(b"?>") {
+                        self.state = LexicalState::Text;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn push_file_bytes(&mut self, bytes: &[u8]) -> Result<(), MetadataError> {
+        let previous_length = self.file_length;
+        self.file_length = self
+            .file_length
+            .checked_add(bytes.len())
+            .ok_or_else(|| MetadataError::Xml("file path length overflow".into()))?;
+        checked_limit(
+            self.file_length as u64,
+            MAX_XML_TEXT_BYTES as u64,
+            "XML text",
+        )?;
+        if self.file_complex {
+            self.file.extend_from_slice(bytes);
+        } else if !self.file_matches {
+            return Ok(());
+        } else if let Some(ampersand) = memchr::memchr(b'&', bytes) {
+            let prefix_end = previous_length + ampersand;
+            self.file_matches &= self.target.as_bytes().get(previous_length..prefix_end)
+                == Some(&bytes[..ampersand]);
+            if !self.file_matches || prefix_end > self.target.len() {
+                return Ok(());
+            }
+            self.file_complex = true;
+            self.file
+                .extend_from_slice(&self.target.as_bytes()[..prefix_end]);
+            self.file.extend_from_slice(&bytes[ampersand..]);
+        } else {
+            self.file_matches = self
+                .target
+                .as_bytes()
+                .get(previous_length..self.file_length)
+                == Some(bytes);
+        }
+        Ok(())
+    }
+
+    fn finish_tag(&mut self) -> Result<(), MetadataError> {
+        let tag = self.tag.strip_suffix(b">").unwrap_or(&self.tag);
+        if tag_name(tag, b"package") {
+            self.package_id = Some(required_raw_attribute(tag, b"pkgid")?);
+        } else if tag
+            .strip_prefix(b"/")
+            .is_some_and(|tag| tag_name(tag, b"package"))
+        {
+            self.package_id = None;
+        } else if tag_name(tag, b"file") {
+            self.begin_file();
+        } else if tag
+            .strip_prefix(b"/")
+            .is_some_and(|tag| tag_name(tag, b"file"))
+        {
+            self.end_file()?;
+        }
+        Ok(())
+    }
+
+    fn begin_file(&mut self) {
+        self.file.clear();
+        self.file_length = 0;
+        self.file_matches = true;
+        self.file_complex = false;
+        self.file_active = true;
+    }
+
+    fn end_file(&mut self) -> Result<(), MetadataError> {
+        if !self.file_active {
+            return Ok(());
+        }
+        let matched = if self.file_complex {
+            let raw = std::str::from_utf8(&self.file)
+                .map_err(|error| MetadataError::Xml(error.to_string()))?;
+            quick_xml::escape::unescape(raw)
+                .map_err(|error| MetadataError::Xml(error.to_string()))?
+                == self.target
+        } else {
+            self.file_matches && self.file_length == self.target.len()
+        };
+        if matched {
+            let package_id = self
+                .package_id
+                .as_ref()
+                .ok_or_else(|| MetadataError::Xml("file outside filelists package".into()))?;
+            self.providers.push(package_id.clone());
+        }
+        self.file_active = false;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<String>, MetadataError> {
+        if self.state != LexicalState::Text || self.file_active || self.package_id.is_some() {
+            return Err(MetadataError::Xml(
+                "validated filelists scan ended inside an element".into(),
+            ));
+        }
+        self.providers.sort();
+        self.providers.dedup();
+        Ok(self.providers)
+    }
+}
+
+fn tag_name(tag: &[u8], expected: &[u8]) -> bool {
+    tag.starts_with(expected)
+        && tag
+            .get(expected.len())
+            .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'/' || *byte == b'>')
+}
+
+fn required_raw_attribute(tag: &[u8], expected: &[u8]) -> Result<String, MetadataError> {
+    let mut offset = tag
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .ok_or_else(|| MetadataError::Xml("package attributes are absent".into()))?;
+    while offset < tag.len() {
+        while tag
+            .get(offset)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            offset += 1;
+        }
+        let name_start = offset;
+        while tag
+            .get(offset)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+        {
+            offset += 1;
+        }
+        let name = &tag[name_start..offset];
+        while tag
+            .get(offset)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            offset += 1;
+        }
+        if tag.get(offset) != Some(&b'=') {
+            return Err(MetadataError::Xml("invalid package attribute".into()));
+        }
+        offset += 1;
+        while tag
+            .get(offset)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            offset += 1;
+        }
+        let quote = *tag
+            .get(offset)
+            .filter(|byte| matches!(byte, b'\'' | b'"'))
+            .ok_or_else(|| MetadataError::Xml("unquoted package attribute".into()))?;
+        offset += 1;
+        let value_start = offset;
+        while tag.get(offset).is_some_and(|byte| *byte != quote) {
+            offset += 1;
+        }
+        let raw = tag
+            .get(value_start..offset)
+            .ok_or_else(|| MetadataError::Xml("incomplete package attribute".into()))?;
+        offset += 1;
+        if name == expected {
+            let raw =
+                std::str::from_utf8(raw).map_err(|error| MetadataError::Xml(error.to_string()))?;
+            return quick_xml::escape::unescape(raw)
+                .map(|value| value.into_owned())
+                .map_err(|error| MetadataError::Xml(error.to_string()));
+        }
+    }
+    Err(MetadataError::Xml("missing required attribute".into()))
+}
+
 fn parse_filelists_with_mode<'a, R: BufRead>(
     input: R,
     retain_files: bool,

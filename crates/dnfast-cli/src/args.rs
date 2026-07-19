@@ -35,6 +35,13 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    #[command(hide = true)]
+    InternalPublishPlanning {
+        #[arg(long)]
+        published_at_unix: u64,
+        #[arg(long = "generation", value_name = "REPOSITORY=SHA256")]
+        generations: Vec<String>,
+    },
     #[command(about = "Solve package intent and write a reviewable plan without changing packages")]
     Plan {
         #[arg(value_enum)]

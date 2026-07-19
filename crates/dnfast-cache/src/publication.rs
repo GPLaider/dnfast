@@ -6,6 +6,7 @@ use dnfast_metadata::{
     parse_repomd_records, validate_filelists_generation, validate_filelists_record_identities,
     validate_primary_record,
 };
+use sha2::Digest;
 
 use crate::{
     Cache,
@@ -70,6 +71,8 @@ impl Cache {
             primary,
             packages: &packages,
             solver_inputs: None,
+            primary_identities: None,
+            primary_files: None,
             filelists_bytes: None,
             filelists: None,
             source_origin: None,
@@ -132,12 +135,19 @@ impl Cache {
             parse_filelists_record(filelists, &records.filelists).map_err(metadata_error)?;
         validate_filelists_generation(&solver_inputs, &filelist_inputs).map_err(metadata_error)?;
         let packages = solver_inputs.iter().map(search_package).collect::<Vec<_>>();
+        let primary_identities = solver_inputs
+            .iter()
+            .map(primary_identity)
+            .collect::<Vec<_>>();
+        let primary_files = primary_file_records(&solver_inputs)?;
         self.publish_generation(Publication {
             repository,
             repomd,
             primary,
             packages: &packages,
             solver_inputs: Some(&solver_inputs),
+            primary_identities: Some(&primary_identities),
+            primary_files: Some(&primary_files),
             filelists_bytes: Some(filelists),
             filelists: Some(&filelist_inputs),
             integrity: SnapshotIntegrity::CompleteMetadata,
@@ -169,12 +179,16 @@ impl Cache {
             .map_err(metadata_error)?;
         trace_memory(&format!("cache:{repository}:filelists-validated"));
         let packages = validated.packages;
+        let primary_identities = validated.identities;
+        let primary_files = validated.primary_files;
         let snapshot = self.publish_generation(Publication {
             repository,
             repomd,
             primary,
             packages: &packages,
             solver_inputs: None,
+            primary_identities: Some(&primary_identities),
+            primary_files: Some(&primary_files),
             filelists_bytes: Some(filelists),
             filelists: None,
             integrity: SnapshotIntegrity::CompleteMetadata,
@@ -253,7 +267,7 @@ impl Cache {
         let search_json = json(input.packages)?;
         let repository = write_verified(staging.path(), "repo-id", input.repository.as_bytes())?;
         let mut manifest = Manifest {
-            version: 3,
+            version: 5,
             repomd: write_verified(staging.path(), "repomd.xml", input.repomd)?,
             primary: write_verified(staging.path(), "primary", input.primary)?,
             search_index: write_verified(staging.path(), "packages.json", &search_json)?,
@@ -262,10 +276,26 @@ impl Cache {
             filelists: None,
             filelists_index: None,
             solver_inputs: None,
+            primary_identities: None,
+            primary_files: None,
             source_origin: None,
         };
         if let Some(bytes) = input.filelists_bytes {
             manifest.filelists = Some(write_verified(staging.path(), "filelists", bytes)?);
+        }
+        if let Some(identities) = input.primary_identities {
+            manifest.primary_identities = Some(write_verified(
+                staging.path(),
+                "primary-identities.json",
+                &json(identities)?,
+            )?);
+        }
+        if let Some(primary_files) = input.primary_files {
+            manifest.primary_files = Some(write_verified(
+                staging.path(),
+                "primary-files.bin",
+                &encode_primary_files(primary_files)?,
+            )?);
         }
         if let Some(origin) = input.source_origin {
             manifest.source_origin = Some(write_verified(
@@ -361,6 +391,8 @@ struct Publication<'a> {
     primary: &'a [u8],
     packages: &'a [Package],
     solver_inputs: Option<&'a [CompletePackage]>,
+    primary_identities: Option<&'a [dnfast_metadata::PrimaryPackageIdentity]>,
+    primary_files: Option<&'a [dnfast_metadata::PrimaryFileRecord]>,
     filelists_bytes: Option<&'a [u8]>,
     filelists: Option<&'a [FileListPackage]>,
     integrity: SnapshotIntegrity,
@@ -377,6 +409,67 @@ fn search_package(record: &CompletePackage) -> Package {
         release: record.release.clone(),
         summary: record.summary.clone(),
     }
+}
+
+fn primary_identity(record: &CompletePackage) -> dnfast_metadata::PrimaryPackageIdentity {
+    dnfast_metadata::PrimaryPackageIdentity {
+        checksum: record.checksum.clone(),
+        name: record.name.clone(),
+        arch: record.arch.clone(),
+        epoch: record.epoch.clone(),
+        version: record.version.clone(),
+        release: record.release.clone(),
+    }
+}
+
+fn primary_file_records(
+    packages: &[CompletePackage],
+) -> Result<Vec<dnfast_metadata::PrimaryFileRecord>, CacheError> {
+    let capacity = packages.iter().try_fold(0_usize, |count, package| {
+        count
+            .checked_add(package.files.len())
+            .ok_or_else(|| CacheError::Corrupt("primary file count overflow".into()))
+    })?;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(capacity)
+        .map_err(|error| CacheError::Io(error.to_string()))?;
+    for (ordinal, package) in packages.iter().enumerate() {
+        let package_ordinal =
+            u32::try_from(ordinal).map_err(|error| CacheError::Corrupt(error.to_string()))?;
+        records.extend(
+            package
+                .files
+                .iter()
+                .map(|path| dnfast_metadata::PrimaryFileRecord {
+                    path_sha256: sha2::Sha256::digest(path.as_bytes()).into(),
+                    package_ordinal,
+                }),
+        );
+    }
+    Ok(records)
+}
+
+fn encode_primary_files(
+    records: &[dnfast_metadata::PrimaryFileRecord],
+) -> Result<Vec<u8>, CacheError> {
+    const RECORD_SIZE: usize = 32 + std::mem::size_of::<u32>();
+    let mut records = records.to_vec();
+    records.sort_unstable_by_key(|record| (record.path_sha256, record.package_ordinal));
+    records.dedup();
+    let capacity = records
+        .len()
+        .checked_mul(RECORD_SIZE)
+        .ok_or_else(|| CacheError::Corrupt("primary file projection size overflow".into()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|error| CacheError::Io(error.to_string()))?;
+    for record in records {
+        bytes.extend_from_slice(&record.path_sha256);
+        bytes.extend_from_slice(&record.package_ordinal.to_be_bytes());
+    }
+    Ok(bytes)
 }
 
 fn json<T: serde::Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CacheError> {

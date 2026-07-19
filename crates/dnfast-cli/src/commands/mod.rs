@@ -61,6 +61,11 @@ impl AppFailure {
 
 pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
     match command {
+        Commands::InternalPublishPlanning {
+            published_at_unix,
+            generations,
+        } => repo::publish_internal(published_at_unix, generations)
+            .map(|message| Response::completed("internal-publish-planning", message)),
         Commands::Plan {
             action,
             output,
@@ -143,6 +148,7 @@ pub(crate) fn run(command: Commands) -> Result<Response, AppFailure> {
 
 pub(crate) fn name(command: &Commands) -> &'static str {
     match command {
+        Commands::InternalPublishPlanning { .. } => "internal-publish-planning",
         Commands::Plan { .. } => "plan",
         Commands::Apply { .. } => "apply",
         Commands::Install(_) => "install",

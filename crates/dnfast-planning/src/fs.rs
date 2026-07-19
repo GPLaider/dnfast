@@ -161,6 +161,22 @@ impl TrustedDirectory {
         Ok(Some(bytes))
     }
 
+    pub(crate) fn open_file(&self, name: &str) -> Result<File, PlanningError> {
+        self.recheck()?;
+        validate_name(name)?;
+        let fd = openat2(
+            &self.fd,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .map_err(io)?;
+        validate_regular(&fd, self.owner)?;
+        self.recheck()?;
+        Ok(File::from(fd))
+    }
+
     pub(crate) fn recheck(&self) -> Result<(), PlanningError> {
         validate_directory(&self.fd, self.owner)?;
         if identity(&self.fd)? != self.identity {

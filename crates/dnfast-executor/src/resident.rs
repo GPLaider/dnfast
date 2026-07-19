@@ -1028,6 +1028,24 @@ impl ResidentPlanner {
         if !packages.iter().any(|package| package.starts_with('/')) {
             return Ok(false);
         }
+        if action == Action::Install {
+            let snapshot = PlanningSnapshot::open_system().map_err(planning)?;
+            let integrity = snapshot
+                .integrity_for_repositories(repositories)
+                .map_err(planning)?;
+            let selected = selected_repositories(&snapshot, &integrity)?;
+            // A checksum-bound file-provides capability means the mapped
+            // selector path can answer every missing primary provide.  No
+            // native pool is needed merely to decide whether the legacy full
+            // filelists fallback is required; solve() will bind ordinals to
+            // the same snapshot digest before using them.
+            if selected
+                .iter()
+                .all(|repository| repository.file_provides.is_some())
+            {
+                return Ok(false);
+            }
+        }
         self.ensure(repositories)?;
         let cached = self.cached.as_ref().expect("resident pool");
         let missing_from_primary = packages.iter().try_fold(false, |missing, selector| {
@@ -1063,7 +1081,27 @@ impl ResidentPlanner {
             .collect::<Result<Vec<_>, _>>()
             .map_err(planning)?;
         let intent = TransactionIntent::new(action, packages).map_err(planning)?;
-        self.ensure(repositories)?;
+        let prefetch = (self.cached.is_none()
+            && intent
+                .packages()
+                .iter()
+                .any(|package| package.as_str().starts_with('/')))
+        .then(|| {
+            spawn_file_selector_prefetch(
+                intent
+                    .packages()
+                    .iter()
+                    .map(|package| package.as_str().to_owned())
+                    .collect(),
+                repositories.to_vec(),
+            )
+        });
+        if let Err(error) = self.ensure(repositories) {
+            if let Some(prefetch) = prefetch {
+                let _ = prefetch.join();
+            }
+            return Err(error);
+        }
         trace_phase(trace, started, "resident-ensure");
         let cached = self.cached.as_mut().expect("resident pool");
         let names = intent
@@ -1097,7 +1135,42 @@ impl ResidentPlanner {
             });
         }
         let policy = cached.policy.clone();
-        let mapped = mapped_file_selectors(cached, &names)?;
+        let every_absolute_selector_is_primary =
+            names.iter().try_fold(true, |all_primary, selector| {
+                if !all_primary || !selector.starts_with('/') {
+                    Ok(all_primary)
+                } else {
+                    cached.context.has_provider(selector).map_err(planning)
+                }
+            })?;
+        let mapped = match prefetch {
+            Some(prefetch) if every_absolute_selector_is_primary => {
+                // Primary metadata is already checksum-bound to this exact
+                // resident pool.  The speculative filelists reader is
+                // read-only, so detaching it is safe and process exit will
+                // stop it; waiting would make common /usr/bin selectors pay
+                // the cost of scanning filelists they never consume.
+                drop(prefetch);
+                trace_phase(trace, started, "resident-file-prefetch-unneeded");
+                Vec::new()
+            }
+            Some(prefetch) => {
+                let prefetched = prefetch.join().map_err(|_| {
+                    DaemonError::Planning("file selector prefetch worker panicked".into())
+                })??;
+                trace_phase(trace, started, "resident-file-prefetch-joined");
+                if prefetched.snapshot_sha256
+                    == cached.integrity.planning_snapshot_sha256().as_str()
+                {
+                    mapped_file_selectors_from_prefetch(cached, &names, prefetched)?
+                } else {
+                    // A root publisher replaced current while the two readers
+                    // were opening it.  Never mix ordinals across generations.
+                    mapped_file_selectors(cached, &names)?
+                }
+            }
+            None => mapped_file_selectors(cached, &names)?,
+        };
         let result = match action {
             Action::Install if mapped.is_empty() => {
                 cached
@@ -2020,12 +2093,28 @@ fn mapped_file_selectors(
             continue;
         }
         let mut providers = Vec::new();
-        for repository in &cached.repositories {
-            for ordinal in cached
-                .snapshot
-                .file_providers(repository, selector)
-                .map_err(planning)?
-            {
+        let provider_ordinals = std::thread::scope(|scope| {
+            let handles = cached
+                .repositories
+                .iter()
+                .map(|repository| {
+                    scope.spawn(|| cached.snapshot.file_providers(repository, selector))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| {
+                            DaemonError::Planning("filelists scan worker panicked".into())
+                        })?
+                        .map_err(planning)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        for (repository, ordinals) in cached.repositories.iter().zip(provider_ordinals) {
+            for ordinal in ordinals {
                 let package = cached
                     .context
                     .repository_package_evidence(&repository.id, ordinal as usize)
@@ -2047,6 +2136,123 @@ fn mapped_file_selectors(
             providers.dedup();
             mapped.push(MappedSelector {
                 selector_index,
+                providers,
+            });
+        }
+    }
+    Ok(mapped)
+}
+
+struct PrefetchedFileSelectors {
+    snapshot_sha256: String,
+    selectors: Vec<PrefetchedFileSelector>,
+}
+
+struct PrefetchedFileSelector {
+    selector_index: usize,
+    repositories: Vec<(String, Vec<u32>)>,
+}
+
+fn spawn_file_selector_prefetch(
+    names: Vec<String>,
+    repository_ids: Vec<String>,
+) -> std::thread::JoinHandle<Result<PrefetchedFileSelectors, DaemonError>> {
+    std::thread::spawn(move || {
+        let snapshot = PlanningSnapshot::open_system().map_err(planning)?;
+        let snapshot_sha256 = snapshot.digest().map_err(planning)?;
+        let integrity = snapshot
+            .integrity_for_repositories(&repository_ids)
+            .map_err(planning)?;
+        let repositories = selected_repositories(&snapshot, &integrity)?;
+        let mut selectors = Vec::new();
+        for (selector_index, selector) in names.iter().enumerate() {
+            if !selector.starts_with('/') {
+                continue;
+            }
+            let ordinals = std::thread::scope(|scope| {
+                let workers = repositories
+                    .iter()
+                    .map(|repository| {
+                        let repository_id = repository.id.clone();
+                        let snapshot = &snapshot;
+                        scope.spawn(move || {
+                            snapshot
+                                .file_providers(repository, selector)
+                                .map(|ordinals| (repository_id, ordinals))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .map_err(|_| {
+                                DaemonError::Planning("filelists scan worker panicked".into())
+                            })?
+                            .map_err(planning)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            selectors.push(PrefetchedFileSelector {
+                selector_index,
+                repositories: ordinals,
+            });
+        }
+        Ok(PrefetchedFileSelectors {
+            snapshot_sha256,
+            selectors,
+        })
+    })
+}
+
+fn mapped_file_selectors_from_prefetch(
+    cached: &mut ResidentPool,
+    names: &[&str],
+    prefetched: PrefetchedFileSelectors,
+) -> Result<Vec<MappedSelector>, DaemonError> {
+    let mut mapped = Vec::new();
+    for selector in prefetched.selectors {
+        let requested = names.get(selector.selector_index).ok_or_else(|| {
+            DaemonError::Planning("prefetched file selector index changed".into())
+        })?;
+        if !requested.starts_with('/')
+            || cached.context.has_provider(requested).map_err(planning)?
+        {
+            continue;
+        }
+        let mut providers = Vec::new();
+        for (repository_id, ordinals) in selector.repositories {
+            let repository = cached
+                .repositories
+                .iter()
+                .find(|repository| repository.id == repository_id)
+                .ok_or_else(|| {
+                    DaemonError::Planning(
+                        "prefetched repository differs from resident selection".into(),
+                    )
+                })?;
+            for ordinal in ordinals {
+                let package = cached
+                    .context
+                    .repository_package_evidence(&repository.id, ordinal as usize)
+                    .map_err(planning)?;
+                providers.push(FileProvider {
+                    repository_id: repository.id.clone(),
+                    package_ordinal: ordinal,
+                    expected_identity: native_package_identity(&package)?,
+                });
+            }
+        }
+        if !providers.is_empty() {
+            providers.sort_by(|left, right| {
+                left.repository_id
+                    .cmp(&right.repository_id)
+                    .then_with(|| left.package_ordinal.cmp(&right.package_ordinal))
+            });
+            providers.dedup();
+            mapped.push(MappedSelector {
+                selector_index: selector.selector_index,
                 providers,
             });
         }

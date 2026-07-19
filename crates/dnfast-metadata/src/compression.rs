@@ -219,6 +219,77 @@ pub fn visit_filelists_record_identities<R: Read>(
     )
 }
 
+pub fn scan_validated_filelists_record_path<R: Read>(
+    input: R,
+    record: &MetadataRecord,
+    target: &str,
+) -> Result<Vec<String>, MetadataError> {
+    crate::filelists::scan_validated_filelists_xml_path(
+        verified_filelists_reader(input, record)?,
+        target,
+    )
+}
+
+/// Scans filelists bytes whose complete opened XML was already validated when
+/// a root-owned immutable capability was published. The compressed SHA-256
+/// and both exact sizes are revalidated while streaming; only the redundant
+/// hash of the multi-gigabyte opened stream is omitted.
+pub fn scan_prevalidated_filelists_record_path(
+    input: impl Read,
+    record: &MetadataRecord,
+    target: &str,
+) -> Result<Vec<String>, MetadataError> {
+    if record.size > MAX_FILELISTS_COMPRESSED_BYTES {
+        return Err(MetadataError::SizeMismatch {
+            expected: MAX_FILELISTS_COMPRESSED_BYTES,
+            actual: record.size,
+        });
+    }
+    if record.open_size > MAX_FILELISTS_OPEN_BYTES {
+        return Err(MetadataError::SizeMismatch {
+            expected: MAX_FILELISTS_OPEN_BYTES,
+            actual: record.open_size,
+        });
+    }
+    let compressed = Rc::new(RefCell::new(StreamDigest::default()));
+    let hashed = DigestReader {
+        inner: input.take(
+            record
+                .size
+                .checked_add(1)
+                .ok_or(MetadataError::LimitExceeded {
+                    kind: "compressed metadata",
+                    maximum: record.size,
+                    actual: u64::MAX,
+                })?,
+        ),
+        state: Rc::clone(&compressed),
+    };
+    let mut buffered = BufReader::new(hashed);
+    let format = buffered
+        .fill_buf()
+        .map_err(|error| MetadataError::Io(error.to_string()))
+        .map(encoding)?;
+    let decoded: Box<dyn Read + '_> = match format {
+        MetadataEncoding::Zstd => Box::new(
+            zstd::stream::read::Decoder::new(buffered)
+                .map_err(|error| MetadataError::Io(error.to_string()))?,
+        ),
+        MetadataEncoding::Gzip => Box::new(GzDecoder::new(buffered)),
+        MetadataEncoding::Xml => Box::new(buffered),
+    };
+    crate::filelists::scan_validated_filelists_xml_path(
+        BufReader::new(CapabilityVerifier {
+            inner: decoded,
+            opened: 0,
+            compressed,
+            record,
+            checked: false,
+        }),
+        target,
+    )
+}
+
 fn verified_filelists_reader<'a, R: Read + 'a>(
     input: R,
     record: &'a MetadataRecord,
@@ -395,6 +466,38 @@ struct OpenVerifier<'a> {
     compressed: Rc<RefCell<StreamDigest>>,
     record: &'a MetadataRecord,
     checked: bool,
+}
+
+struct CapabilityVerifier<'a, R> {
+    inner: R,
+    opened: u64,
+    compressed: Rc<RefCell<StreamDigest>>,
+    record: &'a MetadataRecord,
+    checked: bool,
+}
+
+impl<R: Read> Read for CapabilityVerifier<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.opened = self
+            .opened
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("open size overflow"))?;
+        if self.opened > self.record.open_size {
+            return Err(io::Error::other("opened metadata exceeds declared size"));
+        }
+        if count == 0 && !self.checked {
+            self.checked = true;
+            let compressed = self.compressed.borrow();
+            if compressed.bytes != self.record.size
+                || hex::encode(compressed.hasher.clone().finalize()) != self.record.checksum
+                || self.opened != self.record.open_size
+            {
+                return Err(io::Error::other("metadata capability integrity mismatch"));
+            }
+        }
+        Ok(count)
+    }
 }
 
 impl Read for OpenVerifier<'_> {

@@ -13,7 +13,8 @@ use dnfast_metadata::{
 use dnfast_metadata::{
     RelationFlags, copy_filelists_record_verified, copy_primary_record_verified, decode_record,
     parse_filelists, parse_filelists_record, parse_primary_records, parse_repomd_records,
-    publish_validated, validate_filelists_generation, validate_filelists_record,
+    publish_validated, scan_prevalidated_filelists_record_path,
+    scan_validated_filelists_record_path, validate_filelists_generation, validate_filelists_record,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -145,6 +146,53 @@ fn filelists_stream_when_parsing_todo2a_corpus() {
     validate_filelists_record(compressed.as_slice(), &records.filelists, &primary)
         .expect("streaming identity validation without retaining paths");
     drop(File::open(fixture("filelists.xml.zst")).expect("fixture remains available"));
+}
+
+#[test]
+fn validated_filelists_fast_scan_matches_full_parse_and_checksums() {
+    let records = parse_repomd_records(&std::fs::read(fixture("repomd.xml")).expect("repomd"))
+        .expect("records");
+    let compressed = std::fs::read(fixture("filelists.xml.zst")).expect("filelists");
+    let parsed = parse_filelists_record(compressed.as_slice(), &records.filelists)
+        .expect("full filelists parse");
+    let target = "/usr/share/dnfast/provided";
+    let mut expected = parsed
+        .iter()
+        .filter(|package| package.files.iter().any(|path| path == target))
+        .map(|package| package.package_id.clone())
+        .collect::<Vec<_>>();
+    expected.sort();
+    expected.dedup();
+    assert_eq!(
+        scan_validated_filelists_record_path(compressed.as_slice(), &records.filelists, target)
+            .expect("fast validated scan"),
+        expected
+    );
+    assert_eq!(
+        scan_prevalidated_filelists_record_path(compressed.as_slice(), &records.filelists, target)
+            .expect("prevalidated capability scan"),
+        expected
+    );
+    assert!(
+        scan_validated_filelists_record_path(compressed.as_slice(), &records.filelists, "/missing")
+            .expect("missing path scan")
+            .is_empty()
+    );
+    let mut corrupted = compressed;
+    let midpoint = corrupted.len() / 2;
+    corrupted[midpoint] ^= 1;
+    assert!(
+        scan_validated_filelists_record_path(corrupted.as_slice(), &records.filelists, target)
+            .is_err()
+    );
+    assert!(
+        scan_prevalidated_filelists_record_path(
+            &corrupted[..corrupted.len() - 1],
+            &records.filelists,
+            target
+        )
+        .is_err()
+    );
 }
 
 #[test]

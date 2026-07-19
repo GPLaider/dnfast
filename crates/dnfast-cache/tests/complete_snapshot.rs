@@ -264,7 +264,7 @@ fn version_one_unknown_duplicate_and_extra_manifest_shapes_reject() {
     let original = fs::read_to_string(&manifest).expect("manifest");
     fs::write(
         &manifest,
-        original.replacen("\"version\":3", "\"version\":1", 1),
+        original.replacen("\"version\":5", "\"version\":1", 1),
     )
     .expect("v1");
     assert!(matches!(
@@ -276,7 +276,7 @@ fn version_one_unknown_duplicate_and_extra_manifest_shapes_reject() {
         cache.open_by_digest(&snapshot.digest),
         Err(CacheError::Corrupt(_))
     ));
-    fs::write(&manifest, original.replacen("{", "{\"version\":3,", 1)).expect("duplicate");
+    fs::write(&manifest, original.replacen("{", "{\"version\":5,", 1)).expect("duplicate");
     assert!(matches!(
         cache.open_by_digest(&snapshot.digest),
         Err(CacheError::Corrupt(_))
@@ -291,6 +291,141 @@ fn version_one_unknown_duplicate_and_extra_manifest_shapes_reject() {
         cache.open_by_digest(&snapshot.digest),
         Err(CacheError::Corrupt(_))
     ));
+}
+
+#[test]
+fn primary_identity_projection_is_verified_and_legacy_objects_fall_back() {
+    let directory = tempfile::tempdir().expect("temporary cache");
+    let cache = Cache::new(directory.path());
+    let build = metadata("generated-build10");
+    let snapshot = cache
+        .publish_complete_with_origin(
+            "main",
+            &build.0,
+            &build.1,
+            &build.2,
+            Some("https://example.test/repo/repodata/repomd.xml"),
+        )
+        .expect("complete generation");
+    let object = object(directory.path(), &snapshot.digest);
+    let projection = object.join("primary-identities.json");
+    let primary_files = object.join("primary-files.bin");
+    let generation = cache
+        .open_verified_complete_generation(&snapshot.digest)
+        .expect("verified v5 generation");
+    assert!(generation.primary_identities().is_some());
+    assert!(generation.primary_files().is_some());
+
+    let original_projection = fs::read(&projection).expect("projection");
+    fs::write(&projection, b"[]").expect("tamper projection");
+    assert!(matches!(
+        cache.open_verified_complete_generation(&snapshot.digest),
+        Err(CacheError::Corrupt(_))
+    ));
+    fs::write(&projection, original_projection).expect("restore projection");
+
+    let original_primary_files = fs::read(&primary_files).expect("primary file projection");
+    fs::write(&primary_files, b"partial").expect("tamper primary file projection");
+    assert!(matches!(
+        cache.open_verified_complete_generation(&snapshot.digest),
+        Err(CacheError::Corrupt(_))
+    ));
+    fs::write(&primary_files, original_primary_files).expect("restore primary file projection");
+
+    let manifest_path = object.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("manifest"))
+            .expect("manifest json");
+    manifest["version"] = 3.into();
+    manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .remove("primary_identities");
+    manifest
+        .as_object_mut()
+        .expect("manifest object")
+        .remove("primary_files");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("legacy manifest"),
+    )
+    .expect("write legacy manifest");
+    fs::remove_file(&projection).expect("remove new projection");
+    fs::remove_file(&primary_files).expect("remove primary file projection");
+    assert!(
+        cache
+            .open_verified_complete_generation(&snapshot.digest)
+            .expect("verified v3 generation")
+            .primary_identities()
+            .is_none()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_source_reflink_is_distinct_and_source_mutation_fails_closed() {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = tempfile::tempdir().expect("temporary cache");
+    let cache = Cache::new(directory.path());
+    let build = metadata("generated-build10");
+    let snapshot = cache
+        .publish_complete_with_origin(
+            "main",
+            &build.0,
+            &build.1,
+            &build.2,
+            Some("https://example.test/repo/repodata/repomd.xml"),
+        )
+        .expect("complete generation");
+    let generation = cache
+        .open_verified_complete_generation(&snapshot.digest)
+        .expect("verified generation");
+    let mut streamed = Vec::new();
+    generation
+        .primary()
+        .reader()
+        .expect("verified reader")
+        .read_to_end(&mut streamed)
+        .expect("stream retained primary");
+    assert_eq!(streamed, build.1);
+    let cloned = tempfile::NamedTempFile::new_in(directory.path()).expect("clone target");
+    let reflinked = generation
+        .primary()
+        .try_reflink_to(cloned.as_file())
+        .expect("safe reflink attempt");
+    if reflinked {
+        assert_eq!(
+            fs::read(cloned.path()).expect("cloned bytes"),
+            generation.primary().read_all().expect("retained primary")
+        );
+        let source = object(directory.path(), &snapshot.digest).join("primary");
+        assert_ne!(
+            fs::metadata(source).expect("source metadata").ino(),
+            fs::metadata(cloned.path()).expect("clone metadata").ino()
+        );
+        assert_eq!(
+            fs::metadata(cloned.path()).expect("clone metadata").nlink(),
+            1
+        );
+    }
+
+    let primary = object(directory.path(), &snapshot.digest).join("primary");
+    let mut source = fs::OpenOptions::new()
+        .append(true)
+        .open(primary)
+        .expect("mutable source fixture");
+    std::io::Write::write_all(&mut source, b"changed").expect("mutate source");
+    source.sync_all().expect("sync mutation");
+    let rejected = tempfile::NamedTempFile::new_in(directory.path()).expect("rejected target");
+    assert!(
+        generation
+            .primary()
+            .try_reflink_to(rejected.as_file())
+            .is_err()
+    );
+    assert!(generation.primary().reader().is_err());
 }
 
 #[test]

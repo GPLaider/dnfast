@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    io::Write,
+    io::{Seek, Write},
     os::{
         fd::{AsFd, AsRawFd},
         unix::fs::{MetadataExt, PermissionsExt},
@@ -46,11 +46,68 @@ pub(crate) fn publish_blob_deferred(
     publish_blob_inner(planning, digest, bytes)
 }
 
+pub(crate) fn publish_verified_blob_deferred(
+    planning: &TrustedDirectory,
+    payload: &dnfast_cache::VerifiedBytes,
+) -> Result<(), PlanningError> {
+    publish_blob_inner_with_source(planning, payload.sha256(), payload.bytes(), Some(payload))
+}
+
+pub(crate) fn publish_verified_file_deferred(
+    planning: &TrustedDirectory,
+    payload: &dnfast_cache::VerifiedFile,
+) -> Result<(), PlanningError> {
+    let digest = payload.sha256();
+    if !valid_digest(digest) {
+        return Err(PlanningError::UnsafeSnapshot(
+            "planning blob digest is invalid".into(),
+        ));
+    }
+    let size = usize::try_from(payload.size())
+        .map_err(|error| PlanningError::UnsafeSnapshot(error.to_string()))?;
+    let blobs = planning.child("blobs", true, 0o755)?;
+    let sha256 = blobs.child("sha256", true, 0o755)?;
+    if let Some(existing) = sha256.read_if_present(digest, size)? {
+        if existing.len() != size || format!("{:x}", sha2::Sha256::digest(&existing)) != digest {
+            return Err(PlanningError::UnsafeSnapshot(
+                "immutable planning blob digest collision".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let temporary = format!(
+        "/proc/self/fd/{}/.blob-{digest}-{}-{}",
+        sha256.fd().as_fd().as_raw_fd(),
+        std::process::id(),
+        now_nanos()?
+    );
+    write_file_deferred_from_verified_file(Path::new(&temporary), payload)?;
+    let target = format!(
+        "/proc/self/fd/{}/{}",
+        sha256.fd().as_fd().as_raw_fd(),
+        digest
+    );
+    match fs::rename(&temporary, &target) {
+        Ok(()) => Ok(()),
+        Err(_error) if sha256.read_if_present(digest, size)?.is_some() => {
+            fs::remove_file(&temporary).map_err(io)?;
+            let existing = sha256.read(digest, size)?;
+            if existing.len() != size || format!("{:x}", sha2::Sha256::digest(&existing)) != digest
+            {
+                return Err(PlanningError::UnsafeSnapshot(
+                    "immutable planning blob digest collision".into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => Err(io(error)),
+    }
+}
+
 pub(crate) fn sync_blobs(planning: &TrustedDirectory) -> Result<(), PlanningError> {
     let sha256 = planning
         .child("blobs", false, 0)?
         .child("sha256", false, 0)?;
-    rustix::fs::syncfs(sha256.fd()).map_err(|error| PlanningError::Io(error.to_string()))?;
     sha256.sync()
 }
 
@@ -58,6 +115,15 @@ fn publish_blob_inner(
     planning: &TrustedDirectory,
     digest: &str,
     bytes: &[u8],
+) -> Result<(), PlanningError> {
+    publish_blob_inner_with_source(planning, digest, bytes, None)
+}
+
+fn publish_blob_inner_with_source(
+    planning: &TrustedDirectory,
+    digest: &str,
+    bytes: &[u8],
+    source: Option<&dnfast_cache::VerifiedBytes>,
 ) -> Result<(), PlanningError> {
     if !valid_digest(digest) || format!("{:x}", sha2::Sha256::digest(bytes)) != digest {
         return Err(PlanningError::UnsafeSnapshot(
@@ -80,7 +146,7 @@ fn publish_blob_inner(
         std::process::id(),
         now_nanos()?
     );
-    write_file_deferred(Path::new(&temporary), bytes)?;
+    write_file_deferred_from_verified(Path::new(&temporary), bytes, source)?;
     let target = format!(
         "/proc/self/fd/{}/{}",
         sha256.fd().as_fd().as_raw_fd(),
@@ -121,6 +187,29 @@ pub(crate) fn read_blob(
     let blobs = planning.child("blobs", false, 0)?;
     let sha256 = blobs.child("sha256", false, 0)?;
     sha256.read(digest, maximum)
+}
+
+pub(crate) fn open_blob_file(
+    planning_root: &Path,
+    owner: u32,
+    digest: &str,
+    size: u64,
+) -> Result<fs::File, PlanningError> {
+    if !valid_digest(digest) {
+        return Err(PlanningError::UnsafeSnapshot(
+            "invalid planning blob digest".into(),
+        ));
+    }
+    let planning = TrustedDirectory::open(planning_root, owner, false, 0)?;
+    let blobs = planning.child("blobs", false, 0)?;
+    let sha256 = blobs.child("sha256", false, 0)?;
+    let file = sha256.open_file(digest)?;
+    if file.metadata().map_err(io)?.len() != size {
+        return Err(PlanningError::UnsafeSnapshot(
+            "planning blob size differs from descriptor".into(),
+        ));
+    }
+    Ok(file)
 }
 
 pub(crate) fn current_digest(roots: &PlanningRoots, owner: u32) -> Result<String, PlanningError> {
@@ -347,14 +436,48 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), PlanningError> {
     let mut file = options.open(path).map_err(io)?;
     file.write_all(bytes).map_err(io)?;
     file.sync_all().map_err(io)?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .map_err(io)?;
+    file.sync_all().map_err(io)
+}
+
+fn write_file_deferred_from_verified(
+    path: &Path,
+    bytes: &[u8],
+    source: Option<&dnfast_cache::VerifiedBytes>,
+) -> Result<(), PlanningError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    let mut file = options.open(path).map_err(io)?;
+    let reflinked = source
+        .map(|source| source.try_reflink_to(&file))
+        .transpose()
+        .map_err(|error| PlanningError::Cache(error.to_string()))?
+        .unwrap_or(false);
+    if !reflinked {
+        file.set_len(0).map_err(io)?;
+        file.rewind().map_err(io)?;
+        file.write_all(bytes).map_err(io)?;
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(io)
 }
 
-fn write_file_deferred(path: &Path, bytes: &[u8]) -> Result<(), PlanningError> {
+fn write_file_deferred_from_verified_file(
+    path: &Path,
+    source: &dnfast_cache::VerifiedFile,
+) -> Result<(), PlanningError> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     let mut file = options.open(path).map_err(io)?;
-    file.write_all(bytes).map_err(io)?;
+    let reflinked = source
+        .try_reflink_to(&file)
+        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    if !reflinked {
+        let bytes = source
+            .read_all()
+            .map_err(|error| PlanningError::Cache(error.to_string()))?;
+        file.write_all(&bytes).map_err(io)?;
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(io)
 }
 
