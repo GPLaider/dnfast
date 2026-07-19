@@ -1,0 +1,6 @@
+trial	dnfast_publish_wall_s	dnfast_solve_wall_s	dnfast_total_wall_s	dnfast_user_s	dnfast_sys_s	dnfast_peak_rss_kib	dnf5_wall_s	dnf5_user_s	dnf5_sys_s	dnf5_peak_rss_kib
+1	12.18	0.64	12.82	5.11	0.74	237884	17.55	16.35	0.74	574652
+2	12.26	0.66	12.92	5.28	0.67	237552	17.86	16.47	0.80	514616
+3	13.55	0.64	14.19	5.21	0.66	237800	17.89	16.34	0.79	578984
+4	10.06	0.68	10.74	5.14	0.77	237308	17.57	16.53	0.75	519200
+5	9.23	0.86	10.09	5.20	0.60	237716	19.49	16.55	0.71	541024

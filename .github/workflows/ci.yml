@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fedora-44-x86_64:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native toolchain
+        run: >-
+          dnf5 install -y cargo clang clippy gcc libmodulemd-devel libsolv-devel
+          nettle-devel pkgconf-pkg-config rpm-devel rust rustfmt zstd
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check
+        env:
+          DNFAST_NATIVE_REAL: "1"
+        run: cargo check --locked --workspace --all-targets
+      - name: Clippy
+        env:
+          DNFAST_NATIVE_REAL: "1"
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test
+        env:
+          DNFAST_NATIVE_REAL: "1"
+        run: cargo test --locked --workspace --all-targets -- --test-threads=1

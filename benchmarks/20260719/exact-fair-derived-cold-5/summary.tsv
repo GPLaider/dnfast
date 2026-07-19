@@ -1,0 +1,5 @@
+metric	dnfast_median	dnf5_median	ratio_dnf5_over_dnfast
+wall_seconds	12.82	17.86	1.393
+user_seconds	5.20	16.47	3.167
+system_seconds	0.67	0.75	1.119
+peak_rss_kib	237716	541024	2.276

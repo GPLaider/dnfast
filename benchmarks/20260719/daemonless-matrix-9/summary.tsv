@@ -1,0 +1,9 @@
+tool	case	trials	median_elapsed_seconds	median_user_seconds	median_system_seconds	median_max_rss_kib
+dnfast	name	9	0.56	0.50	0.06	142344
+dnf5	name	9	0.86	0.80	0.12	198416
+dnfast	binary	9	0.66	0.99	0.08	159936
+dnf5	binary	9	0.95	0.96	0.16	204904
+dnfast	deep-file	9	0.97	1.81	0.09	168260
+dnf5	deep-file	9	1.98	1.96	0.18	221896
+dnfast	no-change	9	0.56	0.49	0.05	142276
+dnf5	no-change	9	0.85	0.80	0.12	198140

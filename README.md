@@ -4,6 +4,11 @@
 transactions directly with libsolv, downloads and verifies selected RPMs, and executes approved
 transactions directly with librpm. It does not invoke DNF or DNF5 to solve or apply transactions.
 
+> [!WARNING]
+> Version 0.1.0 is a Fedora 44 x86_64 technical preview. Keep DNF5 installed and available for
+> recovery. `dnfast` is not a drop-in replacement for DNF5 and intentionally supports fewer policy
+> and plugin surfaces.
+
 The implemented command surface is deliberately smaller than DNF5:
 
 ```bash
@@ -83,7 +88,21 @@ be enabled.
 Downgrade, reinstall, distro-sync, reason-bounded autoremove, and Fedora updateinfo advisory
 list/info/upgrade are implemented through the same exact native solve and verified transaction
 boundary. Plugin, COPR, system-upgrade, and offline commands are not implemented and fail closed.
-`dnfast` does not claim DNF5 policy or state compatibility.
+`dnfast` does not claim DNF5 policy or state compatibility. Here, COPR means repository-management
+commands inside dnfast; installing the dnfast RPM from a Fedora COPR repository remains supported.
+
+## Verified performance scope
+
+On the tested Fedora 44 x86_64 host, an exact-fair derived-cold planning comparison retained the
+same raw Fedora metadata, removed both tools' derived solver caches, disabled application network,
+kept the OS page cache, and alternated execution order. Across five trials, dnfast won every trial:
+the median was **12.82 seconds and 237,716 KiB peak RSS**, compared with DNF5 at **17.86 seconds and
+541,024 KiB**. A separate daemonless process-cold matrix also favored dnfast in all four tested
+selectors across nine trials each.
+
+These measurements apply only to the documented hardware, repository generation, and supported
+command paths. See the complete methodology, earlier contrary cells, and remaining limitations in
+[`docs/performance-results-20260719.md`](docs/performance-results-20260719.md).
 
 ## Native build and test
 
