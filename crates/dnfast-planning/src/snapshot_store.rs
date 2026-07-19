@@ -38,20 +38,12 @@ pub(crate) fn open_snapshot(
     Ok(result)
 }
 
-pub(crate) fn publish_blob(
-    planning: &TrustedDirectory,
-    digest: &str,
-    bytes: &[u8],
-) -> Result<(), PlanningError> {
-    publish_blob_inner(planning, digest, bytes, true)
-}
-
 pub(crate) fn publish_blob_deferred(
     planning: &TrustedDirectory,
     digest: &str,
     bytes: &[u8],
 ) -> Result<(), PlanningError> {
-    publish_blob_inner(planning, digest, bytes, false)
+    publish_blob_inner(planning, digest, bytes)
 }
 
 pub(crate) fn sync_blobs(planning: &TrustedDirectory) -> Result<(), PlanningError> {
@@ -66,7 +58,6 @@ fn publish_blob_inner(
     planning: &TrustedDirectory,
     digest: &str,
     bytes: &[u8],
-    sync_directory: bool,
 ) -> Result<(), PlanningError> {
     if !valid_digest(digest) || format!("{:x}", sha2::Sha256::digest(bytes)) != digest {
         return Err(PlanningError::UnsafeSnapshot(
@@ -89,18 +80,13 @@ fn publish_blob_inner(
         std::process::id(),
         now_nanos()?
     );
-    if sync_directory {
-        write_file(Path::new(&temporary), bytes)?;
-    } else {
-        write_file_deferred(Path::new(&temporary), bytes)?;
-    }
+    write_file_deferred(Path::new(&temporary), bytes)?;
     let target = format!(
         "/proc/self/fd/{}/{}",
         sha256.fd().as_fd().as_raw_fd(),
         digest
     );
     match fs::rename(&temporary, &target) {
-        Ok(()) if sync_directory => sha256.sync(),
         Ok(()) => Ok(()),
         Err(_error) if sha256.read_if_present(digest, bytes.len())?.is_some() => {
             fs::remove_file(&temporary).map_err(io)?;

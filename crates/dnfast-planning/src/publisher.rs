@@ -1,6 +1,8 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
+    time::Instant,
 };
 
 use base64::Engine;
@@ -114,6 +116,11 @@ impl RootPlanningPublisher {
         refreshed_generations: Option<&[(String, String)]>,
     ) -> Result<String, PlanningError> {
         self.require_publisher()?;
+        // Refresh validation has released its metadata objects by this point,
+        // but glibc may retain their arenas. Do not carry that dead resident
+        // set into RPMDB inventory and planning publication.
+        dnfast_native::release_unused_memory();
+        trace_memory("planning:refresh-buffers-released");
         let planning = self.publication_directory()?;
         let _lock = PublicationLock::acquire(&planning)?;
         let profile = load_system_mutation_profile()
@@ -272,7 +279,10 @@ impl RootPlanningPublisher {
                     host_architecture,
                     &cache,
                     refreshed_repository_ids,
-                    Some(planning),
+                    PlanningStorage {
+                        blobs: Some(planning),
+                        solv_cache_root: Some(&self.roots.cache_root),
+                    },
                 )?,
             },
             _ => snapshot_from(
@@ -285,7 +295,10 @@ impl RootPlanningPublisher {
                 host_architecture,
                 &cache,
                 refreshed_repository_ids,
-                Some(planning),
+                PlanningStorage {
+                    blobs: Some(planning),
+                    solv_cache_root: Some(&self.roots.cache_root),
+                },
             )?,
         };
         snapshot.attach_storage(&self.roots.planning_root, self.owner);
@@ -469,7 +482,7 @@ impl RootPlanningPublisher {
             host_architecture,
             &Cache::new(&self.roots.cache_root),
             None,
-            None,
+            PlanningStorage::default(),
         )?;
         validate_tree(&self.roots.cache_root, self.owner)?;
         require_same_source_payload(snapshot, &refreshed)?;
@@ -603,7 +616,9 @@ fn trace_memory(phase: &str) {
         .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
         .collect::<Vec<_>>()
         .join(" ");
-    eprintln!("dnfast-refresh-trace phase={phase} {fields}");
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    eprintln!("dnfast-refresh-trace phase={phase} elapsed_ms={elapsed} {fields}");
 }
 
 impl PlanningSnapshot {
@@ -649,6 +664,12 @@ pub fn host_rpm_architecture() -> Result<Architecture, PlanningError> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct PlanningStorage<'a> {
+    blobs: Option<&'a TrustedDirectory>,
+    solv_cache_root: Option<&'a Path>,
+}
+
 fn snapshot_from(
     profile: &MutationProfile,
     host_state: SnapshotHostState,
@@ -656,7 +677,7 @@ fn snapshot_from(
     host_architecture: Architecture,
     cache: &Cache,
     refreshed_repository_ids: Option<&[String]>,
-    blob_store: Option<&TrustedDirectory>,
+    storage: PlanningStorage<'_>,
 ) -> Result<PlanningSnapshot, PlanningError> {
     let SnapshotHostState {
         inventory,
@@ -692,10 +713,47 @@ fn snapshot_from(
         .collect::<Result<Vec<_>, _>>()
         .map_err(domain)?;
     let policy = policy_for(host_architecture, profile, preferences)?;
-    let repositories = enabled
-        .into_iter()
-        .map(|repository| repository_payload(repository, cache, published_at_unix, blob_store))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Each repository has an independent checksum-bound generation and
+    // independent file-provides spools. Build them concurrently so a large
+    // Fedora base repository overlaps the smaller updates repository instead
+    // of making first publication pay both parse/sort passes serially. The
+    // resulting workers are joined in canonical repository order.
+    let repositories = std::thread::scope(|scope| {
+        enabled
+            .into_iter()
+            .map(|repository| {
+                scope.spawn(move || {
+                    repository_payload(
+                        repository,
+                        cache,
+                        published_at_unix,
+                        host_architecture,
+                        storage,
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| PlanningError::Io("repository planning worker panicked".into()))?
+            })
+            .collect::<Result<Vec<_>, PlanningError>>()
+    })?;
+    // Repository workers transiently hold decompression, sort, and staging
+    // buffers hundreds of MiB larger than the published descriptors. Return
+    // those free glibc arenas before the libsolv prewarm phase so the two
+    // bounded phases do not stack their resident high-water marks.
+    dnfast_native::release_unused_memory();
+    trace_memory("planning:repository-buffers-released");
+    // No snapshot can refer to these immutable blobs until every repository
+    // worker succeeds. Flush the complete batch exactly once before building
+    // the publishable snapshot, rather than issuing hundreds of per-blob
+    // fsyncs or one filesystem-wide sync per repository.
+    if let Some(store) = storage.blobs {
+        crate::snapshot_store::sync_blobs(store)?;
+    }
     let payload = PlanningPayload {
         policy: PlanningPolicy {
             solver: policy,
@@ -943,7 +1001,8 @@ fn repository_payload(
     repository: &RepoConfig,
     cache: &Cache,
     valid_at_unix: u64,
-    blob_store: Option<&TrustedDirectory>,
+    host_architecture: Architecture,
+    storage: PlanningStorage<'_>,
 ) -> Result<PlanningRepository, PlanningError> {
     if !repository.sslverify
         || !repository.gpgcheck
@@ -1000,7 +1059,15 @@ fn repository_payload(
             .transpose()
             .map_err(|error| PlanningError::Cache(error.to_string()))?,
     };
-    generation_payload(repository, generation, auxiliary, trust, bundle, blob_store)
+    generation_payload(
+        repository,
+        generation,
+        auxiliary,
+        trust,
+        bundle,
+        host_architecture,
+        storage,
+    )
 }
 
 struct AuxiliaryPayloads {
@@ -1015,22 +1082,48 @@ fn generation_payload(
     auxiliary: AuxiliaryPayloads,
     trust: RepoTrustPolicy,
     bundle: KeyBundle,
-    blob_store: Option<&TrustedDirectory>,
+    host_architecture: Architecture,
+    storage: PlanningStorage<'_>,
 ) -> Result<PlanningRepository, PlanningError> {
-    let file_provides = crate::file_provides::build(&generation, blob_store)?;
+    // Primary-only libsolv materialization and filelists hashing consume
+    // independent immutable inputs. On a first publication, overlap them so
+    // full absolute-file readiness does not pay both CPU passes serially.
+    let file_provides = std::thread::scope(|scope| {
+        let solv_worker = storage.solv_cache_root.map(|cache_root| {
+            scope.spawn(|| {
+                prewarm_repository_generation_solv_cache(
+                    repository,
+                    &generation,
+                    cache_root,
+                    host_architecture,
+                )
+            })
+        });
+        let file_provides = crate::file_provides::build(&generation, storage.blobs)?;
+        if let Some(worker) = solv_worker {
+            worker
+                .join()
+                .map_err(|_| PlanningError::Io("repository solv-cache worker panicked".into()))??;
+        }
+        Ok::<_, PlanningError>(file_provides)
+    })?;
     let keys = planning_keys(&bundle)?;
     if generation.repository() != repository.id {
         return Err(PlanningError::Cache(
             "cache generation repository differs from configuration".into(),
         ));
     }
-    if let Some(planning) = blob_store {
+    if let Some(planning) = storage.blobs {
         for payload in [
             generation.repomd(),
             generation.primary(),
             generation.filelists(),
         ] {
-            crate::snapshot_store::publish_blob(planning, payload.sha256(), payload.bytes())?;
+            crate::snapshot_store::publish_blob_deferred(
+                planning,
+                payload.sha256(),
+                payload.bytes(),
+            )?;
         }
         for payload in auxiliary
             .group
@@ -1038,7 +1131,11 @@ fn generation_payload(
             .chain(auxiliary.modules.iter())
             .chain(auxiliary.updateinfo.iter())
         {
-            crate::snapshot_store::publish_blob(planning, payload.sha256(), payload.bytes())?;
+            crate::snapshot_store::publish_blob_deferred(
+                planning,
+                payload.sha256(),
+                payload.bytes(),
+            )?;
         }
     }
     let origin = generation.origin();
@@ -1157,14 +1254,49 @@ pub fn repository_solv_cache_binding(
     repository: &PlanningRepository,
     architecture: Architecture,
 ) -> Result<(Vec<u8>, String), PlanningError> {
+    repository_solv_cache_binding_from_parts(
+        &repository.id,
+        &repository.generation_sha256,
+        &repository.primary.sha256,
+        repository.primary.size,
+        architecture,
+    )
+}
+
+/// Binding for libsolv's filelists extension.  It is independently
+/// content-addressed, but also names the exact main cache generation it is
+/// allowed to extend so a valid extension can never be paired with a
+/// different solvable range.
+pub fn repository_filelists_solv_cache_binding(
+    repository: &PlanningRepository,
+    architecture: Architecture,
+) -> Result<(Vec<u8>, String), PlanningError> {
+    repository_filelists_solv_cache_binding_from_parts(
+        &repository.id,
+        &repository.generation_sha256,
+        &repository.primary.sha256,
+        repository.primary.size,
+        &repository.filelists.sha256,
+        repository.filelists.size,
+        architecture,
+    )
+}
+
+fn repository_solv_cache_binding_from_parts(
+    repository_id: &str,
+    generation_sha256: &str,
+    primary_sha256: &str,
+    primary_size: u64,
+    architecture: Architecture,
+) -> Result<(Vec<u8>, String), PlanningError> {
     let binding = format!(
         "dnfast-solv-cache-v2\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrepository={}\ngeneration_sha256={}\nprimary_sha256={}\nprimary_size={}\nlimits_validated=true\n",
         dnfast_native_sys::ABI_VERSION,
         architecture.as_rpm_arch(),
-        repository.id,
-        repository.generation_sha256,
-        repository.primary.sha256,
-        repository.primary.size,
+        repository_id,
+        generation_sha256,
+        primary_sha256,
+        primary_size,
     )
     .into_bytes();
     if binding.len() > 4096 {
@@ -1174,6 +1306,135 @@ pub fn repository_solv_cache_binding(
     }
     let sha256 = digest(&binding);
     Ok((binding, sha256))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repository_filelists_solv_cache_binding_from_parts(
+    repository_id: &str,
+    generation_sha256: &str,
+    primary_sha256: &str,
+    primary_size: u64,
+    filelists_sha256: &str,
+    filelists_size: u64,
+    architecture: Architecture,
+) -> Result<(Vec<u8>, String), PlanningError> {
+    let (_, main_binding_sha256) = repository_solv_cache_binding_from_parts(
+        repository_id,
+        generation_sha256,
+        primary_sha256,
+        primary_size,
+        architecture,
+    )?;
+    let binding = format!(
+        "dnfast-solv-filelists-cache-v1\nnative_abi={}\nlibsolv=0.7.39\narchitecture={}\nrepository={}\ngeneration_sha256={}\nmain_binding_sha256={}\nfilelists_sha256={}\nfilelists_size={}\nlimits_validated=true\n",
+        dnfast_native_sys::ABI_VERSION,
+        architecture.as_rpm_arch(),
+        repository_id,
+        generation_sha256,
+        main_binding_sha256,
+        filelists_sha256,
+        filelists_size,
+    )
+    .into_bytes();
+    if binding.len() > 4096 {
+        return Err(PlanningError::Input(
+            "solv filelists cache binding exceeds native limit".into(),
+        ));
+    }
+    let sha256 = digest(&binding);
+    Ok((binding, sha256))
+}
+
+fn prewarm_repository_generation_solv_cache(
+    repository: &RepoConfig,
+    generation: &VerifiedCompleteGeneration,
+    cache_root: &Path,
+    architecture: Architecture,
+) -> Result<(), PlanningError> {
+    let (binding, binding_sha256) = repository_solv_cache_binding_from_parts(
+        &repository.id,
+        generation.digest(),
+        generation.primary().sha256(),
+        generation.primary().size(),
+        architecture,
+    )?;
+    let cache = SolvCache::new(cache_root);
+    let mut main_ready = cache_entry_ready(&cache, &binding_sha256)?;
+    if main_ready {
+        return Ok(());
+    }
+    // libsolv's writers transiently retain an entire repository pool. Keep
+    // repository-level source validation parallel, but do not stack those
+    // high-memory native builders in one process.
+    static SOLV_BUILD_LIMIT: Mutex<()> = Mutex::new(());
+    let _build = SOLV_BUILD_LIMIT
+        .lock()
+        .map_err(|_| PlanningError::Io("repository solv-cache lock is poisoned".into()))?;
+    // A concurrent publisher may have completed the immutable entry while
+    // this worker waited for the in-process memory gate.
+    main_ready = cache_entry_ready(&cache, &binding_sha256)?;
+    if main_ready {
+        return Ok(());
+    }
+    trace_memory(&format!("planning:solv-build-{}-begin", repository.id));
+    let records = dnfast_metadata::parse_repomd_records(generation.repomd().bytes())
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
+    let workspace = tempfile::tempdir().map_err(|error| PlanningError::Io(error.to_string()))?;
+    let repomd = workspace.path().join("repomd.xml");
+    let primary_path = workspace.path().join("primary.xml");
+    let filelists = workspace.path().join("filelists.xml");
+    std::fs::write(&repomd, generation.repomd().bytes())
+        .map_err(|error| PlanningError::Io(error.to_string()))?;
+    let mut primary_output = std::fs::File::create(&primary_path)
+        .map_err(|error| PlanningError::Io(error.to_string()))?;
+    dnfast_metadata::copy_primary_record_verified(
+        generation.primary().bytes(),
+        &records.primary,
+        &mut primary_output,
+    )
+    .map_err(|error| PlanningError::Input(error.to_string()))?;
+    drop(primary_output);
+    std::fs::write(&filelists, []).map_err(|error| PlanningError::Io(error.to_string()))?;
+    let path = |value: &Path| {
+        value
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| PlanningError::Input("temporary metadata path is not UTF-8".into()))
+    };
+    let mut context = dnfast_native::NativeContext::open(architecture, || false)
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
+    context
+        .add_repository_primary(dnfast_native::Repository {
+            id: repository.id.clone(),
+            repomd_path: path(&repomd)?,
+            primary_path: path(&primary_path)?,
+            filelists_path: path(&filelists)?,
+            priority: i32::from(repository.priority),
+            cost: i32::try_from(repository.cost)
+                .map_err(|error| PlanningError::Input(error.to_string()))?,
+        })
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
+    let staged = cache
+        .stage(&binding_sha256)
+        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    context
+        .write_repository_solv(&repository.id, staged.file(), &binding)
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
+    staged
+        .commit()
+        .map_err(|error| PlanningError::Cache(error.to_string()))?;
+    drop(context);
+    dnfast_native::release_unused_memory();
+    trace_memory(&format!("planning:solv-build-{}-end", repository.id));
+    Ok(())
+}
+
+fn cache_entry_ready(cache: &SolvCache, binding_sha256: &str) -> Result<bool, PlanningError> {
+    match cache.open(binding_sha256) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) | Err(CacheError::Corrupt(_)) => Ok(false),
+        Err(error) => Err(PlanningError::Cache(error.to_string())),
+    }
 }
 
 pub fn installed_solv_cache_binding(
@@ -1238,21 +1499,31 @@ fn prewarm_repository_solv_caches(
             repository,
             snapshot.payload().policy.solver.base_arch(),
         )?;
-        match cache.open(&binding_sha256) {
-            Ok(Some(_)) => continue,
-            Ok(None) | Err(CacheError::Corrupt(_)) => {}
-            Err(error) => return Err(PlanningError::Cache(error.to_string())),
+        let main_ready = cache_entry_ready(&cache, &binding_sha256)?;
+        if main_ready {
+            continue;
         }
-        let metadata = snapshot.materialize_native_primary_unparsed(repository)?;
+        let repomd_bytes = snapshot.materialize_payload(&repository.repomd)?;
+        let primary_bytes = snapshot.materialize_payload(&repository.primary)?;
+        let records = dnfast_metadata::parse_repomd_records(&repomd_bytes)
+            .map_err(|error| PlanningError::Input(error.to_string()))?;
         let workspace =
             tempfile::tempdir().map_err(|error| PlanningError::Io(error.to_string()))?;
         let repomd = workspace.path().join("repomd.xml");
         let primary = workspace.path().join("primary.xml");
         let filelists = workspace.path().join("filelists.xml");
-        std::fs::write(&repomd, metadata.repomd())
-            .and_then(|_| std::fs::write(&primary, metadata.primary()))
-            .and_then(|_| std::fs::write(&filelists, []))
+        std::fs::write(&repomd, &repomd_bytes)
             .map_err(|error| PlanningError::Io(error.to_string()))?;
+        let mut primary_output = std::fs::File::create(&primary)
+            .map_err(|error| PlanningError::Io(error.to_string()))?;
+        dnfast_metadata::copy_primary_record_verified(
+            primary_bytes.as_slice(),
+            &records.primary,
+            &mut primary_output,
+        )
+        .map_err(|error| PlanningError::Input(error.to_string()))?;
+        drop(primary_output);
+        std::fs::write(&filelists, []).map_err(|error| PlanningError::Io(error.to_string()))?;
         let path = |value: &Path| {
             value
                 .to_str()
@@ -1285,6 +1556,8 @@ fn prewarm_repository_solv_caches(
         staged
             .commit()
             .map_err(|error| PlanningError::Cache(error.to_string()))?;
+        drop(context);
+        dnfast_native::release_unused_memory();
         trace_memory(&format!("planning:solv-cache-{index}-prewarmed"));
     }
     Ok(())

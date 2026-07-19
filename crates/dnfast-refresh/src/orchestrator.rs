@@ -8,7 +8,10 @@ use crate::{
 };
 use dnfast_cache::{Cache, RepomdAuthentication, SelectedOrigin};
 use dnfast_metadata::{AuxiliaryRecord, parse_repomd_records};
-use std::sync::Mutex;
+use std::{
+    sync::{Mutex, OnceLock},
+    time::Instant,
+};
 
 // Downloads from independent repositories can overlap, but validating several
 // Fedora-scale primary/filelists streams at once multiplies their peak working
@@ -236,5 +239,7 @@ fn trace_memory(phase: &str) {
         .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
         .collect::<Vec<_>>()
         .join(" ");
-    eprintln!("dnfast-refresh-trace phase={phase} {fields}");
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    eprintln!("dnfast-refresh-trace phase={phase} elapsed_ms={elapsed} {fields}");
 }

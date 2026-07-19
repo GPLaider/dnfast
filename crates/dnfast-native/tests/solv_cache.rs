@@ -121,6 +121,64 @@ fn solv_cache_round_trip_preserves_packages_relations_and_solves() {
 }
 
 #[test]
+fn filelists_extension_cache_round_trip_is_binding_checked_and_provides_paths() {
+    let directory = tempfile::tempdir().expect("temporary metadata");
+    let main_binding = b"dnfast native main solv fixture v1";
+    let extension_binding = b"dnfast native filelists solv fixture v1";
+    let main_cache = tempfile::tempfile().expect("main cache file");
+    let extension_cache = tempfile::tempfile().expect("extension cache file");
+    let repository = installed_repository(&directory);
+    let filelists = std::fs::File::open(&repository.filelists_path).expect("filelists XML");
+
+    let mut source = NativeContext::open(Architecture::Aarch64, || false).expect("source");
+    source
+        .add_repository_primary(primary_only_repository(&directory))
+        .expect("primary repository");
+    source
+        .write_repository_solv("main", &main_cache, main_binding)
+        .expect("main cache");
+    source
+        .extend_repository_filelists("main", &filelists)
+        .expect("filelists extension");
+    source
+        .write_repository_solv_extension("main", &extension_cache, extension_binding)
+        .expect("extension cache");
+    source.prepare_solver().expect("source solver");
+    let source_solve = source
+        .solve_install("/usr/share/dnfast/provided", false, true)
+        .expect("source filelist solve");
+    assert_eq!(source_solve.actions.len(), 1);
+    assert!(matches!(
+        source_solve.actions[0].as_str(),
+        "dnfast-file-collision-0:1.0-1.noarch" | "dnfast-file-provider-0:1.0-1.noarch"
+    ));
+
+    let mut loaded = NativeContext::open(Architecture::Aarch64, || false).expect("loaded");
+    loaded
+        .add_repository_solv("main", 99, 1000, &main_cache, main_binding)
+        .expect("main cache load");
+    loaded
+        .add_repository_solv_extension("main", &extension_cache, extension_binding)
+        .expect("extension cache load");
+    loaded.prepare_solver().expect("loaded solver");
+    let loaded_solve = loaded
+        .solve_install("/usr/share/dnfast/provided", false, true)
+        .expect("loaded filelist solve");
+    assert_eq!(loaded_solve.actions, source_solve.actions);
+    assert_eq!(loaded_solve.repositories, source_solve.repositories);
+
+    let mut rejected = NativeContext::open(Architecture::Aarch64, || false).expect("rejected");
+    rejected
+        .add_repository_solv("main", 99, 1000, &main_cache, main_binding)
+        .expect("main cache load");
+    assert!(
+        rejected
+            .add_repository_solv_extension("main", &extension_cache, b"wrong binding")
+            .is_err()
+    );
+}
+
+#[test]
 fn installed_solv_cache_restores_the_pool_installed_repository() {
     let directory = tempfile::tempdir().expect("temporary metadata");
     let binding = b"dnfast installed solv cache fixture v1";

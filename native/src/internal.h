@@ -168,5 +168,8 @@ dnfast_status dnfast_limits_accept_validated_repo(dnfast_context *context,
                                                   struct s_Repo *repo,
                                                   uint64_t metadata_bytes,
                                                   dnfast_error *error);
+dnfast_status dnfast_limits_accept_extension(dnfast_context *context,
+                                             uint64_t metadata_bytes,
+                                             dnfast_error *error);
 
 #endif

@@ -17,8 +17,10 @@
 #include <solv/knownid.h>
 #include <solv/pool.h>
 #include <solv/repo.h>
+#include <solv/repo_rpmmd.h>
 #include <solv/repo_solv.h>
 #include <solv/repo_write.h>
+#include <solv/repodata.h>
 #include <solv/selection.h>
 #include <solv/solvable.h>
 #include <solv/util.h>
@@ -89,6 +91,14 @@ static int retained_stream(int retained_fd, const char *mode,
     *stream = fdopen(duplicate, mode);
     if (*stream == NULL) {
         (void)close(duplicate);
+        return 0;
+    }
+    /* dup(2) shares the open-file-description offset with the caller.  Cache
+       writers therefore leave a retained descriptor at EOF; every native
+       consumer must establish its own logical starting position explicitly. */
+    if (fseek(*stream, 0, SEEK_SET) != 0) {
+        (void)fclose(*stream);
+        *stream = NULL;
         return 0;
     }
     return 1;
@@ -243,6 +253,194 @@ dnfast_status dnfast_solver_write_repo_solv(
     (void)userdata_size;
     return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
                             "solv", "repowriter_write",
+                            "real native build disabled");
+#endif
+}
+
+dnfast_status dnfast_solver_extend_repo_filelists(
+    dnfast_context *context, const char *repository_id, int retained_fd,
+    dnfast_error *error) {
+    dnfast_status status = owner_check(context, error);
+    if (status != DNFAST_STATUS_OK) return status;
+    if (repository_id == NULL)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "solver-cache", NULL,
+                                "invalid filelists extension input");
+#ifdef DNFAST_NATIVE_REAL
+    Repo *repo = find_repo(context, repository_id);
+    FILE *stream = NULL;
+    struct stat before;
+    if (repo == NULL || !retained_stream(retained_fd, "rb", &stream, &before) ||
+        before.st_size <= 0) {
+        if (stream != NULL) (void)fclose(stream);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "solver-cache", "fdopen",
+                                "filelists extension open failed");
+    }
+    int metadata_fds[3] = {retained_fd, -1, -1};
+    status = dnfast_limits_before_repo(context, metadata_fds, 1, error);
+    int before_repodata = repo->nrepodata;
+    Id before_start = repo->start;
+    Id before_end = repo->end;
+    if (status == DNFAST_STATUS_OK &&
+        repo_add_rpmmd(repo, stream, "FL", REPO_EXTEND_SOLVABLES) != 0)
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "libsolv", "repo_add_rpmmd",
+                                  "filelists extension load failed");
+    struct stat after;
+    Repodata *extension = repo_last_repodata(repo);
+    if (status == DNFAST_STATUS_OK &&
+        (fstat(retained_fd, &after) != 0 || before.st_dev != after.st_dev ||
+         before.st_ino != after.st_ino || before.st_size != after.st_size ||
+         repo->start != before_start || repo->end != before_end ||
+         repo->nrepodata != before_repodata + 1 || extension == NULL ||
+         !repodata_has_keyname(extension, SOLVABLE_FILELIST)))
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "solver-cache", "filelists",
+                                  "filelists extension changed repository identity");
+    if (status == DNFAST_STATUS_OK)
+        status = dnfast_limits_accept_extension(context,
+                                                (uint64_t)before.st_size,
+                                                error);
+    if (fclose(stream) != 0 && status == DNFAST_STATUS_OK)
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "solver-cache", "fclose",
+                                  "filelists extension close failed");
+    return status;
+#else
+    (void)retained_fd;
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "solv", "repo_add_rpmmd",
+                            "real native build disabled");
+#endif
+}
+
+dnfast_status dnfast_solver_write_repo_solv_extension(
+    dnfast_context *context, const char *repository_id, int retained_fd,
+    const uint8_t *userdata, size_t userdata_size, dnfast_error *error) {
+    dnfast_status status = owner_check(context, error);
+    if (status != DNFAST_STATUS_OK) return status;
+    if (repository_id == NULL || userdata == NULL || userdata_size == 0 ||
+        userdata_size > 4096 || userdata_size > INT32_MAX)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "solver-cache", NULL,
+                                "invalid solv extension output");
+#ifdef DNFAST_NATIVE_REAL
+    Repo *repo = find_repo(context, repository_id);
+    Repodata *extension = repo == NULL ? NULL : repo_last_repodata(repo);
+    if (extension == NULL ||
+        !repodata_has_keyname(extension, SOLVABLE_FILELIST))
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "solver-cache", NULL,
+                                "filelists extension was not loaded");
+    FILE *stream = NULL;
+    struct stat identity;
+    if (!retained_stream(retained_fd, "r+b", &stream, &identity) ||
+        ftruncate(fileno(stream), 0) != 0 || fseek(stream, 0, SEEK_SET) != 0) {
+        if (stream != NULL) (void)fclose(stream);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "solver-cache", "fdopen",
+                                "solv extension output failed");
+    }
+    Repowriter *writer = repowriter_create(repo);
+    if (writer == NULL) status = DNFAST_STATUS_NATIVE_FAILURE;
+    if (writer != NULL) {
+        repowriter_set_userdata(writer, userdata, (int)userdata_size);
+        repowriter_set_repodatarange(writer, extension->repodataid,
+                                     extension->repodataid + 1);
+        repowriter_set_flags(writer, REPOWRITER_NO_STORAGE_SOLVABLE);
+        if (repowriter_write(writer, stream) != 0 || fflush(stream) != 0 ||
+            fsync(fileno(stream)) != 0)
+            status = DNFAST_STATUS_NATIVE_FAILURE;
+        repowriter_free(writer);
+    }
+    if (fclose(stream) != 0) status = DNFAST_STATUS_NATIVE_FAILURE;
+    if (status != DNFAST_STATUS_OK)
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "libsolv", "repowriter_write",
+                                "solv extension write failed");
+    return DNFAST_STATUS_OK;
+#else
+    (void)retained_fd; (void)userdata; (void)userdata_size;
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "solv", "repowriter_write",
+                            "real native build disabled");
+#endif
+}
+
+dnfast_status dnfast_solver_add_repo_solv_extension(
+    dnfast_context *context, const char *repository_id, int retained_fd,
+    const uint8_t *expected_userdata, size_t expected_userdata_size,
+    dnfast_error *error) {
+    dnfast_status status = owner_check(context, error);
+    if (status != DNFAST_STATUS_OK) return status;
+    if (repository_id == NULL || expected_userdata == NULL ||
+        expected_userdata_size == 0 || expected_userdata_size > 4096)
+        return dnfast_set_error(error, DNFAST_STATUS_INVALID_ARGUMENT,
+                                "solver-cache", NULL,
+                                "invalid solv extension input");
+#ifdef DNFAST_NATIVE_REAL
+    Repo *repo = find_repo(context, repository_id);
+    FILE *stream = NULL;
+    struct stat before;
+    if (repo == NULL || !retained_stream(retained_fd, "rb", &stream, &before) ||
+        before.st_size <= 0) {
+        if (stream != NULL) (void)fclose(stream);
+        return dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                "solver-cache", "fdopen",
+                                "solv extension open failed");
+    }
+    int metadata_fds[3] = {retained_fd, -1, -1};
+    status = dnfast_limits_before_repo(context, metadata_fds, 1, error);
+    unsigned char *userdata = NULL;
+    int userdata_size = 0;
+    if (status == DNFAST_STATUS_OK &&
+        (solv_read_userdata(stream, &userdata, &userdata_size) != 0 ||
+         userdata_size < 0 || (size_t)userdata_size != expected_userdata_size ||
+         userdata == NULL ||
+         memcmp(userdata, expected_userdata, expected_userdata_size) != 0))
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "solver-cache", "solv_read_userdata",
+                                  "solv extension binding differs");
+    solv_free(userdata);
+    if (status == DNFAST_STATUS_OK && fseek(stream, 0, SEEK_SET) != 0)
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "solver-cache", "fseek",
+                                  "solv extension rewind failed");
+    Id before_start = repo->start;
+    Id before_end = repo->end;
+    int before_repodata = repo->nrepodata;
+    if (status == DNFAST_STATUS_OK &&
+        repo_add_solv(repo, stream,
+                      REPO_EXTEND_SOLVABLES | REPO_LOCALPOOL) != 0)
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "libsolv", "repo_add_solv",
+                                  "solv extension load failed");
+    struct stat after;
+    Repodata *extension = repo_last_repodata(repo);
+    if (status == DNFAST_STATUS_OK &&
+        (fstat(retained_fd, &after) != 0 || before.st_dev != after.st_dev ||
+         before.st_ino != after.st_ino || before.st_size != after.st_size ||
+         repo->start != before_start || repo->end != before_end ||
+         repo->nrepodata != before_repodata + 1 || extension == NULL ||
+         !repodata_has_keyname(extension, SOLVABLE_FILELIST)))
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "solver-cache", "filelists",
+                                  "solv extension changed repository identity");
+    if (status == DNFAST_STATUS_OK)
+        status = dnfast_limits_accept_extension(context,
+                                                (uint64_t)before.st_size,
+                                                error);
+    if (fclose(stream) != 0 && status == DNFAST_STATUS_OK)
+        status = dnfast_set_error(error, DNFAST_STATUS_NATIVE_FAILURE,
+                                  "solver-cache", "fclose",
+                                  "solv extension close failed");
+    return status;
+#else
+    (void)retained_fd; (void)expected_userdata;
+    (void)expected_userdata_size;
+    return dnfast_set_error(error, DNFAST_STATUS_UNSUPPORTED_ABI,
+                            "solv", "repo_add_solv",
                             "real native build disabled");
 #endif
 }

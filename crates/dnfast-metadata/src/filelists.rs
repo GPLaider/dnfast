@@ -4,9 +4,8 @@ use std::{
 };
 
 use quick_xml::{
-    events::{BytesStart, Event},
-    name::ResolveResult,
-    reader::NsReader,
+    events::{BytesStart, BytesText, Event},
+    reader::Reader,
 };
 use serde::{Deserialize, Serialize};
 
@@ -135,6 +134,7 @@ type FileVisitor<'a> = dyn FnMut(&str, &str) -> Result<(), MetadataError> + 'a;
 struct State<'a> {
     current: Option<Builder>,
     file_text: Option<String>,
+    spare_file_text: String,
     packages: Vec<FileListPackage>,
     declared: Option<u64>,
     root_seen: bool,
@@ -179,7 +179,7 @@ fn parse_filelists_with_mode<'a, R: BufRead>(
     retain_files: bool,
     visitor: Option<&'a mut FileVisitor<'a>>,
 ) -> Result<Vec<FileListPackage>, MetadataError> {
-    let mut reader = NsReader::from_reader(input);
+    let mut reader = Reader::from_reader(input);
     // Preserve text around entity-reference events until the complete path is
     // reassembled and validated.
     reader.config_mut().trim_text(false);
@@ -191,38 +191,32 @@ fn parse_filelists_with_mode<'a, R: BufRead>(
         ..State::default()
     };
     loop {
-        match reader.read_resolved_event_into(&mut buffer) {
-            Ok((namespace, Event::Start(event))) => {
-                validate_resolved(&namespace)?;
-                state.start(reader.decoder(), &event)?;
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => state.start(reader.decoder(), &event)?,
+            Ok(Event::Empty(event)) => state.empty(reader.decoder(), &event)?,
+            Ok(Event::Text(event)) if state.file_text.is_some() => {
+                state.append_file_event(&event)?
             }
-            Ok((namespace, Event::Empty(event))) => {
-                validate_resolved(&namespace)?;
-                state.empty(reader.decoder(), &event)?;
-            }
-            Ok((_, Event::Text(event))) if state.file_text.is_some() => {
-                state.append_file_text(&decode_text(&event)?)?
-            }
-            Ok((_, Event::GeneralRef(event))) if state.file_text.is_some() => {
+            Ok(Event::GeneralRef(event)) if state.file_text.is_some() => {
                 state.append_file_text(&decode_reference(&event)?)?
             }
-            Ok((_, Event::Text(event))) if !state.root_seen || state.root_closed => {
+            Ok(Event::Text(event)) if !state.root_seen || state.root_closed => {
                 if !decode_text(&event)?.trim().is_empty() {
                     return Err(MetadataError::Xml("text outside filelists root".into()));
                 }
             }
-            Ok((_, Event::End(event))) => state.end(event.name().as_ref())?,
-            Ok((_, Event::Decl(_))) if !state.root_seen && !state.declaration_seen => {
+            Ok(Event::End(event)) => state.end(event.name().as_ref())?,
+            Ok(Event::Decl(_)) if !state.root_seen && !state.declaration_seen => {
                 state.declaration_seen = true
             }
-            Ok((_, Event::Decl(_) | Event::DocType(_))) => {
+            Ok(Event::Decl(_) | Event::DocType(_)) => {
                 return Err(MetadataError::Xml(
                     "misplaced XML declaration or doctype".into(),
                 ));
             }
-            Ok((_, Event::Comment(_) | Event::PI(_))) => {}
-            Ok((_, Event::Eof)) => break,
-            Ok((_, _)) if !state.root_seen || state.root_closed => {
+            Ok(Event::Comment(_) | Event::PI(_)) => {}
+            Ok(Event::Eof) => break,
+            Ok(_) if !state.root_seen || state.root_closed => {
                 return Err(MetadataError::Xml("content outside filelists root".into()));
             }
             Err(error) => return Err(MetadataError::Xml(error.to_string())),
@@ -257,7 +251,7 @@ impl State<'_> {
             self.root_seen = true;
             return Ok(());
         }
-        self.check_namespace(decoder, event)?;
+        reject_nested_namespace_declarations(event)?;
         reject_prefix(event.name().as_ref())?;
         match event.name().as_ref() {
             b"package" => {
@@ -271,10 +265,11 @@ impl State<'_> {
                     ..Builder::default()
                 });
             }
-            b"file"
-                if self.current.is_some() && self.file_text.replace(String::new()).is_some() =>
-            {
-                return Err(MetadataError::Xml("nested filelists file".into()));
+            b"file" if self.current.is_some() => {
+                if self.file_text.is_some() {
+                    return Err(MetadataError::Xml("nested filelists file".into()));
+                }
+                self.file_text = Some(std::mem::take(&mut self.spare_file_text));
             }
             _ => {}
         }
@@ -289,7 +284,7 @@ impl State<'_> {
         if !self.root_seen || self.root_closed {
             return Err(MetadataError::Xml("element outside filelists root".into()));
         }
-        self.check_namespace(decoder, event)?;
+        reject_nested_namespace_declarations(event)?;
         reject_prefix(event.name().as_ref())?;
         if event.name().as_ref() == b"version" {
             let package = self
@@ -314,16 +309,21 @@ impl State<'_> {
         Ok(())
     }
 
+    fn append_file_event(&mut self, event: &BytesText<'_>) -> Result<(), MetadataError> {
+        let decoded = event
+            .decode()
+            .map_err(|error| MetadataError::Xml(error.to_string()))?;
+        let unescaped = quick_xml::escape::unescape(&decoded)
+            .map_err(|error| MetadataError::Xml(error.to_string()))?;
+        self.append_file_text(&unescaped)
+    }
+
     fn finish_file(&mut self) -> Result<(), MetadataError> {
-        let value = self
+        let mut value = self
             .file_text
             .take()
             .ok_or_else(|| MetadataError::Xml("file end without start".into()))?;
-        if !value.starts_with('/')
-            || value.contains("//")
-            || value.chars().any(char::is_control)
-            || value.split('/').any(|part| part == "." || part == "..")
-        {
+        if !safe_file_path(&value) {
             return Err(MetadataError::UnsafeLocation(value));
         }
         let package = self
@@ -341,6 +341,9 @@ impl State<'_> {
         }
         if self.retain_files {
             package.files.push(value);
+        } else {
+            value.clear();
+            self.spare_file_text = value;
         }
         Ok(())
     }
@@ -384,18 +387,6 @@ impl State<'_> {
         Ok(())
     }
 
-    fn check_namespace(
-        &self,
-        decoder: quick_xml::encoding::Decoder,
-        event: &BytesStart<'_>,
-    ) -> Result<(), MetadataError> {
-        if namespace(decoder, event)?
-            .is_some_and(|value| value != "http://linux.duke.edu/metadata/filelists")
-        {
-            return Err(MetadataError::Xml("unexpected filelists namespace".into()));
-        }
-        Ok(())
-    }
     fn finish(self) -> Result<Vec<FileListPackage>, MetadataError> {
         if !self.root_seen || !self.root_closed {
             return Err(MetadataError::Xml("incomplete filelists root".into()));
@@ -411,6 +402,32 @@ impl State<'_> {
         }
         Ok(self.packages)
     }
+}
+
+fn safe_file_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b'/') {
+        return false;
+    }
+    let mut segment_length = 0_usize;
+    let mut segment_is_dots = true;
+    for &byte in &bytes[1..] {
+        if byte < b' ' || byte == 0x7f {
+            return false;
+        }
+        if byte == b'/' {
+            if segment_length == 0 || (segment_is_dots && matches!(segment_length, 1 | 2)) {
+                return false;
+            }
+            segment_length = 0;
+            segment_is_dots = true;
+        } else {
+            segment_length += 1;
+            segment_is_dots &= byte == b'.';
+        }
+    }
+    !(segment_is_dots && matches!(segment_length, 1 | 2))
+        && (value.is_ascii() || !value.chars().any(char::is_control))
 }
 
 fn namespace(
@@ -435,15 +452,37 @@ fn reject_prefix(name: &[u8]) -> Result<(), MetadataError> {
     }
     Ok(())
 }
-fn validate_resolved(namespace: &ResolveResult<'_>) -> Result<(), MetadataError> {
-    match namespace {
-        ResolveResult::Bound(actual)
-            if actual.as_ref() == b"http://linux.duke.edu/metadata/filelists" =>
-        {
-            Ok(())
+fn reject_nested_namespace_declarations(event: &BytesStart<'_>) -> Result<(), MetadataError> {
+    for attribute in event.attributes() {
+        let attribute = attribute.map_err(|error| MetadataError::Xml(error.to_string()))?;
+        let name = attribute.key.as_ref();
+        if name == b"xmlns" || name.starts_with(b"xmlns:") {
+            return Err(MetadataError::Xml(
+                "nested filelists namespace declaration".into(),
+            ));
         }
-        _ => Err(MetadataError::Xml(
-            "unexpected filelists resolved namespace".into(),
-        )),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_file_path;
+
+    #[test]
+    fn file_path_validation_rejects_traversal_repetition_and_unicode_controls() {
+        assert!(safe_file_path("/usr/share/한글/파일"));
+        assert!(safe_file_path("/"));
+        assert!(safe_file_path("/usr/share/"));
+        for unsafe_path in [
+            "relative/path",
+            "/usr//share",
+            "/usr/./share",
+            "/usr/../share",
+            "/usr/share/\u{009f}hidden",
+            "/usr/share/\nfile",
+        ] {
+            assert!(!safe_file_path(unsafe_path), "accepted {unsafe_path:?}");
+        }
     }
 }

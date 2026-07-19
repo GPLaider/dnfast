@@ -173,6 +173,16 @@ dnfast_status dnfast_solver_add_repo_solv(
 dnfast_status dnfast_solver_write_repo_solv(
     dnfast_context *context, const char *repository_id, int retained_fd,
     const uint8_t *userdata, size_t userdata_size, dnfast_error *out_error);
+dnfast_status dnfast_solver_extend_repo_filelists(
+    dnfast_context *context, const char *repository_id, int retained_fd,
+    dnfast_error *out_error);
+dnfast_status dnfast_solver_write_repo_solv_extension(
+    dnfast_context *context, const char *repository_id, int retained_fd,
+    const uint8_t *userdata, size_t userdata_size, dnfast_error *out_error);
+dnfast_status dnfast_solver_add_repo_solv_extension(
+    dnfast_context *context, const char *repository_id, int retained_fd,
+    const uint8_t *expected_userdata, size_t expected_userdata_size,
+    dnfast_error *out_error);
 size_t dnfast_solver_repo_package_count(const dnfast_context *context,
                                         const char *repository_id);
 dnfast_status dnfast_solver_repo_package_find_identity(

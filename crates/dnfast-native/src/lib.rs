@@ -241,6 +241,38 @@ impl NativeContext {
             .map_err(NativeError::from)
     }
 
+    pub fn extend_repository_filelists(
+        &mut self,
+        repository_id: &str,
+        file: &std::fs::File,
+    ) -> Result<(), NativeError> {
+        self.inner
+            .extend_repo_filelists(repository_id, file)
+            .map_err(NativeError::from)
+    }
+
+    pub fn write_repository_solv_extension(
+        &mut self,
+        repository_id: &str,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        self.inner
+            .write_repo_solv_extension(repository_id, file, userdata)
+            .map_err(NativeError::from)
+    }
+
+    pub fn add_repository_solv_extension(
+        &mut self,
+        repository_id: &str,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        self.inner
+            .add_repo_solv_extension(repository_id, file, userdata)
+            .map_err(NativeError::from)
+    }
+
     pub fn repository_packages(
         &mut self,
         repository_id: &str,

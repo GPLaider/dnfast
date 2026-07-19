@@ -26,7 +26,9 @@ use dnfast_native::{
     ExpectedPackage, FileProvider, InventorySnapshot, MappedSelector, NativeContext, Repository,
     VerifiedStagedKey,
 };
-use dnfast_planning::{PlanningRepository, PlanningSnapshot, SYSTEM_CACHE_PATH};
+use dnfast_planning::{
+    PlanningRepository, PlanningSnapshot, SYSTEM_CACHE_PATH, SYSTEM_PLANNING_PATH,
+};
 use dnfast_solver::{
     CandidatePackage, CanonicalSolverPlan, NativePackageEvidence, NativePackageEvidenceParts,
     NativeSolveOutput, PlanBuilder,
@@ -508,14 +510,27 @@ pub fn serve_system() -> Result<(), DaemonError> {
     getrandom::fill(&mut nonce).map_err(|error| DaemonError::Io(error.to_string()))?;
     let journal = dnfast_state::JournalStore::open_system()
         .map_err(|error| DaemonError::Execution(error.to_string()))?;
+    let architecture = system_architecture()?;
+    // Reconcile an interrupted RPM transaction before advertising daemon
+    // readiness.  Leaving this until the next approved transaction makes a
+    // systemd restart look healthy while a pending journal remains unresolved.
+    // Failure remains fail-closed: the service does not accept requests.
+    recover_pending_transactions(&journal, architecture).map_err(executor)?;
     let mut planner = ResidentPlanner::default();
-    planner.verify_startup(system_architecture()?)?;
+    // A freshly installed system has no planning generation until its first
+    // repository refresh.  Keep the root-only status socket available in
+    // that state and defer the same full RPMDB/snapshot verification to the
+    // first warm or solve.  Any present (including malformed or symlinked)
+    // current pointer still enters the secure reader and fails closed.
+    if planning_snapshot_published(&Path::new(SYSTEM_PLANNING_PATH).join("current"))? {
+        planner.verify_startup(architecture)?;
+    }
     let mut state = DaemonState {
         planner,
         journal,
         nonce,
         sequence: 0,
-        recovered_architecture: None,
+        recovered_architecture: Some(architecture),
         trace: std::env::var_os("DNFASTD_TRACE").is_some(),
     };
     for accepted in listener.incoming() {
@@ -538,6 +553,14 @@ pub fn serve_system() -> Result<(), DaemonError> {
         }
     }
     Ok(())
+}
+
+fn planning_snapshot_published(current: &Path) -> Result<bool, DaemonError> {
+    match fs::symlink_metadata(current) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(DaemonError::Io(error.to_string())),
+    }
 }
 
 fn root_peer(stream: &UnixStream) -> Result<bool, DaemonError> {
@@ -2266,5 +2289,19 @@ mod tests {
             &["ordinary-package".into(), "capability(foo) >= 1".into()],
             primary_contains
         ));
+    }
+
+    #[test]
+    fn fresh_install_defers_startup_verification_but_present_pointer_does_not() {
+        let directory = tempfile::tempdir().expect("temporary planning root");
+        let current = directory.path().join("current");
+        assert!(!planning_snapshot_published(&current).expect("absent pointer"));
+
+        std::fs::write(&current, b"invalid-but-present\n").expect("current pointer");
+        assert!(planning_snapshot_published(&current).expect("present pointer"));
+
+        std::fs::remove_file(&current).expect("remove pointer");
+        std::os::unix::fs::symlink("missing-target", &current).expect("symlink pointer");
+        assert!(planning_snapshot_published(&current).expect("symlink pointer"));
     }
 }

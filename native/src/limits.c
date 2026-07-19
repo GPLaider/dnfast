@@ -147,3 +147,14 @@ dnfast_status dnfast_limits_accept_validated_repo(dnfast_context *context,
     return DNFAST_STATUS_UNSUPPORTED_ABI;
 #endif
 }
+
+dnfast_status dnfast_limits_accept_extension(dnfast_context *context,
+                                             uint64_t metadata_bytes,
+                                             dnfast_error *error) {
+    if (UINT64_MAX - context->metadata_bytes < metadata_bytes ||
+        context->metadata_bytes + metadata_bytes > context->limits.max_metadata_bytes)
+        return dnfast_set_error(error, DNFAST_STATUS_LIMIT_EXCEEDED,
+                                "solver", NULL, "metadata byte limit exceeded");
+    context->metadata_bytes += metadata_bytes;
+    return DNFAST_STATUS_OK;
+}

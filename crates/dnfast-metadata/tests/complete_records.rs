@@ -11,9 +11,9 @@ use dnfast_metadata::{
     MAX_PRIMARY_OPEN_BYTES, MAX_RELATIONS_PER_PACKAGE, MAX_TOTAL_OPEN_BYTES, checked_total_open,
 };
 use dnfast_metadata::{
-    RelationFlags, decode_record, parse_filelists, parse_filelists_record, parse_primary_records,
-    parse_repomd_records, publish_validated, validate_filelists_generation,
-    validate_filelists_record,
+    RelationFlags, copy_filelists_record_verified, copy_primary_record_verified, decode_record,
+    parse_filelists, parse_filelists_record, parse_primary_records, parse_repomd_records,
+    publish_validated, validate_filelists_generation, validate_filelists_record,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -54,6 +54,51 @@ fn complete_records_when_parsing_todo2a_corpus() {
     assert_eq!(weak.suggests[0].name, "dnfast-file-provider");
     assert_eq!(weak.supplements[0].name, "dnfast-app");
     assert_eq!(weak.enhances[0].name, "dnfast-rich");
+}
+
+#[test]
+fn verified_primary_copy_streams_the_exact_open_record_and_rejects_tamper() {
+    let records = parse_repomd_records(&std::fs::read(fixture("repomd.xml")).expect("repomd"))
+        .expect("records");
+    let primary = std::fs::read(fixture("primary.xml.zst")).expect("primary");
+    let expected = decode_record(&primary, &records.primary).expect("opened primary");
+    let mut streamed = Vec::new();
+    assert_eq!(
+        copy_primary_record_verified(primary.as_slice(), &records.primary, &mut streamed)
+            .expect("verified streaming copy"),
+        expected.len() as u64
+    );
+    assert_eq!(streamed, expected);
+
+    let mut corrupted = primary;
+    let midpoint = corrupted.len() / 2;
+    corrupted[midpoint] ^= 1;
+    assert!(
+        copy_primary_record_verified(corrupted.as_slice(), &records.primary, Vec::new()).is_err()
+    );
+}
+
+#[test]
+fn verified_filelists_copy_streams_the_exact_open_record_and_rejects_tamper() {
+    let records = parse_repomd_records(&std::fs::read(fixture("repomd.xml")).expect("repomd"))
+        .expect("records");
+    let filelists = std::fs::read(fixture("filelists.xml.zst")).expect("filelists");
+    let expected = decode_record(&filelists, &records.filelists).expect("opened filelists");
+    let mut streamed = Vec::new();
+    assert_eq!(
+        copy_filelists_record_verified(filelists.as_slice(), &records.filelists, &mut streamed)
+            .expect("verified streaming copy"),
+        expected.len() as u64
+    );
+    assert_eq!(streamed, expected);
+
+    let mut corrupted = filelists;
+    let midpoint = corrupted.len() / 2;
+    corrupted[midpoint] ^= 1;
+    assert!(
+        copy_filelists_record_verified(corrupted.as_slice(), &records.filelists, Vec::new(),)
+            .is_err()
+    );
 }
 
 #[test]

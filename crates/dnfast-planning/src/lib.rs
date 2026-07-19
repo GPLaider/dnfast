@@ -23,7 +23,8 @@ pub use modulemd::{
 pub use native_xml::{NativeRepositoryPrimary, NativeRepositoryXml};
 pub use publisher::{
     PlanningRoots, RootPlanningPublisher, SYSTEM_CACHE_PATH, SYSTEM_PLANNING_PATH,
-    host_rpm_architecture, installed_solv_cache_binding, repository_solv_cache_binding,
+    host_rpm_architecture, installed_solv_cache_binding, repository_filelists_solv_cache_binding,
+    repository_solv_cache_binding,
 };
 
 #[cfg(test)]

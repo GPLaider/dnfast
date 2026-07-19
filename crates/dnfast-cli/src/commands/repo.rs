@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dnfast_cache::Cache;
+use dnfast_cache::{Cache, CacheError};
 use dnfast_planning::{RootPlanningPublisher, SYSTEM_CACHE_PATH};
 use dnfast_refresh::{HttpTransport, MetadataTrust, RefreshOutcome, Refresher, Source};
 use dnfast_repo::{
@@ -26,6 +26,23 @@ pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
     let profile =
         load_system_mutation_profile().map_err(|error| AppFailure::new(1, error.to_string()))?;
     let cache = Cache::new(SYSTEM_CACHE_PATH);
+    // A planning snapshot is deliberately bound to every enabled repository,
+    // even when --repo narrows which repositories the caller wants refreshed.
+    // On first use there is no safe old generation to retain for unselected
+    // repositories, so bootstrap those missing/corrupt pointers in the same
+    // transaction instead of downloading the requested subset and failing at
+    // publication time.
+    let requested = expand_bootstrap_selection(&profile, requested, |repository| {
+        match cache.open_current_generation_identity(repository) {
+            Ok(_) => Ok(true),
+            Err(
+                CacheError::MissingSnapshot(_)
+                | CacheError::CacheUpgradeRequired
+                | CacheError::Corrupt(_),
+            ) => Ok(false),
+            Err(CacheError::Io(error)) => Err(error),
+        }
+    })?;
     let refresher = Refresher::new(HttpTransport::new(), &cache);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -52,6 +69,48 @@ pub(super) fn refresh(requested: Vec<String>) -> Result<String, AppFailure> {
         report.refreshed.join(", "),
         report.planning_snapshot,
     ))
+}
+
+fn expand_bootstrap_selection<Probe>(
+    profile: &MutationProfile,
+    mut requested: Vec<String>,
+    has_generation: Probe,
+) -> Result<Vec<String>, AppFailure>
+where
+    Probe: Fn(&str) -> Result<bool, String>,
+{
+    requested.sort();
+    requested.dedup();
+    for id in &requested {
+        if !profile
+            .repositories
+            .iter()
+            .any(|repository| repository.enabled && repository.id == *id)
+        {
+            return Err(AppFailure::new(1, format!("unknown repository: {id}")));
+        }
+    }
+    if requested.is_empty() {
+        return Ok(requested);
+    }
+    for repository in profile
+        .repositories
+        .iter()
+        .filter(|repository| repository.enabled)
+    {
+        if !requested.contains(&repository.id)
+            && !has_generation(&repository.id).map_err(|error| {
+                AppFailure::new(
+                    1,
+                    format!("cannot inspect repository {} cache: {error}", repository.id),
+                )
+            })?
+        {
+            requested.push(repository.id.clone());
+        }
+    }
+    requested.sort();
+    Ok(requested)
 }
 
 pub(super) fn makecache(requested: Vec<String>) -> Result<String, AppFailure> {
@@ -238,7 +297,24 @@ mod tests {
     use dnfast_refresh::RefreshOutcome;
     use dnfast_repo::{MainConfig, MetadataExpire, MutationProfile, RepoConfig, Variables};
 
-    use super::refresh_profile;
+    use super::{expand_bootstrap_selection, refresh_profile};
+
+    #[test]
+    fn explicit_first_refresh_bootstraps_missing_enabled_repositories() {
+        let profile = MutationProfile {
+            main: MainConfig::default(),
+            repositories: vec![repository("first"), repository("second")],
+            variables: Variables::default(),
+        };
+        let selected =
+            expand_bootstrap_selection(&profile, vec!["first".into()], |id| Ok(id == "first"))
+                .expect("selection");
+        assert_eq!(selected, ["first", "second"]);
+
+        let selected = expand_bootstrap_selection(&profile, vec!["first".into()], |_| Ok(true))
+            .expect("selection");
+        assert_eq!(selected, ["first"]);
+    }
 
     #[test]
     fn refresh_publishes_the_snapshot_after_every_selected_repository_verifies() {

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader, Read, Write},
     rc::Rc,
 };
 
@@ -78,6 +78,51 @@ pub fn decode_primary(bytes: &[u8], record: &PrimaryRecord) -> Result<Vec<u8>, M
 
 pub fn decode_record(bytes: &[u8], record: &MetadataRecord) -> Result<Vec<u8>, MetadataError> {
     decode_bounded(bytes, record, crate::MAX_FILELISTS_OPEN_BYTES)
+}
+
+/// Streams an integrity-verified primary record into a bounded sink without
+/// retaining its expanded XML in memory. The caller must still parse the
+/// resulting XML before treating its contents as metadata evidence.
+pub fn copy_primary_record_verified(
+    input: impl Read,
+    record: &MetadataRecord,
+    output: impl Write,
+) -> Result<u64, MetadataError> {
+    copy_record_verified(
+        input,
+        record,
+        crate::MAX_PRIMARY_COMPRESSED_BYTES,
+        crate::MAX_PRIMARY_OPEN_BYTES,
+        output,
+    )
+}
+
+/// Streams an integrity-verified filelists record into a bounded sink without
+/// retaining its expanded XML in memory.  Both the compressed and opened
+/// checksums from repomd are verified before EOF is reported to the caller.
+pub fn copy_filelists_record_verified(
+    input: impl Read,
+    record: &MetadataRecord,
+    output: impl Write,
+) -> Result<u64, MetadataError> {
+    copy_record_verified(
+        input,
+        record,
+        crate::MAX_FILELISTS_COMPRESSED_BYTES,
+        crate::MAX_FILELISTS_OPEN_BYTES,
+        output,
+    )
+}
+
+fn copy_record_verified(
+    input: impl Read,
+    record: &MetadataRecord,
+    max_compressed: u64,
+    max_open: u64,
+    mut output: impl Write,
+) -> Result<u64, MetadataError> {
+    let mut verified = verified_metadata_reader(input, record, max_compressed, max_open)?;
+    io::copy(&mut verified, &mut output).map_err(|error| MetadataError::Io(error.to_string()))
 }
 
 fn decode_bounded(

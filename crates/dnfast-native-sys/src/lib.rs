@@ -159,6 +159,28 @@ unsafe extern "C" {
         userdata_size: usize,
         error: *mut RawError,
     ) -> i32;
+    fn dnfast_solver_extend_repo_filelists(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        retained_fd: i32,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_write_repo_solv_extension(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        retained_fd: i32,
+        userdata: *const u8,
+        userdata_size: usize,
+        error: *mut RawError,
+    ) -> i32;
+    fn dnfast_solver_add_repo_solv_extension(
+        context: *mut RawContext,
+        repository_id: *const c_char,
+        retained_fd: i32,
+        expected_userdata: *const u8,
+        expected_userdata_size: usize,
+        error: *mut RawError,
+    ) -> i32;
     fn dnfast_solver_repo_package_count(
         context: *const RawContext,
         repository_id: *const c_char,
@@ -560,6 +582,84 @@ impl Context {
         // all pointers and unique context access remain valid synchronously.
         let status = unsafe {
             dnfast_solver_write_repo_solv(
+                self.raw.as_ptr(),
+                id.as_ptr(),
+                file.as_raw_fd(),
+                userdata.as_ptr(),
+                userdata.len(),
+                &mut error,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status_error(status, &mut error))
+        }
+    }
+
+    pub fn extend_repo_filelists(
+        &mut self,
+        repository_id: &str,
+        file: &std::fs::File,
+    ) -> Result<(), NativeError> {
+        let id = c_string(repository_id)?;
+        let mut error = empty_error();
+        // SAFETY: the retained file and repository id remain live while the
+        // uniquely borrowed native context synchronously parses the extension.
+        let status = unsafe {
+            dnfast_solver_extend_repo_filelists(
+                self.raw.as_ptr(),
+                id.as_ptr(),
+                file.as_raw_fd(),
+                &mut error,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status_error(status, &mut error))
+        }
+    }
+
+    pub fn write_repo_solv_extension(
+        &mut self,
+        repository_id: &str,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        let id = c_string(repository_id)?;
+        let mut error = empty_error();
+        // SAFETY: all arguments remain live and the native writer accesses the
+        // retained descriptor only during this uniquely borrowed call.
+        let status = unsafe {
+            dnfast_solver_write_repo_solv_extension(
+                self.raw.as_ptr(),
+                id.as_ptr(),
+                file.as_raw_fd(),
+                userdata.as_ptr(),
+                userdata.len(),
+                &mut error,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status_error(status, &mut error))
+        }
+    }
+
+    pub fn add_repo_solv_extension(
+        &mut self,
+        repository_id: &str,
+        file: &std::fs::File,
+        userdata: &[u8],
+    ) -> Result<(), NativeError> {
+        let id = c_string(repository_id)?;
+        let mut error = empty_error();
+        // SAFETY: the retained cache descriptor, binding, and id remain live
+        // for the synchronous extension load into the unique native context.
+        let status = unsafe {
+            dnfast_solver_add_repo_solv_extension(
                 self.raw.as_ptr(),
                 id.as_ptr(),
                 file.as_raw_fd(),

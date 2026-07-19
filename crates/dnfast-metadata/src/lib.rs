@@ -13,9 +13,10 @@ mod updateinfo;
 mod xml;
 
 pub use compression::{
-    decode_auxiliary, decode_primary, decode_record, parse_filelists_record,
-    validate_filelists_record, validate_filelists_record_identities, validate_primary_record,
-    verify_compressed, visit_filelists_record_identities,
+    copy_filelists_record_verified, copy_primary_record_verified, decode_auxiliary, decode_primary,
+    decode_record, parse_filelists_record, validate_filelists_record,
+    validate_filelists_record_identities, validate_primary_record, verify_compressed,
+    visit_filelists_record_identities,
 };
 pub use comps::{Comps, CompsEnvironment, CompsGroup, CompsPackage, CompsPackageType, parse_comps};
 pub use error::MetadataError;
