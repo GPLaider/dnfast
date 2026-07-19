@@ -17,6 +17,7 @@ BuildRequires:  clang
 BuildRequires:  gcc
 BuildRequires:  nettle-devel
 BuildRequires:  pkgconf-pkg-config
+BuildRequires:  pkgconfig(libzstd)
 BuildRequires:  pkgconfig(libsolv) = 0.7.39
 BuildRequires:  pkgconfig(modulemd-2.0) >= 2.15.2
 BuildRequires:  pkgconfig(rpm) = 6.0.1
@@ -55,11 +56,13 @@ export CARGO_HOME=%{_builddir}/dnfast-cargo-home
 export CARGO_PROFILE_RELEASE_DEBUG=2
 export CARGO_PROFILE_RELEASE_STRIP=none
 export DNFAST_NATIVE_REAL=1
+export ZSTD_SYS_USE_PKG_CONFIG=1
 cargo build --offline --locked --release -p dnfast-cli -p dnfast-executor --bins
 
 %check
 export CARGO_HOME=%{_builddir}/dnfast-cargo-home
 export DNFAST_NATIVE_REAL=1
+export ZSTD_SYS_USE_PKG_CONFIG=1
 cargo test --offline --locked --workspace --all-targets -- --test-threads=1
 
 %install
