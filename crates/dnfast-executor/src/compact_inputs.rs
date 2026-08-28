@@ -442,7 +442,11 @@ fn revalidate_snapshot_digest(
     Ok(snapshot)
 }
 
-fn sealed_memfd(name: &str, bytes: &[u8], maximum: u64) -> Result<OwnedFd, ExecutorError> {
+pub(crate) fn sealed_memfd(
+    name: &str,
+    bytes: &[u8],
+    maximum: u64,
+) -> Result<OwnedFd, ExecutorError> {
     if bytes.is_empty() || bytes.len() as u64 > maximum {
         return Err(inputs("sealed input size is invalid"));
     }
