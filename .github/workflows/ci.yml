@@ -18,8 +18,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install native toolchain
         run: >-
-          dnf5 install -y cargo clang clippy gcc libmodulemd-devel libsolv-devel
-          nettle-devel pkgconf-pkg-config rpm-devel rust rustfmt util-linux zstd
+          dnf5 install -y --allowerasing cargo clang clippy gcc libmodulemd-devel
+          libsolv-devel nettle-devel pkgconf-pkg-config rpm-devel-6.0.1-2.fc44
+          rust rustfmt util-linux zstd
       - name: Prepare a trusted workspace
         run: |
           workspace_uid=$(stat -c '%u' "$GITHUB_WORKSPACE")
