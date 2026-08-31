@@ -310,7 +310,7 @@ fn parse_metadata_expire(
         return Ok(MetadataExpire::AfterSeconds(seconds));
     }
     // Intentionally narrower than libdnf's std::stod path: fixed-point decimal only, never exponent syntax.
-    let (whole, fraction) = number.split_once('.').map_or((number, ""), |parts| parts);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
     if number.matches('.').count() > 1
         || (whole.is_empty() && fraction.is_empty())
         || !whole.bytes().all(|byte| byte.is_ascii_digit())
